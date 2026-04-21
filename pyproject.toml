@@ -1,0 +1,121 @@
+[build-system]
+requires = ["uv_build>=0.9.5,<1.0.0"]
+build-backend = "uv_build"
+
+[project]
+name = "trajan"
+version = "0.0.1"
+description = "Reshapable and visualizable connectivity tables"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "datafolio>=1.2.0",
+    "polars>=1.39.3",
+]
+authors = [
+    { name = "Casey Schneider-Mizell", email = "caseysm@gmail.com" },
+]
+
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel",
+    "pytest",
+    "pytest-cov",
+    "bump-my-version",
+]
+lint = [
+    "ruff",
+]
+profile = [
+    "scalene",
+    "pyinstrument",
+]
+docs = [
+    "mkdocs",
+    "mkdocs-material",
+    "mkdocstrings[python]",
+]
+
+[tool.uv]
+default-groups = [
+    "dev",
+    "lint",
+    "profile",
+    "docs",
+]
+
+[tool.uv.sources]
+datafolio = { path = "../datafolio", editable = true }
+
+[tool.bumpversion]
+current_version = "0.0.1"
+parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
+serialize = ["{major}.{minor}.{patch}"]
+regex = false
+ignore_missing_version = false
+tag = true
+sign_tags = false
+tag_name = "v{new_version}"
+tag_message = "Bump version: {current_version} → {new_version}"
+allow_dirty = false
+commit = true
+message = "v{new_version}"
+commit_args = ""
+pre_commit_hooks = ['uv sync', 'git add uv.lock']
+post_commit_hooks = ["./.bmv-post-commit.sh"]
+
+[[tool.bumpversion.files]]
+filename = "src/trajan/__init__.py"
+search = "__version__ = \"{current_version}\""
+replace = "__version__ = \"{new_version}\""
+
+[[tool.bumpversion.files]]
+filename = "pyproject.toml"
+search = "version = \"{current_version}\""
+replace = "version = \"{new_version}\""
+
+# Ruff configuration - minimal rules to start
+# See https://docs.astral.sh/ruff/rules/ for available rules
+# Common additions: select = ["E", "F", "I"] for errors, pyflakes, and isort
+[tool.ruff]
+extend-exclude = ["*.ipynb"]
+
+[tool.ruff.lint]
+select=["E9","F63","F7","F82"]  # Minimal: syntax errors and undefined names
+
+[tool.poe.tasks.drybump]
+cmd = "uv run bump-my-version bump --dry-run --verbose"
+help = "Dry run of version bump for the project. Use with 'patch', 'minor', or 'major' to specify the version change."
+
+[tool.poe.tasks.bump]
+cmd = "uv run bump-my-version bump"
+help = "Bump the version number in the project. Use with 'patch', 'minor', or 'major' to specify the version change."
+
+[tool.poe.tasks.test]
+cmd = "uv run pytest --cov=trajan tests"
+help = "Run pytest with code coverage."
+
+[tool.poe.tasks.doc-preview]
+cmd = "uv run mkdocs serve"
+help = "Preview documentation build locally"
+
+[tool.poe.tasks.profile-all]
+cmd = "uv run scalene"
+help = "Profile cpu and memory of task with scalene"
+
+[tool.poe.tasks.profile]
+cmd = "uv run pyinstrument -r html"
+help = "Profile cpu of task with pyinstrument"
+[tool.poe.tasks.lab]
+cmd = "uv run --with jupyterlab --with jupyterlab-vim --with jupyterlab-code-formatter --with jupyter-resource-usage --with jupyterlab-execute-time --with catppuccin-jupyterlab --with ipywidgets jupyter lab --no-browser"
+help = "Start Jupyter Lab"
+
+[tool.poe.tasks.scratch-lab]
+cwd = "scratch"
+cmd = "uv run --with jupyterlab --with jupyterlab-vim --with jupyterlab-code-formatter --with jupyter-resource-usage --with jupyterlab-execute-time --with catppuccin-jupyterlab --with ipywidgets jupyter lab --no-browser"
+help = "Start Jupyter Lab"
+

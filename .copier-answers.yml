@@ -1,0 +1,14 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: 1.0.8
+_src_path: gh:ceesem/cave-copier
+directory_name: trajantable
+github_user: ceesem
+initial_version: 0.0.1
+project_description: Reshapable and visualizable connectivity tables
+project_name: TrajanTable
+project_slug: trajan
+python_version: '3.10'
+template_type: library
+use_vim_jupyter: true
+user_email: caseysm@gmail.com
+user_name: Casey Schneider-Mizell
