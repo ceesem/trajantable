@@ -100,7 +100,7 @@ cmd = "uv run pytest --cov=trajan tests"
 help = "Run pytest with code coverage."
 
 [tool.poe.tasks.doc-preview]
-cmd = "uv run mkdocs serve"
+cmd = "uv run mkdocs serve -a localhost:8001"
 help = "Preview documentation build locally"
 
 [tool.poe.tasks.profile-all]
