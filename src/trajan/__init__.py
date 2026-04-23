@@ -7,6 +7,8 @@ from .spatial import (
     pack_all_positions,
     pack_position,
     radial_distance,
+    unpack_all_positions,
+    unpack_position,
 )
 from .synapse_table import SynapseTable
 
@@ -16,4 +18,6 @@ __all__ = [
     "pack_all_positions",
     "pack_position",
     "radial_distance",
+    "unpack_all_positions",
+    "unpack_position",
 ]

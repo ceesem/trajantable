@@ -52,21 +52,21 @@ class SynapseTable:
 
     Parameters
     ----------
-    syn_df:
+    syn_df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
         Synapse table, one row per synapse.
-    pre_col:
+    pre_col : str, optional
         Column name for the pre-synaptic cell id.
-    post_col:
+    post_col : str, optional
         Column name for the post-synaptic cell id.
-    id_col:
+    id_col : str, optional
         Column name for the synapse id (used to join synapse annotations).
-    synapse_position_col:
+    synapse_position_col : str or None, optional
         Column in syn_df holding synapse positions as a struct with x, y, z fields.
         Required for filter_by_bbox.
-    soma_position_annotation:
+    soma_position_annotation : str or None, optional
         Name of the registered cell annotation that holds soma positions.
         Required for filter_by_soma_distance.
-    soma_position_col:
+    soma_position_col : str or None, optional
         Column within the soma position annotation that holds positions as a struct
         with x, y, z fields. Required for filter_by_soma_distance.
     """
@@ -195,7 +195,12 @@ class SynapseTable:
 
         Parameters
         ----------
-        position_cols:
+        name : str
+            Identifier for this annotation; used to remove it later via
+            remove_synapse_annotation.
+        df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
+            Annotation table. Must contain id_col plus data columns.
+        position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "ctr_pt_position" or ["ctr_pt_position"] will
             pack ctr_pt_position_x/y/z into a struct named ctr_pt_position.
@@ -240,23 +245,33 @@ class SynapseTable:
 
         Parameters
         ----------
-        cell_id_col:
+        name : str
+            Identifier for this annotation; used to remove it later via
+            remove_cell_annotation.
+        df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
+            Annotation table. Must contain cell_id_col plus data columns.
+        cell_id_col : str
             The column in df containing cell ids to join on.
-        join_on_alias:
+        join_on_alias : str or None, optional
             If None (default), joins on root ID columns (pre_col/post_col).
             If a string, names the cell alias to join on — the alias must have
             been registered via set_cell_alias() or alias_col on a prior call.
-        alias_col:
+        alias_col : str or None, optional
             If provided, registers this annotation as a cell alias source.
             Equivalent to calling set_cell_alias(name, alias_col, alias_name)
             immediately after registration.
-        alias_name:
+        alias_name : str or None, optional
             Name under which to register the alias. Defaults to the annotation
             name. Only used when alias_col is also provided.
-        position_cols:
+        position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "soma_pt_position" or ["soma_pt_position"] will
             pack soma_pt_position_x/y/z into a struct named soma_pt_position.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
         """
         if join_on_alias is not None and join_on_alias not in self._cell_aliases:
             raise ValueError(
@@ -325,16 +340,21 @@ class SynapseTable:
 
         Parameters
         ----------
-        annotation_name:
+        annotation_name : str
             Name of an already-registered cell annotation whose data columns
             include col. This annotation must itself join on root ID
             (join_on_alias=None).
-        col:
+        col : str, optional
             Column within the annotation that holds the aliased cell IDs.
             Defaults to "cell_id".
-        alias_name:
+        alias_name : str or None, optional
             Name used to reference this alias in join_on_alias. Defaults to
             the annotation name.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
 
         Raises
         ------
@@ -377,16 +397,21 @@ class SynapseTable:
 
         Parameters
         ----------
-        name:
+        name : str
             Name of the existing cell annotation to extend.
-        df:
+        df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
             DataFrame or LazyFrame containing the new columns and the join key.
-        on:
+        on : str
             Column name to join on. Must exist in the already-registered annotation
             and must be unique in df.
-        position_cols:
+        position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z into a position
             struct before registering.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
         """
         if name not in self._cell_annotations:
             raise KeyError(f"No cell annotation named {name!r}")
@@ -447,18 +472,28 @@ class SynapseTable:
 
         Parameters
         ----------
-        vertex_id_col:
+        name : str
+            Identifier for this annotation; used to remove it later via
+            remove_vertex_annotation.
+        df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
+            Annotation table. Must contain vertex_id_col plus data columns.
+        vertex_id_col : str
             The column in df containing vertex ids to join on.
-        pre_vertex_col:
+        pre_vertex_col : str or None, optional
             Column in the synapse table holding pre-synaptic vertex ids.
             If provided, annotation columns appear as col_pre in .synapses.
-        post_vertex_col:
+        post_vertex_col : str or None, optional
             Column in the synapse table holding post-synaptic vertex ids.
             If provided, annotation columns appear as col_post in .synapses.
-        position_cols:
+        position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "pt_position" or ["pt_position"] will pack
             pt_position_x/y/z into a struct named pt_position.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
         """
         if pre_vertex_col is None and post_vertex_col is None:
             raise ValueError(
@@ -509,10 +544,15 @@ class SynapseTable:
 
         Parameters
         ----------
-        name:
+        name : str
             Output column name.
-        expr:
+        expr : pl.Expr
             Polars expression. An alias of name is applied automatically.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
         """
         if name in self._current_columns():
             raise ValueError(f"Column {name!r} already exists in the table")
@@ -627,12 +667,21 @@ class SynapseTable:
 
         Parameters
         ----------
-        synapse_annotations, cell_annotations, vertex_annotations:
+        synapse_annotations : list[str] or None, optional
             Names to include. None keeps all registered; [] keeps none.
-        expressions:
+        cell_annotations : list[str] or None, optional
+            Names to include. None keeps all registered; [] keeps none.
+        vertex_annotations : list[str] or None, optional
+            Names to include. None keeps all registered; [] keeps none.
+        expressions : list[str] or None, optional
             Expression names to include. None keeps all; [] keeps none.
-        keep_filters:
+        keep_filters : bool, optional
             Whether to carry forward registered filters. Default True.
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable with only the requested annotations and expressions.
 
         Raises
         ------
@@ -686,16 +735,38 @@ class SynapseTable:
             raise KeyError(f"No cell or vertex annotation named {annotation_name!r}")
         return pl.col(f"{data_cols[0]}_{side}").is_not_null()
 
-    def filter_to_annotated(self, annotation_name: str) -> SynapseTable:
+    def filter_to_annotated(
+        self, annotation_name: str, pre: bool = True, post: bool = True
+    ) -> SynapseTable:
         """Return a new SynapseTable keeping only synapses where both pre and post
         cells have a non-null value for the given cell or vertex annotation.
 
         Equivalent to:
             st.filter(pl.col("col_pre").is_not_null() & pl.col("col_post").is_not_null())
+
+        Parameters
+        ----------
+        annotation_name : str
+            Name of a registered cell or vertex annotation to filter on.
+        pre : bool, optional
+            If True (default), require the pre-synaptic side to be non-null.
+        post : bool, optional
+            If True (default), require the post-synaptic side to be non-null.
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable with the annotation null filter applied.
         """
-        expr = self._annotation_null_expr(
-            annotation_name, "pre"
-        ) & self._annotation_null_expr(annotation_name, "post")
+        expr = None
+        if pre:
+            expr = self._annotation_null_expr(annotation_name, "pre")
+        if post:
+            expr = (
+                expr & self._annotation_null_expr(annotation_name, "post")
+                if expr is not None
+                else self._annotation_null_expr(annotation_name, "post")
+            )
         return self.filter(expr)
 
     def filter(self, expr: pl.Expr) -> SynapseTable:
@@ -704,6 +775,16 @@ class SynapseTable:
         The filter is pushed into the query plan after all annotation joins,
         so any column in .synapses is valid. Polars' optimizer will push
         predicates on base synapse columns before the joins automatically.
+
+        Parameters
+        ----------
+        expr : pl.Expr
+            A Polars boolean expression to filter rows by.
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable with the filter registered.
 
         Example
         -------
@@ -727,10 +808,18 @@ class SynapseTable:
 
         Parameters
         ----------
-        distance_fn:
+        max_distance : float
+            Maximum soma-to-soma distance to retain, in the same units as
+            the position columns.
+        distance_fn : Callable[[str, str], pl.Expr], optional
             Callable taking two column name strings and returning a pl.Expr for
             the distance. Defaults to euclidean_distance. Use radial_distance to
             ignore the z axis, or supply a custom function.
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable keeping only synapses within max_distance.
         """
         if self._soma_position_annotation is None:
             raise ValueError("soma_position_annotation not set on this SynapseTable")
@@ -745,6 +834,47 @@ class SynapseTable:
         post_col = f"{self._soma_position_col}_post"
         return self.filter(distance_fn(pre_col, post_col) <= max_distance)
 
+    def filter_by_ids(
+        self,
+        pre_ids=None,
+        post_ids=None,
+    ) -> SynapseTable:
+        """Return a new SynapseTable keeping only synapses involving specified cell IDs.
+
+        Filters are applied on the base pre/post root ID columns, so this works
+        even before cell annotations are joined.
+
+        Parameters
+        ----------
+        pre_ids : Iterable or None, optional
+            Iterable of pre-synaptic cell IDs to keep. None means no filter on pre.
+        post_ids : Iterable or None, optional
+            Iterable of post-synaptic cell IDs to keep. None means no filter on post.
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable filtered to the specified cell IDs.
+
+        Examples
+        --------
+        Keep only synapses from a specific set of pre cells:
+
+        >>> st.filter_by_ids(pre_ids=[111, 222, 333])
+
+        Keep synapses between two specific populations:
+
+        >>> st.filter_by_ids(pre_ids=excitatory_ids, post_ids=inhibitory_ids)
+        """
+        if pre_ids is None and post_ids is None:
+            return self._copy()
+        new = self
+        if pre_ids is not None:
+            new = new.filter(pl.col(self._pre_col).is_in(list(pre_ids)))
+        if post_ids is not None:
+            new = new.filter(pl.col(self._post_col).is_in(list(post_ids)))
+        return new
+
     def filter_by_bbox(self, bbox) -> SynapseTable:
         """Filter synapses whose position falls within a bounding box.
 
@@ -753,8 +883,13 @@ class SynapseTable:
 
         Parameters
         ----------
-        bbox:
+        bbox : Sequence
             Sequence of two (x, y, z) corners: ((xmin, ymin, zmin), (xmax, ymax, zmax)).
+
+        Returns
+        -------
+        SynapseTable
+            A new SynapseTable keeping only synapses within the bounding box.
         """
         if self._synapse_position_col is None:
             raise ValueError("synapse_position_col not set on this SynapseTable")
@@ -771,7 +906,12 @@ class SynapseTable:
 
     # ── edgelist ───────────────────────────────────────────────────────────
 
-    def edgelist(self, agg: dict[str, pl.Expr] | None = None) -> pl.DataFrame:
+    def edgelist(
+        self,
+        agg: dict[str, pl.Expr] | None = None,
+        pre_anno: bool = True,
+        post_anno: bool = True,
+    ) -> pl.DataFrame:
         """Aggregate synapses into a cell-pair edgelist.
 
         Always includes n_syn (synapse count per pair). Additional aggregations
@@ -779,19 +919,103 @@ class SynapseTable:
 
         Parameters
         ----------
-        agg:
+        agg : dict[str, pl.Expr] or None, optional
             {output_column_name: polars_expression} for additional aggregations.
             Example: {"mean_size": pl.mean("size"), "total_area": pl.sum("area")}
+        pre_anno : bool, optional
+            If True (default), include all cell annotation columns for the
+            pre-synaptic side (``*_pre``) using ``.first()``.
+        post_anno : bool, optional
+            If True (default), include all cell annotation columns for the
+            post-synaptic side (``*_post``) using ``.first()``.
+
+        Returns
+        -------
+        pl.DataFrame
+            Edgelist with columns [pre_col, post_col, "n_syn"] plus any agg columns
+            and, if requested, cell annotation columns.
         """
         agg_exprs = [pl.len().alias("n_syn")]
         if agg:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
+
+        if pre_anno or post_anno:
+            for _, _, _, data_cols in self._cell_annotations.values():
+                if pre_anno:
+                    agg_exprs.extend(pl.col(f"{c}_pre").first() for c in data_cols)
+                if post_anno:
+                    agg_exprs.extend(pl.col(f"{c}_post").first() for c in data_cols)
+
         return (
             self._build_lazy()
             .group_by([self._pre_col, self._post_col])
             .agg(agg_exprs)
             .collect()
         )
+
+    def type_edgelist(
+        self,
+        pre_col: str,
+        post_col: str | None = None,
+        agg: dict[str, pl.Expr] | None = None,
+    ) -> pl.DataFrame:
+        """Aggregate synapses into a type-to-type edgelist.
+
+        Groups synapses by cell-type annotation columns rather than individual
+        cell IDs, producing synapse counts (and optional aggregations) between
+        cell-type categories. This is a fast path to the type-level connectivity
+        table that would otherwise require joining the result of edgelist() back
+        to annotation data.
+
+        Parameters
+        ----------
+        pre_col : str
+            Column in .synapses to use as the pre-synaptic grouping key.
+            Typically a cell annotation column such as ``"cell_type_pre"``.
+        post_col : str or None, optional
+            Column in .synapses to use as the post-synaptic grouping key.
+            Defaults to the corresponding ``*_post`` column: if pre_col ends
+            with ``_pre``, post_col becomes the same name with ``_post``; otherwise
+            post_col defaults to pre_col.
+        agg : dict[str, pl.Expr] or None, optional
+            {output_column_name: polars_expression} for additional per-pair
+            aggregations, applied after the type grouping.
+
+        Returns
+        -------
+        pl.DataFrame
+            DataFrame with columns [pre_col, post_col, "n_syn"] plus any agg columns.
+
+        Examples
+        --------
+        Synapse counts between cell types:
+
+        >>> el = st.type_edgelist("cell_type_pre")
+        >>> el.columns
+        ['cell_type_pre', 'cell_type_post', 'n_syn']
+
+        Using an asymmetric grouping:
+
+        >>> el = st.type_edgelist("cell_type_pre", post_col="broad_type_post")
+
+        With extra aggregations:
+
+        >>> el = st.type_edgelist(
+        ...     "cell_type_pre",
+        ...     agg={"mean_size": pl.mean("size")},
+        ... )
+        """
+        if post_col is None:
+            if pre_col.endswith("_pre"):
+                post_col = pre_col[:-4] + "_post"
+            else:
+                post_col = pre_col
+
+        agg_exprs = [pl.len().alias("n_syn")]
+        if agg:
+            agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
+
+        return self._build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
 
     # ── matrix ─────────────────────────────────────────────────────────────
 
@@ -807,19 +1031,27 @@ class SynapseTable:
 
         Parameters
         ----------
-        values:
+        values : str, optional
             Column to use as matrix entries. "n_syn" (synapse count) is always
             available; any other column is summed per cell pair.
-        fill_value:
+        fill_value : float, optional
             Value for missing pairs.
-        pre_ids, post_ids:
-            Constrain or pad rows/columns to a fixed cell set. Missing cells
+        pre_ids : Iterable or None, optional
+            Constrain or pad rows to a fixed cell set. Missing cells
             are filled with fill_value.
-        filter_annotated:
+        post_ids : Iterable or None, optional
+            Constrain or pad columns to a fixed cell set. Missing cells
+            are filled with fill_value.
+        filter_annotated : str or dict[str, str] or None, optional
             Restrict to synapses where cells have non-null annotation values.
             str: filter both pre and post on the named annotation.
             dict: per-side control, e.g. {"pre": "cell_id"} or
             {"pre": "cell_id", "post": "other_annotation"}.
+
+        Returns
+        -------
+        pl.DataFrame
+            Pivot table with pre cell IDs as rows and post cell IDs as columns.
         """
         st = self
         if isinstance(filter_annotated, str):
@@ -828,9 +1060,11 @@ class SynapseTable:
             for side, ann in filter_annotated.items():
                 st = st.filter(st._annotation_null_expr(ann, side))
         if values == "n_syn":
-            el = st.edgelist()
+            el = st.edgelist(pre_anno=False, post_anno=False)
         else:
-            el = st.edgelist(agg={values: pl.sum(values)})
+            el = st.edgelist(
+                agg={values: pl.sum(values)}, pre_anno=False, post_anno=False
+            )
 
         result = el.pivot(
             on=self._post_col,
@@ -868,13 +1102,13 @@ class SynapseTable:
 
         Parameters
         ----------
-        by:
+        by : str, optional
             "pre" — normalize by each pre cell's total output synaptic weight.
             "post" — normalize by each post cell's total input synaptic weight.
-        values:
+        values : str, optional
             Column to normalize. "n_syn" counts synapses per pair; any other
             column is summed per pair before normalizing.
-        group_col:
+        group_col : str or None, optional
             Cell annotation name (without _pre/_post suffix) to collapse the
             "other" side before normalizing. Resolved to _pre or _post
             automatically from `by`.
@@ -882,9 +1116,15 @@ class SynapseTable:
             Example: group_col="broad_type" with by="pre" computes what
             fraction of each pre cell's output goes to each post cell type.
             group_col=None preserves individual cell identity on both sides.
-        pivot:
+        pivot : bool, optional
             False (default): return tidy DataFrame with a "fraction" column.
             True: pivot into a matrix (self_col rows × other/group columns).
+
+        Returns
+        -------
+        pl.DataFrame
+            Tidy DataFrame with a "fraction" column, or a pivot matrix if
+            pivot=True.
         """
         if by == "pre":
             self_col = self._pre_col
@@ -930,6 +1170,223 @@ class SynapseTable:
 
         return result
 
+    # ── graph export ───────────────────────────────────────────────────────
+
+    def to_graph(
+        self,
+        edge_agg: dict[str, pl.Expr] | None = None,
+        cell_agg: dict[str, pl.Expr] | None = None,
+        backend: str = "networkx",
+    ):
+        """Convert the synapse table to a directed graph.
+
+        Nodes are cell IDs. Cell annotation columns (``*_pre`` / ``*_post``) are
+        stored as node attributes, with the ``_pre`` / ``_post`` suffix stripped.
+        Where pre and post values differ for the same cell, the first encountered
+        value is kept. Edge attributes are ``n_syn`` plus any ``edge_agg`` columns.
+
+        Parameters
+        ----------
+        edge_agg : dict[str, pl.Expr] or None, optional
+            Additional per-cell-pair aggregations forwarded to :meth:`edgelist`.
+            Results become edge attributes.
+        cell_agg : dict[str, pl.Expr] or None, optional
+            Additional per-cell aggregations computed by grouping the full synapse
+            lazy plan by cell ID. Results become node attributes. Aggregations are
+            computed once over all synapses where the cell appears on either side,
+            with the pre-side result taking precedence on conflicts.
+        backend : str, optional
+            Graph library to use. One of ``"networkx"`` (default), ``"igraph"``,
+            or ``"csgraph"``. The matching library must be installed.
+
+            ``"csgraph"`` returns a ``(scipy.sparse.csr_array, cell_ids)`` tuple
+            rather than a graph object; node annotations are not representable in
+            a sparse matrix and are omitted.
+
+        Returns
+        -------
+        networkx.DiGraph or igraph.Graph or tuple[scipy.sparse.csr_array, list]
+
+        Examples
+        --------
+        >>> G = st.to_graph()
+        >>> G.nodes[111]
+        {'cell_type': 'L2/3 ET'}
+        >>> G.edges[111, 222]
+        {'n_syn': 14}
+
+        With per-cell aggregation as node attributes:
+
+        >>> G = st.to_graph(cell_agg={"n_output": pl.len()})
+
+        igraph backend:
+
+        >>> g = st.to_graph(backend="igraph")
+        >>> g.vs["name"]
+        [111, 222, 333]
+
+        Scipy sparse matrix:
+
+        >>> mat, cell_ids = st.to_graph(backend="csgraph")
+        """
+        if backend not in ("networkx", "igraph", "csgraph"):
+            raise ValueError(
+                f"backend must be 'networkx', 'igraph', or 'csgraph', got {backend!r}"
+            )
+
+        el = self.edgelist(agg=edge_agg)
+
+        # ── shared setup ──────────────────────────────────────────────────────
+        # Cell annotation attribute columns (present in el as *_pre / *_post)
+        anno_cols: list[str] = []
+        for _, _, _, data_cols in self._cell_annotations.values():
+            anno_cols.extend(data_cols)
+
+        anno_suffixed = {f"{c}_pre" for c in anno_cols} | {
+            f"{c}_post" for c in anno_cols
+        }
+        edge_cols = [
+            c
+            for c in el.columns
+            if c not in {self._pre_col, self._post_col} and c not in anno_suffixed
+        ]
+
+        # Ordered unique cell IDs (pre union post, preserving first-seen order)
+        seen: dict = {}
+        for row in el.iter_rows(named=True):
+            seen.setdefault(row[self._pre_col], None)
+            seen.setdefault(row[self._post_col], None)
+        cell_ids = list(seen)
+        idx_map = {cid: i for i, cid in enumerate(cell_ids)}
+
+        # Node attribute dict: cell_id → {attr: value}
+        node_attrs: dict = {cid: {} for cid in cell_ids}
+        for row in el.iter_rows(named=True):
+            for cell_id, side in [
+                (row[self._pre_col], "pre"),
+                (row[self._post_col], "post"),
+            ]:
+                attrs = node_attrs[cell_id]
+                if not attrs:  # first encounter — populate from annotation cols
+                    attrs.update(
+                        {
+                            c: row[f"{c}_{side}"]
+                            for c in anno_cols
+                            if f"{c}_{side}" in el.columns
+                        }
+                    )
+
+        # Merge cell_agg results into node_attrs
+        if cell_agg:
+            agg_exprs = [expr.alias(name) for name, expr in cell_agg.items()]
+            lf = self._build_lazy()
+            for id_col in (self._post_col, self._pre_col):  # pre wins on conflict
+                per_cell = lf.group_by(id_col).agg(agg_exprs).collect()
+                for row in per_cell.iter_rows(named=True):
+                    cid = row[id_col]
+                    if cid in node_attrs:
+                        node_attrs[cid].update(
+                            {k: v for k, v in row.items() if k != id_col}
+                        )
+
+        # ── backend dispatch ──────────────────────────────────────────────────
+        if backend == "networkx":
+            try:
+                import networkx as nx
+            except ImportError as e:
+                raise ImportError(
+                    "NetworkX is required for backend='networkx'. "
+                    "Install it with: uv add networkx"
+                ) from e
+
+            G = nx.DiGraph()
+            for cid in cell_ids:
+                G.add_node(cid, **node_attrs[cid])
+            for row in el.iter_rows(named=True):
+                G.add_edge(
+                    row[self._pre_col],
+                    row[self._post_col],
+                    **{c: row[c] for c in edge_cols},
+                )
+            return G
+
+        elif backend == "igraph":
+            try:
+                import igraph
+            except ImportError as e:
+                raise ImportError(
+                    "igraph is required for backend='igraph'. "
+                    "Install it with: uv add igraph"
+                ) from e
+
+            g = igraph.Graph(n=len(cell_ids), directed=True)
+            g.vs["name"] = cell_ids
+            # Set node attribute arrays
+            attr_keys = {k for attrs in node_attrs.values() for k in attrs}
+            for key in attr_keys:
+                g.vs[key] = [node_attrs[cid].get(key) for cid in cell_ids]
+            # Add edges
+            g.add_edges(
+                [
+                    (idx_map[row[self._pre_col]], idx_map[row[self._post_col]])
+                    for row in el.iter_rows(named=True)
+                ]
+            )
+            for col in edge_cols:
+                g.es[col] = el[col].to_list()
+            return g
+
+        else:  # csgraph
+            try:
+                import scipy.sparse as sp
+            except ImportError as e:
+                raise ImportError(
+                    "SciPy is required for backend='csgraph'. "
+                    "Install it with: uv add scipy"
+                ) from e
+
+            n = len(cell_ids)
+            data = el["n_syn"].to_numpy()
+            row_idx = [idx_map[v] for v in el[self._pre_col].to_list()]
+            col_idx = [idx_map[v] for v in el[self._post_col].to_list()]
+            matrix = sp.csr_array((data, (row_idx, col_idx)), shape=(n, n))
+            return matrix, cell_ids
+
+    # ── dataframe export ───────────────────────────────────────────────────
+
+    def to_dataframe(self, unpack_positions: bool = True):
+        """Return .synapses as a pandas DataFrame.
+
+        Requires pandas (``pip install pandas`` or ``uv add pandas``).
+
+        Parameters
+        ----------
+        unpack_positions : bool, optional
+            If True (default), unpack any struct columns with x, y, z fields
+            into flat ``{col}_x``, ``{col}_y``, ``{col}_z`` columns. This is
+            necessary because pandas cannot natively represent Polars structs.
+
+        Returns
+        -------
+        pandas.DataFrame
+
+        Examples
+        --------
+        >>> df = st.to_dataframe()
+        >>> df.columns
+        Index(['pre_pt_root_id', 'post_pt_root_id', 'soma_pt_position_x', ...])
+        """
+        if not _HAS_PANDAS:
+            raise ImportError(
+                "pandas is required for to_dataframe(). Install it with: uv add pandas"
+            )
+        df = self.synapses
+        if unpack_positions:
+            from .spatial import unpack_all_positions
+
+            df = unpack_all_positions(df)
+        return df.to_pandas()
+
     # ── persistence ────────────────────────────────────────────────────────
 
     def save(self, folio, overwrite: bool = False) -> None:
@@ -940,9 +1397,9 @@ class SynapseTable:
 
         Parameters
         ----------
-        folio:
+        folio : DataFolio
             A DataFolio instance to save into.
-        overwrite:
+        overwrite : bool, optional
             If True, overwrite existing items in the folio.
         """
         config = {
@@ -1009,8 +1466,14 @@ class SynapseTable:
 
         Parameters
         ----------
-        folio:
+        folio : DataFolio
             A DataFolio instance previously written by .save().
+
+        Returns
+        -------
+        SynapseTable
+            A fully reconstructed SynapseTable with all annotations, expressions,
+            and filters restored.
         """
 
         def _lf(name: str) -> pl.LazyFrame:

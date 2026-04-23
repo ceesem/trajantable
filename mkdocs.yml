@@ -5,6 +5,13 @@ repo_name: ceesem/trajan
 
 nav:
 - About: index.md
+- Guides:
+    - SynapseTable: guides/synapse-table.md
+    - Annotations: guides/annotations.md
+    - Cell ID aliasing: guides/cell-aliases.md
+    - Filtering: guides/filtering.md
+    - Connectivity representations: guides/output.md
+    - Persistence: guides/persistence.md
 - Function Reference:
     - reference/api.md
 - Changelog: changelog.md

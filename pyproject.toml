@@ -26,6 +26,9 @@ dev = [
     "pytest",
     "pytest-cov",
     "bump-my-version",
+    "networkx>=3.4.2",
+    "igraph>=1.0.0",
+    "scipy>=1.15.3",
 ]
 lint = [
     "ruff",
