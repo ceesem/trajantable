@@ -188,7 +188,7 @@ class SynapseTable:
         elif not self._filters:
             n = self._n_syn_base
         else:
-            n = self._build_lazy().select(pl.len()).collect().item()
+            n = self.build_lazy().select(pl.len()).collect().item()
         lines.append(f"SynapseTable  ({n:,} synapses, {len(self._filters)} filter(s))")
         lines.append("")
 
@@ -402,6 +402,51 @@ class SynapseTable:
     def cell_aliases(self) -> dict[str, tuple[str, str]]:
         """Registered cell aliases: {alias_name: (annotation_name, col)}."""
         return dict(self._cell_aliases)
+
+    # ── role-declared blessed columns ──────────────────────────────────────
+
+    @property
+    def pre_col(self) -> str:
+        """Column name for the pre-synaptic cell id."""
+        return self._pre_col
+
+    @property
+    def post_col(self) -> str:
+        """Column name for the post-synaptic cell id."""
+        return self._post_col
+
+    @property
+    def id_col(self) -> str:
+        """Column name for the synapse id (used to join synapse annotations)."""
+        return self._id_col
+
+    @property
+    def synapse_position_col(self) -> str | None:
+        """Column holding synapse positions as a struct with x, y, z fields, if declared."""
+        return self._synapse_position_col
+
+    @property
+    def soma_position_annotation(self) -> str | None:
+        """Name of the registered cell annotation that holds soma positions, if declared."""
+        return self._soma_position_annotation
+
+    @property
+    def soma_position_col(self) -> str | None:
+        """Column within the soma position annotation that holds positions, if declared."""
+        return self._soma_position_col
+
+    def cell_annotation_data_cols(self) -> dict[str, list[str]]:
+        """Data columns (non-key) for each registered cell annotation.
+
+        Returns a fresh dict mapping annotation name to a fresh list of data
+        column names. Consumers (e.g. free-function extractions of
+        ``cell_summary`` / ``to_graph``) use this to enumerate annotation
+        columns without reaching into the private storage tuple.
+        """
+        return {
+            name: list(data_cols)
+            for name, (_, _, _, data_cols) in self._cell_annotations.items()
+        }
 
     # ── internal column tracking ───────────────────────────────────────────
 
@@ -997,7 +1042,18 @@ class SynapseTable:
 
     # ── lazy plan construction ─────────────────────────────────────────────
 
-    def _build_lazy(self) -> pl.LazyFrame:
+    def build_lazy(self) -> pl.LazyFrame:
+        """Construct (without collecting) the full annotated + filtered lazy plan.
+
+        Applies all registered synapse, cell, and vertex annotation joins,
+        computed expressions (in registration order), and accumulated filters.
+        Does not hit the materialization cache — call ``.synapses`` for the
+        cached collected result.
+
+        This is the public entry point for consumers (free functions, free-
+        standing statistics) that need the lazy plan without going through
+        ``.synapses``. Renamed from the previous ``_build_lazy`` internal.
+        """
         lf = self._syn_lf
 
         for ann_lf, _ in self._synapse_annotations.values():
@@ -1053,7 +1109,7 @@ class SynapseTable:
     def synapses(self) -> pl.DataFrame:
         """Full merged synapse table with all registered annotations. Cached."""
         if self._cache is None:
-            self._cache = self._build_lazy().collect()
+            self._cache = self.build_lazy().collect()
         return self._cache
 
     # ── copy helper ────────────────────────────────────────────────────────
@@ -1476,7 +1532,7 @@ class SynapseTable:
         if weight_col is not None and weight_col not in self._current_columns():
             raise ValueError(f"Column {weight_col!r} not found in table.")
 
-        lf = self._build_lazy()
+        lf = self.build_lazy()
         if weight_col is None:
             pair_agg = lf.group_by([self._pre_col, self._post_col]).agg(
                 pl.len().alias("_agg")
@@ -1579,7 +1635,7 @@ class SynapseTable:
                     agg_exprs.append(pl.col(name).first())
 
         return (
-            self._build_lazy()
+            self.build_lazy()
             .group_by([self._pre_col, self._post_col])
             .agg(agg_exprs)
             .collect()
@@ -1648,7 +1704,7 @@ class SynapseTable:
         if agg:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
 
-        return self._build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
+        return self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
 
     # ── matrix ─────────────────────────────────────────────────────────────
 
@@ -1761,7 +1817,7 @@ class SynapseTable:
             - any ``pre_agg`` / ``post_agg`` columns
             - cell annotation columns (if ``include_annotations=True``)
         """
-        lf = self._build_lazy()
+        lf = self.build_lazy()
 
         anno_cols: list[str] = [
             c
@@ -1873,7 +1929,7 @@ class SynapseTable:
         else:
             val_expr = pl.sum(values).alias(values)
 
-        agg_lf = self._build_lazy().group_by(group_by_cols).agg(val_expr)
+        agg_lf = self.build_lazy().group_by(group_by_cols).agg(val_expr)
         totals_lf = agg_lf.group_by(self_col).agg(pl.sum(values).alias("_total"))
 
         result = (
@@ -2002,7 +2058,7 @@ class SynapseTable:
         # Merge cell_agg results into node_attrs
         if cell_agg:
             agg_exprs = [expr.alias(name) for name, expr in cell_agg.items()]
-            lf = self._build_lazy()
+            lf = self.build_lazy()
             for id_col in (self._post_col, self._pre_col):  # pre wins on conflict
                 per_cell = lf.group_by(id_col).agg(agg_exprs).collect()
                 for row in per_cell.iter_rows(named=True):

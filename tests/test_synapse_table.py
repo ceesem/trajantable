@@ -1147,3 +1147,46 @@ def test_info_filter_count(st):
     filtered = st.filter(pl.col("pre_pt_root_id") == 10)
     text = filtered.info()
     assert "1 filter(s)" in text
+
+
+# ── role-declared public accessors (Phase 0) ──────────────────────────────────
+
+
+def test_role_accessors_default(st):
+    assert st.pre_col == "pre_pt_root_id"
+    assert st.post_col == "post_pt_root_id"
+    assert st.id_col == "id"
+    assert st.synapse_position_col is None
+    assert st.soma_position_annotation is None
+    assert st.soma_position_col is None
+
+
+def test_role_accessors_non_default(base_synapses):
+    st = SynapseTable(
+        base_synapses,
+        pre_col="pre_pt_root_id",
+        post_col="post_pt_root_id",
+        id_col="id",
+        soma_position_annotation="soma",
+        soma_position_col="pt_position",
+    )
+    assert st.soma_position_annotation == "soma"
+    assert st.soma_position_col == "pt_position"
+
+
+def test_build_lazy_is_public(st):
+    lf = st.build_lazy()
+    assert isinstance(lf, pl.LazyFrame)
+    assert lf.collect().equals(st.synapses)
+
+
+def test_cell_annotation_data_cols(st):
+    assert st.cell_annotation_data_cols() == {}
+    ann = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["a", "b", "c"]})
+    st.add_cell_annotation("types", ann, cell_id_col="root_id")
+    assert st.cell_annotation_data_cols() == {"types": ["cell_type"]}
+    # mutating the returned dict must not affect internal state
+    d = st.cell_annotation_data_cols()
+    d["types"].append("bogus")
+    d["other"] = ["nope"]
+    assert st.cell_annotation_data_cols() == {"types": ["cell_type"]}
