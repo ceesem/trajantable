@@ -4,6 +4,7 @@ from unittest.mock import patch
 import polars as pl
 import pytest
 
+from trajan import to_graph
 from trajan.synapse_table import SynapseTable
 
 
@@ -258,34 +259,34 @@ def st_graph(base_synapses):
 def test_to_graph_invalid_backend(st_graph):
     """Unknown backend raises ValueError."""
     with pytest.raises(ValueError, match="backend"):
-        st_graph.to_graph(backend="gephi")
+        to_graph(st_graph, backend="gephi")
 
 
 def test_to_graph_missing_networkx(st_graph):
     """Missing networkx raises ImportError with install hint."""
     with patch.dict(sys.modules, {"networkx": None}):
         with pytest.raises(ImportError, match="networkx"):
-            st_graph.to_graph(backend="networkx")
+            to_graph(st_graph, backend="networkx")
 
 
 def test_to_graph_missing_igraph(st_graph):
     """Missing igraph raises ImportError with install hint."""
     with patch.dict(sys.modules, {"igraph": None}):
         with pytest.raises(ImportError, match="igraph"):
-            st_graph.to_graph(backend="igraph")
+            to_graph(st_graph, backend="igraph")
 
 
 def test_to_graph_missing_scipy(st_graph):
     """Missing scipy raises ImportError with install hint."""
     with patch.dict(sys.modules, {"scipy.sparse": None, "scipy": None}):
         with pytest.raises(ImportError, match="[Ss]ci[Pp]y"):
-            st_graph.to_graph(backend="csgraph")
+            to_graph(st_graph, backend="csgraph")
 
 
 def test_to_graph_networkx_structure(st_graph):
     """networkx graph has correct node/edge counts and attributes."""
     nx = pytest.importorskip("networkx")
-    G = st_graph.to_graph(backend="networkx")
+    G = to_graph(st_graph, backend="networkx")
     assert isinstance(G, nx.DiGraph)
     assert set(G.nodes) == {10, 20, 30}
     assert G.number_of_edges() == 5  # 5 unique pre/post pairs in base_synapses
@@ -299,7 +300,7 @@ def test_to_graph_networkx_structure(st_graph):
 def test_to_graph_igraph_structure(st_graph):
     """igraph graph has correct vertex/edge counts and attributes."""
     igraph = pytest.importorskip("igraph")
-    g = st_graph.to_graph(backend="igraph")
+    g = to_graph(st_graph, backend="igraph")
     assert isinstance(g, igraph.Graph)
     assert g.is_directed()
     assert g.vcount() == 3
@@ -312,7 +313,7 @@ def test_to_graph_igraph_structure(st_graph):
 def test_to_graph_csgraph_structure(st_graph):
     """csgraph returns a (sparse_matrix, cell_ids) tuple with correct shape."""
     pytest.importorskip("scipy")
-    mat, cell_ids = st_graph.to_graph(backend="csgraph")
+    mat, cell_ids = to_graph(st_graph, backend="csgraph")
     assert len(cell_ids) == 3
     assert mat.shape == (3, 3)
     # total synapse count across all edges should equal 5 (one per synapse row)
@@ -322,7 +323,7 @@ def test_to_graph_csgraph_structure(st_graph):
 def test_to_graph_cell_agg_node_attrs(st_graph):
     """cell_agg results appear as node attributes."""
     nx = pytest.importorskip("networkx")
-    G = st_graph.to_graph(cell_agg={"total_syn": pl.len()}, backend="networkx")
+    G = to_graph(st_graph, cell_agg={"total_syn": pl.len()}, backend="networkx")
     for node in G.nodes:
         assert "total_syn" in G.nodes[node]
         assert G.nodes[node]["total_syn"] >= 1
@@ -341,7 +342,7 @@ def test_to_graph_edge_agg(st_graph):
         }
     )
     st2 = SynapseTable(syn_with_size)
-    G = st2.to_graph(edge_agg={"mean_size": pl.mean("size")}, backend="networkx")
+    G = to_graph(st2, edge_agg={"mean_size": pl.mean("size")}, backend="networkx")
     for _, _, data in G.edges(data=True):
         assert "mean_size" in data
 

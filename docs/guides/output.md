@@ -153,27 +153,32 @@ el = st.type_edgelist("cell_type_pre", agg={"mean_size": pl.mean("size")})
 
 ## Graph export
 
-`to_graph()` exports the synapse table as a directed graph. Cell annotation
-columns become node attributes with the `_pre` / `_post` suffix stripped:
+`trajan.to_graph(st, ...)` exports the synapse table as a directed graph. It is
+a free function (not a method on `SynapseTable`) because it produces a derived
+artifact rather than mutating or chaining state. Cell annotation columns
+become node attributes with the `_pre` / `_post` suffix stripped:
 
 ```python
+import trajan
+
 # NetworkX (default) — requires: uv add networkx
-G = st.to_graph()
+G = trajan.to_graph(st)
 G.nodes[111]   # {'cell_type': 'L2/3 ET'}
 G.edges[111, 222]  # {'n_syn': 14}
 
 # igraph — requires: uv add igraph
-g = st.to_graph(backend="igraph")
+g = trajan.to_graph(st, backend="igraph")
 
 # Scipy sparse matrix — requires: uv add scipy
-mat, cell_ids = st.to_graph(backend="csgraph")
+mat, cell_ids = trajan.to_graph(st, backend="csgraph")
 # returns (csr_array, array of cell IDs) rather than a graph object
 ```
 
 Add edge attributes with `edge_agg` and per-cell node attributes with `cell_agg`:
 
 ```python
-G = st.to_graph(
+G = trajan.to_graph(
+    st,
     edge_agg={"mean_size": pl.mean("size")},
     cell_agg={"n_output": pl.len()},  # computed from the pre side
 )
@@ -181,12 +186,13 @@ G = st.to_graph(
 
 ## Pandas export
 
-`to_dataframe()` materializes `.synapses` as a pandas DataFrame. Polars struct
-columns (positions) cannot be represented directly in pandas, so they are
-automatically unpacked into flat `_x` / `_y` / `_z` columns:
+`trajan.to_dataframe(st)` materializes `.synapses` as a pandas DataFrame. Like
+`to_graph`, it is a free function. Polars struct columns (positions) cannot be
+represented directly in pandas, so they are automatically unpacked into flat
+`_x` / `_y` / `_z` columns:
 
 ```python
-df = st.to_dataframe()
+df = trajan.to_dataframe(st)
 # Returns a pandas DataFrame; e.g. ctr_pt_position → ctr_pt_position_x/y/z
 ```
 

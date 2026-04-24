@@ -2,6 +2,7 @@
 
 __version__ = "0.0.1"
 
+from .export import to_dataframe, to_graph
 from .spatial import (
     euclidean_distance,
     pack_all_positions,
@@ -18,6 +19,8 @@ __all__ = [
     "pack_all_positions",
     "pack_position",
     "radial_distance",
+    "to_dataframe",
+    "to_graph",
     "unpack_all_positions",
     "unpack_position",
 ]
