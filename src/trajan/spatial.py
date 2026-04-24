@@ -247,10 +247,11 @@ def euclidean_distance(col_a: str, col_b: str) -> pl.Expr:
 
 
 def radial_distance(col_a: str, col_b: str) -> pl.Expr:
-    """Distance in the xy plane between two position struct columns, ignoring z.
+    """Lateral (horizontal) distance between two position struct columns, ignoring depth.
 
-    Both columns must be structs with x, y, z fields (see pack_position).
-    Returns NaN where either column is null.
+    Computes distance in the xz plane, where y is the cortical depth axis and x/z
+    are the horizontal axes. Both columns must be structs with x, y, z fields
+    (see pack_position). Returns NaN where either column is null.
 
     Parameters
     ----------
@@ -262,11 +263,119 @@ def radial_distance(col_a: str, col_b: str) -> pl.Expr:
     Returns
     -------
     pl.Expr
-        Expression computing the 2-D radial distance in the xy plane,
+        Expression computing the 2-D lateral distance in the xz plane,
         element-wise. NaN where either column is null.
 
     Examples
     --------
     >>> st.filter(radial_distance("soma_pre", "soma_post") <= 30_000)
     """
-    return _sq_distance_expr(col_a, col_b, ("x", "y")).sqrt()
+    return _sq_distance_expr(col_a, col_b, ("x", "z")).sqrt()
+
+
+def spatial_feature_exprs(
+    from_col: str,
+    to_col: str,
+    depth_axis: str = "y",
+    euclidean: bool = True,
+    depth_diff: bool = True,
+    spherical: bool = True,
+    cylindrical: bool = True,
+) -> dict[str, pl.Expr]:
+    """Compute a battery of spatial features for the vector from_col → to_col.
+
+    Both columns must be structs with x, y, z fields (see pack_position).
+    All returned expressions evaluate to NaN (not null) where either column is null.
+
+    The vector **v = to_pos − from_pos** is decomposed into depth and lateral
+    components relative to ``depth_axis``. With ``depth_axis="y"`` (the default
+    cortical convention where y increases with depth), the lateral plane is xz
+    and ``rho`` equals :func:`radial_distance` for the same pair of columns.
+
+    Parameters
+    ----------
+    from_col : str
+        Name of the origin position struct column.
+    to_col : str
+        Name of the destination position struct column.
+    depth_axis : str, optional
+        Axis that represents cortical depth, optionally with a direction suffix.
+        Plain ``"x"``, ``"y"``, or ``"z"`` means positive values go deeper.
+        Append ``"_r"`` to reverse: ``"y_r"`` means positive y is towards the
+        surface (shallower). Defaults to ``"y"``.
+    euclidean : bool, optional
+        Include the Euclidean (3-D) distance. Key: ``"euclidean"``.
+    depth_diff : bool, optional
+        Include the signed depth component of the vector. Key: ``"depth_diff"``.
+    spherical : bool, optional
+        Include spherical coordinates: ``"r"`` (= euclidean), ``"theta"``
+        (polar angle from depth axis, [0, π]), ``"phi"`` (azimuthal angle in
+        lateral plane, [-π, π]).
+    cylindrical : bool, optional
+        Include cylindrical coordinates: ``"rho"`` (lateral distance), ``"phi"``
+        (shared with spherical), ``"dy"`` (= depth_diff).
+
+    Returns
+    -------
+    dict[str, pl.Expr]
+        Mapping of feature name to Polars expression. ``"phi"`` appears at most
+        once even when both ``spherical`` and ``cylindrical`` are True.
+
+    Examples
+    --------
+    >>> feats = spatial_feature_exprs("soma_pre", "soma_post")
+    >>> df.select([expr.alias(name) for name, expr in feats.items()])
+
+    Reverse the depth convention (positive y = shallower):
+
+    >>> feats = spatial_feature_exprs("soma_pre", "soma_post", depth_axis="y_r")
+    """
+    # Parse optional "_r" suffix — reverses the sign of the depth component
+    if depth_axis.endswith("_r"):
+        axis = depth_axis[:-2]
+        depth_sign = -1
+    else:
+        axis = depth_axis
+        depth_sign = 1
+
+    fc, tc = pl.col(from_col), pl.col(to_col)
+    null_cond = fc.is_not_null() & tc.is_not_null()
+    nan = pl.lit(float("nan"))
+
+    def _guard(expr: pl.Expr) -> pl.Expr:
+        return pl.when(null_cond).then(expr).otherwise(nan)
+
+    # Lateral axes: the two axes not equal to axis, sorted for determinism
+    lateral = tuple(sorted({"x", "y", "z"} - {axis}))
+    lat_a, lat_b = lateral
+
+    da = tc.struct.field(lat_a) - fc.struct.field(lat_a)
+    db = tc.struct.field(lat_b) - fc.struct.field(lat_b)
+    dd = depth_sign * (tc.struct.field(axis) - fc.struct.field(axis))
+
+    r_sq = da.pow(2) + db.pow(2) + dd.pow(2)
+    r_expr = r_sq.sqrt()
+
+    result: dict[str, pl.Expr] = {}
+
+    if euclidean:
+        result["euclidean"] = _guard(r_expr)
+
+    if depth_diff:
+        result["depth_diff"] = _guard(dd)
+
+    need_phi = spherical or cylindrical
+    phi_expr = pl.arctan2(db, da) if need_phi else None
+
+    if spherical:
+        result["r"] = _guard(r_expr)
+        result["theta"] = _guard((dd / r_expr).arccos())
+        result["phi"] = _guard(phi_expr)
+
+    if cylindrical:
+        result["rho"] = _guard((da.pow(2) + db.pow(2)).sqrt())
+        if "phi" not in result:
+            result["phi"] = _guard(phi_expr)
+        result["dy"] = _guard(dd)
+
+    return result
