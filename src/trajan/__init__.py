@@ -2,6 +2,7 @@
 
 __version__ = "0.0.1"
 
+from .connectivity_table import ConnectivityTable
 from .export import to_dataframe, to_graph
 from .spatial import (
     euclidean_distance,
@@ -14,6 +15,7 @@ from .spatial import (
 from .synapse_table import SynapseTable
 
 __all__ = [
+    "ConnectivityTable",
     "SynapseTable",
     "euclidean_distance",
     "pack_all_positions",
