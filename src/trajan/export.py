@@ -127,21 +127,24 @@ def to_graph(
         )
 
     pre_col, post_col = st.pre_col, st.post_col
-    el = st.edgelist(agg=edge_agg)
+    # st.edgelist() returns an EdgeList; pull its materialized pair frame.
+    el_df = st.edgelist(agg=edge_agg).pairs
 
-    # Cell annotation attribute columns (present in el as *_pre / *_post)
+    # Cell annotation attribute columns (present in el_df as *_pre / *_post)
     anno_cols: list[str] = []
     for data_cols in st.cell_annotation_data_cols().values():
         anno_cols.extend(data_cols)
 
     anno_suffixed = {f"{c}_pre" for c in anno_cols} | {f"{c}_post" for c in anno_cols}
     edge_cols = [
-        c for c in el.columns if c not in {pre_col, post_col} and c not in anno_suffixed
+        c
+        for c in el_df.columns
+        if c not in {pre_col, post_col} and c not in anno_suffixed
     ]
 
     # Ordered unique cell IDs (pre union post, preserving first-seen order)
     seen: dict = {}
-    for row in el.iter_rows(named=True):
+    for row in el_df.iter_rows(named=True):
         seen.setdefault(row[pre_col], None)
         seen.setdefault(row[post_col], None)
     cell_ids = list(seen)
@@ -149,7 +152,7 @@ def to_graph(
 
     # Node attribute dict: cell_id → {attr: value}
     node_attrs: dict = {cid: {} for cid in cell_ids}
-    for row in el.iter_rows(named=True):
+    for row in el_df.iter_rows(named=True):
         for cell_id, side in [(row[pre_col], "pre"), (row[post_col], "post")]:
             attrs = node_attrs[cell_id]
             if not attrs:  # first encounter — populate from annotation cols
@@ -157,7 +160,7 @@ def to_graph(
                     {
                         c: row[f"{c}_{side}"]
                         for c in anno_cols
-                        if f"{c}_{side}" in el.columns
+                        if f"{c}_{side}" in el_df.columns
                     }
                 )
 
@@ -186,7 +189,7 @@ def to_graph(
         G = nx.DiGraph()
         for cid in cell_ids:
             G.add_node(cid, **node_attrs[cid])
-        for row in el.iter_rows(named=True):
+        for row in el_df.iter_rows(named=True):
             G.add_edge(
                 row[pre_col],
                 row[post_col],
@@ -211,11 +214,11 @@ def to_graph(
         g.add_edges(
             [
                 (idx_map[row[pre_col]], idx_map[row[post_col]])
-                for row in el.iter_rows(named=True)
+                for row in el_df.iter_rows(named=True)
             ]
         )
         for col in edge_cols:
-            g.es[col] = el[col].to_list()
+            g.es[col] = el_df[col].to_list()
         return g
 
     else:  # csgraph
@@ -227,8 +230,8 @@ def to_graph(
             ) from e
 
         n = len(cell_ids)
-        data = el["n_syn"].to_numpy()
-        row_idx = [idx_map[v] for v in el[pre_col].to_list()]
-        col_idx = [idx_map[v] for v in el[post_col].to_list()]
+        data = el_df["n_syn"].to_numpy()
+        row_idx = [idx_map[v] for v in el_df[pre_col].to_list()]
+        col_idx = [idx_map[v] for v in el_df[post_col].to_list()]
         matrix = sp.csr_array((data, (row_idx, col_idx)), shape=(n, n))
         return matrix, cell_ids

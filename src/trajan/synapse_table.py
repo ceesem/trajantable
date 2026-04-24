@@ -15,6 +15,8 @@ from ._base import (
     _auto_pack,
     _to_lazy,
 )
+from .connectivity_table import ConnectivityTable
+from .edgelist import EdgeList
 from .spatial import euclidean_distance, spatial_feature_exprs
 
 try:
@@ -1552,29 +1554,37 @@ class SynapseTable:
         agg: dict[str, pl.Expr] | None = None,
         pre_anno: bool = True,
         post_anno: bool = True,
-    ) -> pl.DataFrame:
-        """Aggregate synapses into a cell-pair edgelist.
+    ) -> EdgeList:
+        """Aggregate synapses into a cell-pair EdgeList.
 
-        Always includes n_syn (synapse count per pair). Additional aggregations
-        over any column in .synapses can be passed via agg.
+        Always produces an ``n_syn`` weight column (synapse count per pair).
+        Registered weights (``self.weights``) are auto-summed. Additional
+        per-pair aggregations can be passed via ``agg``.
+
+        Cell annotation values are carried across as ``{col}_pre`` /
+        ``{col}_post`` columns using ``.first()`` aggregation (they're
+        invariant per cell so ``.first()`` is well-defined), subject to the
+        ``pre_anno`` / ``post_anno`` flags. Side-classified expressions
+        (see ``expression_sides``) ride along the matching side.
 
         Parameters
         ----------
         agg : dict[str, pl.Expr] or None, optional
-            {output_column_name: polars_expression} for additional aggregations.
-            Example: {"mean_size": pl.mean("size"), "total_area": pl.sum("area")}
+            {output_column_name: polars_expression} for additional per-pair
+            aggregations. Example:
+            ``{"mean_size": pl.mean("size"), "total_area": pl.sum("area")}``.
         pre_anno : bool, optional
-            If True (default), include all cell annotation columns for the
-            pre-synaptic side (``*_pre``) using ``.first()``.
+            If True (default), carry pre-side cell annotation columns into
+            the EdgeList.
         post_anno : bool, optional
-            If True (default), include all cell annotation columns for the
-            post-synaptic side (``*_post``) using ``.first()``.
+            If True (default), carry post-side cell annotation columns.
 
         Returns
         -------
-        pl.DataFrame
-            Edgelist with columns [pre_col, post_col, "n_syn"] plus any agg columns
-            and, if requested, cell annotation columns.
+        EdgeList
+            Pair-level table with pre/post cell id columns, ``n_syn``, any
+            registered weights, ``agg`` outputs, and (by default) cell
+            annotation columns baked in.
         """
         agg_exprs = [pl.len().alias("n_syn")]
         agg_exprs.extend(pl.sum(w).alias(w) for w in self._weights)
@@ -1597,11 +1607,23 @@ class SynapseTable:
                 elif side == "both" and (pre_anno or post_anno):
                     agg_exprs.append(pl.col(name).first())
 
-        return (
+        pair_df = (
             self.build_lazy()
             .group_by([self._pre_col, self._post_col])
             .agg(agg_exprs)
             .collect()
+        )
+        # Registered weights on the resulting EdgeList: n_syn plus the
+        # SynapseTable's weights (which are also now summed per pair). Any
+        # ``agg`` columns are caller-defined; we do not attempt to classify
+        # them as weights — per the column-semantics principle, trajan does
+        # not interpret user-supplied column meanings.
+        weight_cols = ["n_syn"] + list(self._weights)
+        return EdgeList(
+            pair_df,
+            pre_col=self._pre_col,
+            post_col=self._post_col,
+            weight_cols=weight_cols,
         )
 
     def type_edgelist(
@@ -1609,52 +1631,27 @@ class SynapseTable:
         pre_col: str,
         post_col: str | None = None,
         agg: dict[str, pl.Expr] | None = None,
-    ) -> pl.DataFrame:
-        """Aggregate synapses into a type-to-type edgelist.
+    ) -> ConnectivityTable:
+        """Aggregate synapses into a type-to-type ConnectivityTable.
 
-        Groups synapses by cell-type annotation columns rather than individual
-        cell IDs, producing synapse counts (and optional aggregations) between
-        cell-type categories. This is a fast path to the type-level connectivity
-        table that would otherwise require joining the result of edgelist() back
-        to annotation data.
+        Groups synapses by label columns (typically cell-type annotation
+        outputs such as ``cell_type_pre`` / ``cell_type_post``) rather than
+        individual cell ids. Returns a ``ConnectivityTable`` — the axes are
+        labels, not cells, so the result is Tier 2, not an EdgeList.
 
         Parameters
         ----------
         pre_col : str
-            Column in .synapses to use as the pre-synaptic grouping key.
-            Typically a cell annotation column such as ``"cell_type_pre"``.
+            Column in the merged plan to use as the pre-side grouping key.
         post_col : str or None, optional
-            Column in .synapses to use as the post-synaptic grouping key.
-            Defaults to the corresponding ``*_post`` column: if pre_col ends
-            with ``_pre``, post_col becomes the same name with ``_post``; otherwise
-            post_col defaults to pre_col.
+            Column for the post-side grouping key. Defaults to ``pre_col``
+            with any trailing ``_pre`` replaced by ``_post``.
         agg : dict[str, pl.Expr] or None, optional
-            {output_column_name: polars_expression} for additional per-pair
-            aggregations, applied after the type grouping.
+            Per-pair aggregations applied after the type grouping.
 
         Returns
         -------
-        pl.DataFrame
-            DataFrame with columns [pre_col, post_col, "n_syn"] plus any agg columns.
-
-        Examples
-        --------
-        Synapse counts between cell types:
-
-        >>> el = st.type_edgelist("cell_type_pre")
-        >>> el.columns
-        ['cell_type_pre', 'cell_type_post', 'n_syn']
-
-        Using an asymmetric grouping:
-
-        >>> el = st.type_edgelist("cell_type_pre", post_col="broad_type_post")
-
-        With extra aggregations:
-
-        >>> el = st.type_edgelist(
-        ...     "cell_type_pre",
-        ...     agg={"mean_size": pl.mean("size")},
-        ... )
+        ConnectivityTable
         """
         if post_col is None:
             if pre_col.endswith("_pre"):
@@ -1667,248 +1664,16 @@ class SynapseTable:
         if agg:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
 
-        return self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
-
-    # ── matrix ─────────────────────────────────────────────────────────────
-
-    def matrix(
-        self,
-        values: str = "n_syn",
-        fill_value: float = 0,
-        pre_ids=None,
-        post_ids=None,
-        filter_annotated: str | dict[str, str] | None = None,
-    ) -> pl.DataFrame:
-        """Pivot the edgelist into a pre × post connectivity matrix.
-
-        Parameters
-        ----------
-        values : str, optional
-            Column to use as matrix entries. "n_syn" (synapse count) is always
-            available; any other column is summed per cell pair.
-        fill_value : float, optional
-            Value for missing pairs.
-        pre_ids : Iterable or None, optional
-            Constrain or pad rows to a fixed cell set. Missing cells
-            are filled with fill_value.
-        post_ids : Iterable or None, optional
-            Constrain or pad columns to a fixed cell set. Missing cells
-            are filled with fill_value.
-        filter_annotated : str or dict[str, str] or None, optional
-            Restrict to synapses where cells have non-null annotation values.
-            str: filter both pre and post on the named annotation.
-            dict: per-side control, e.g. {"pre": "cell_id"} or
-            {"pre": "cell_id", "post": "other_annotation"}.
-
-        Returns
-        -------
-        pl.DataFrame
-            Pivot table with pre cell IDs as rows and post cell IDs as columns.
-        """
-        st = self
-        if isinstance(filter_annotated, str):
-            st = st.filter_to_annotated(filter_annotated)
-        elif isinstance(filter_annotated, dict):
-            for side, ann in filter_annotated.items():
-                st = st.filter(st._annotation_null_expr(ann, side))
-        if values == "n_syn" or values in self._weights:
-            el = st.edgelist(pre_anno=False, post_anno=False)
-        else:
-            el = st.edgelist(
-                agg={values: pl.sum(values)}, pre_anno=False, post_anno=False
-            )
-
-        result = el.pivot(
-            on=self._post_col,
-            index=self._pre_col,
-            values=values,
-            aggregate_function="first",
-        ).fill_null(fill_value)
-
-        if pre_ids is not None:
-            pre_df = pl.DataFrame({self._pre_col: list(pre_ids)})
-            result = pre_df.join(result, on=self._pre_col, how="left").fill_null(
-                fill_value
-            )
-
-        if post_ids is not None:
-            existing = set(result.columns) - {self._pre_col}
-            post_str = [str(p) for p in post_ids]
-            for pid in post_str:
-                if pid not in existing:
-                    result = result.with_columns(pl.lit(fill_value).alias(pid))
-            result = result.select([self._pre_col] + post_str)
-
-        return result
-
-    # ── cell summary ───────────────────────────────────────────────────────
-
-    def cell_summary(
-        self,
-        pre_agg: dict[str, pl.Expr] | None = None,
-        post_agg: dict[str, pl.Expr] | None = None,
-        include_annotations: bool = True,
-    ) -> pl.DataFrame:
-        """Aggregate synapse-level data into a per-cell summary DataFrame.
-
-        Returns one row per unique cell ID, combining output (pre-side) and input
-        (post-side) statistics. Cell annotation values are included by default.
-
-        Parameters
-        ----------
-        pre_agg : dict[str, pl.Expr] or None, optional
-            Additional aggregations applied when the cell appears as the pre-synaptic
-            partner. Example: ``{"mean_size_out": pl.mean("size")}``.
-        post_agg : dict[str, pl.Expr] or None, optional
-            Additional aggregations applied when the cell appears as the post-synaptic
-            partner. Example: ``{"mean_size_in": pl.mean("size")}``.
-        include_annotations : bool, optional
-            If True (default), cell annotation columns are included in the output
-            (with ``_pre``/``_post`` suffixes stripped). All cell annotations are
-            included, regardless of whether they use ``join_on_alias``.
-
-        Returns
-        -------
-        pl.DataFrame
-            One row per cell. Always contains:
-
-            - ``cell_id`` — the cell's root ID
-            - ``n_syn_output`` — synapse count where cell is pre (null if never pre)
-            - ``n_syn_input`` — synapse count where cell is post (null if never post)
-            - ``{weight}_output`` / ``{weight}_input`` — per-direction weight sums
-              for each registered weight column
-            - any ``pre_agg`` / ``post_agg`` columns
-            - cell annotation columns (if ``include_annotations=True``)
-        """
-        lf = self.build_lazy()
-
-        anno_cols: list[str] = [
-            c for spec in self._cell_annotations.values() for c in spec.data_cols
-        ]
-
-        # Pre-side aggregation (cell as sender)
-        pre_exprs: list[pl.Expr] = [pl.len().alias("n_syn_output")]
-        pre_exprs.extend(pl.sum(w).alias(f"{w}_output") for w in self._weights)
-        if pre_agg:
-            pre_exprs.extend(expr.alias(name) for name, expr in pre_agg.items())
-        if include_annotations:
-            pre_exprs.extend(pl.col(f"{c}_pre").first().alias(c) for c in anno_cols)
-        pre_df = (
-            lf.group_by(self._pre_col)
-            .agg(pre_exprs)
-            .rename({self._pre_col: "cell_id"})
-            .collect()
+        pair_df = (
+            self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
         )
-
-        # Post-side aggregation (cell as receiver)
-        post_exprs: list[pl.Expr] = [pl.len().alias("n_syn_input")]
-        post_exprs.extend(pl.sum(w).alias(f"{w}_input") for w in self._weights)
-        if post_agg:
-            post_exprs.extend(expr.alias(name) for name, expr in post_agg.items())
-        if include_annotations:
-            post_exprs.extend(pl.col(f"{c}_post").first().alias(c) for c in anno_cols)
-        post_df = (
-            lf.group_by(self._post_col)
-            .agg(post_exprs)
-            .rename({self._post_col: "cell_id"})
-            .collect()
+        weight_cols = ["n_syn"] + list(self._weights)
+        return ConnectivityTable(
+            pair_df,
+            pre_col=pre_col,
+            post_col=post_col,
+            weight_cols=weight_cols,
         )
-
-        # Full outer join; coalesce=True merges the two cell_id key columns
-        result = pre_df.join(post_df, on="cell_id", how="full", coalesce=True)
-
-        # Annotation values are the same regardless of side; coalesce the two
-        # copies that outer join produces (suffixed _right for the post side).
-        if include_annotations:
-            for c in anno_cols:
-                right = f"{c}_right"
-                if right in result.columns:
-                    result = result.with_columns(pl.coalesce([c, right]).alias(c)).drop(
-                        right
-                    )
-
-        return result
-
-    # ── normalized ─────────────────────────────────────────────────────────
-
-    def normalized(
-        self,
-        by: str = "pre",
-        values: str = "n_syn",
-        group_col: str | None = None,
-        pivot: bool = False,
-    ) -> pl.DataFrame:
-        """Compute fractional connectivity normalized by pre or post cell totals.
-
-        Parameters
-        ----------
-        by : str, optional
-            "pre" — normalize by each pre cell's total output synaptic weight.
-            "post" — normalize by each post cell's total input synaptic weight.
-        values : str, optional
-            Column to normalize. "n_syn" counts synapses per pair; any other
-            column is summed per pair before normalizing.
-        group_col : str or None, optional
-            Cell annotation name (without _pre/_post suffix) to collapse the
-            "other" side before normalizing. Resolved to _pre or _post
-            automatically from `by`.
-
-            Example: group_col="broad_type" with by="pre" computes what
-            fraction of each pre cell's output goes to each post cell type.
-            group_col=None preserves individual cell identity on both sides.
-        pivot : bool, optional
-            False (default): return tidy DataFrame with a "fraction" column.
-            True: pivot into a matrix (self_col rows × other/group columns).
-
-        Returns
-        -------
-        pl.DataFrame
-            Tidy DataFrame with a "fraction" column, or a pivot matrix if
-            pivot=True.
-        """
-        if by == "pre":
-            self_col = self._pre_col
-            other_col = self._post_col
-            group_suffix = "_post"
-        elif by == "post":
-            self_col = self._post_col
-            other_col = self._pre_col
-            group_suffix = "_pre"
-        else:
-            raise ValueError(f"by must be 'pre' or 'post', got {by!r}")
-
-        if group_col is not None:
-            resolved = f"{group_col}{group_suffix}"
-            group_by_cols = [self_col, resolved]
-            other_label = resolved
-        else:
-            group_by_cols = [self_col, other_col]
-            other_label = other_col
-
-        if values == "n_syn":
-            val_expr = pl.len().alias("n_syn")
-        else:
-            val_expr = pl.sum(values).alias(values)
-
-        agg_lf = self.build_lazy().group_by(group_by_cols).agg(val_expr)
-        totals_lf = agg_lf.group_by(self_col).agg(pl.sum(values).alias("_total"))
-
-        result = (
-            agg_lf.join(totals_lf, on=self_col)
-            .with_columns((pl.col(values) / pl.col("_total")).alias("fraction"))
-            .drop(["_total", values])
-            .collect()
-        )
-
-        if pivot:
-            result = result.pivot(
-                on=other_label,
-                index=self_col,
-                values="fraction",
-                aggregate_function="first",
-            ).fill_null(0.0)
-
-        return result
 
     # ── persistence ────────────────────────────────────────────────────────
 

@@ -13,12 +13,14 @@ from .spatial import (
     unpack_all_positions,
     unpack_position,
 )
+from .stats import cell_summary
 from .synapse_table import SynapseTable
 
 __all__ = [
     "ConnectivityTable",
     "EdgeList",
     "SynapseTable",
+    "cell_summary",
     "euclidean_distance",
     "pack_all_positions",
     "pack_position",
