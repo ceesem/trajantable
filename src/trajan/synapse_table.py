@@ -8,26 +8,21 @@ from typing import Callable, Union
 
 import polars as pl
 
-from .spatial import euclidean_distance, pack_position, spatial_feature_exprs
+from ._base import (
+    CellAnnotationSpec,
+    SynapseAnnotationSpec,
+    VertexAnnotationSpec,
+    _auto_pack,
+    _to_lazy,
+)
+from .spatial import euclidean_distance, spatial_feature_exprs
 
 try:
-    import pandas as pd
+    import pandas as pd  # noqa: F401  (still used elsewhere for duck-typing)
 
     _HAS_PANDAS = True
 except ImportError:
     _HAS_PANDAS = False
-
-
-def _auto_pack(lf: pl.LazyFrame, col: str | None) -> pl.LazyFrame:
-    """Pack {col}_x/y/z into a struct named col, if col is absent but the triplet exists."""
-    if col is None:
-        return lf
-    names = lf.collect_schema().names()
-    if col in names:
-        return lf
-    if all(f"{col}_{ax}" in names for ax in ("x", "y", "z")):
-        return pack_position(lf, col)
-    return lf
 
 
 class _AnnotationProxy:
@@ -43,7 +38,7 @@ class _AnnotationProxy:
     def __getitem__(self, name: str) -> pl.DataFrame:
         if name not in self._store:
             raise KeyError(name)
-        return self._store[name][0].collect()
+        return self._store[name].lf.collect()
 
     def __iter__(self):
         return iter(self._store)
@@ -69,18 +64,6 @@ def _as_folio(folio):
 
 def _spatial_col_name(prefix: str, feature: str) -> str:
     return f"{prefix}_{feature}" if prefix else feature
-
-
-def _to_lazy(df) -> pl.LazyFrame:
-    if isinstance(df, pl.LazyFrame):
-        return df
-    if isinstance(df, pl.DataFrame):
-        return df.lazy()
-    if _HAS_PANDAS and isinstance(df, pd.DataFrame):
-        return pl.from_pandas(df).lazy()
-    raise TypeError(
-        f"Expected pl.DataFrame, pl.LazyFrame, or pd.DataFrame, got {type(df)}"
-    )
 
 
 class SynapseTable:
@@ -136,17 +119,11 @@ class SynapseTable:
         # Cache base schema names once — _syn_lf never changes
         self._syn_col_names: list[str] = self._syn_lf.collect_schema().names()
 
-        # name → (LazyFrame, data_cols)  — data_cols excludes the join key
-        self._synapse_annotations: dict[str, tuple[pl.LazyFrame, list[str]]] = {}
-        # name → (LazyFrame, cell_id_col, join_on_alias, data_cols)
-        # join_on_alias=None joins on _pre_col/_post_col; a string names the alias to join on
-        self._cell_annotations: dict[
-            str, tuple[pl.LazyFrame, str, str | None, list[str]]
-        ] = {}
-        # name → (LazyFrame, vertex_id_col, pre_vertex_col, post_vertex_col, data_cols)
-        self._vertex_annotations: dict[
-            str, tuple[pl.LazyFrame, str, str | None, str | None, list[str]]
-        ] = {}
+        # Registered annotations, keyed by user-chosen name.
+        # See src/trajan/_base.py for the spec dataclass definitions.
+        self._synapse_annotations: dict[str, SynapseAnnotationSpec] = {}
+        self._cell_annotations: dict[str, CellAnnotationSpec] = {}
+        self._vertex_annotations: dict[str, VertexAnnotationSpec] = {}
 
         self._filters: list[pl.Expr] = []
         # name → aliased pl.Expr, applied in insertion order after joins and before filters
@@ -227,30 +204,25 @@ class SynapseTable:
         if self._synapse_annotations:
             lines.append("")
             lines.append(f"Synapse annotations ({len(self._synapse_annotations)})")
-            for name, (ann_lf, data_cols) in self._synapse_annotations.items():
-                lines.append(f"  {name!r} ({len(data_cols)} col(s))")
-                for c in data_cols:
-                    tag = "  [position]" if self._is_position_col(ann_lf, c) else ""
+            for name, spec in self._synapse_annotations.items():
+                lines.append(f"  {name!r} ({len(spec.data_cols)} col(s))")
+                for c in spec.data_cols:
+                    tag = "  [position]" if self._is_position_col(spec.lf, c) else ""
                     lines.append(f"    {c}{tag}")
 
         # ── cell annotations
         if self._cell_annotations:
             lines.append("")
             lines.append(f"Cell annotations ({len(self._cell_annotations)})")
-            for name, (
-                ann_lf,
-                cell_id_col,
-                join_on_alias,
-                data_cols,
-            ) in self._cell_annotations.items():
+            for name, spec in self._cell_annotations.items():
                 join_info = (
-                    f"join on alias {join_on_alias!r}"
-                    if join_on_alias
-                    else f"join on {cell_id_col!r}"
+                    f"join on alias {spec.join_on_alias!r}"
+                    if spec.join_on_alias
+                    else f"join on {spec.cell_id_col!r}"
                 )
-                lines.append(f"  {name!r} ({len(data_cols)} col(s), {join_info})")
-                for c in data_cols:
-                    tag = "  [position]" if self._is_position_col(ann_lf, c) else ""
+                lines.append(f"  {name!r} ({len(spec.data_cols)} col(s), {join_info})")
+                for c in spec.data_cols:
+                    tag = "  [position]" if self._is_position_col(spec.lf, c) else ""
                     lines.append(f"    {c}  ->  {c}_pre, {c}_post{tag}")
 
         # ── cell aliases
@@ -264,28 +236,22 @@ class SynapseTable:
         if self._vertex_annotations:
             lines.append("")
             lines.append(f"Vertex annotations ({len(self._vertex_annotations)})")
-            for name, (
-                ann_lf,
-                vertex_id_col,
-                pre_v,
-                post_v,
-                data_cols,
-            ) in self._vertex_annotations.items():
+            for name, spec in self._vertex_annotations.items():
                 sides = []
-                if pre_v:
-                    sides.append(f"pre via {pre_v!r}")
-                if post_v:
-                    sides.append(f"post via {post_v!r}")
+                if spec.pre_vertex_col:
+                    sides.append(f"pre via {spec.pre_vertex_col!r}")
+                if spec.post_vertex_col:
+                    sides.append(f"post via {spec.post_vertex_col!r}")
                 lines.append(
-                    f"  {name!r} ({len(data_cols)} col(s), {', '.join(sides)})"
+                    f"  {name!r} ({len(spec.data_cols)} col(s), {', '.join(sides)})"
                 )
-                for c in data_cols:
+                for c in spec.data_cols:
                     suffixes = []
-                    if pre_v:
+                    if spec.pre_vertex_col:
                         suffixes.append(f"{c}_pre")
-                    if post_v:
+                    if spec.post_vertex_col:
                         suffixes.append(f"{c}_post")
-                    tag = "  [position]" if self._is_position_col(ann_lf, c) else ""
+                    tag = "  [position]" if self._is_position_col(spec.lf, c) else ""
                     lines.append(f"    {c}  ->  {', '.join(suffixes)}{tag}")
 
         # ── expressions
@@ -444,8 +410,7 @@ class SynapseTable:
         columns without reaching into the private storage tuple.
         """
         return {
-            name: list(data_cols)
-            for name, (_, _, _, data_cols) in self._cell_annotations.items()
+            name: list(spec.data_cols) for name, spec in self._cell_annotations.items()
         }
 
     # ── internal column tracking ───────────────────────────────────────────
@@ -453,16 +418,16 @@ class SynapseTable:
     def _current_columns(self) -> set[str]:
         """All column names present (or that will be present) in .synapses."""
         cols = set(self._syn_col_names)
-        for _, data_cols in self._synapse_annotations.values():
-            cols |= set(data_cols)
-        for _, _, _, data_cols in self._cell_annotations.values():
-            cols |= {f"{c}_pre" for c in data_cols}
-            cols |= {f"{c}_post" for c in data_cols}
-        for _, _, pre_v_col, post_v_col, data_cols in self._vertex_annotations.values():
-            if pre_v_col is not None:
-                cols |= {f"{c}_pre" for c in data_cols}
-            if post_v_col is not None:
-                cols |= {f"{c}_post" for c in data_cols}
+        for spec in self._synapse_annotations.values():
+            cols |= set(spec.data_cols)
+        for spec in self._cell_annotations.values():
+            cols |= {f"{c}_pre" for c in spec.data_cols}
+            cols |= {f"{c}_post" for c in spec.data_cols}
+        for spec in self._vertex_annotations.values():
+            if spec.pre_vertex_col is not None:
+                cols |= {f"{c}_pre" for c in spec.data_cols}
+            if spec.post_vertex_col is not None:
+                cols |= {f"{c}_post" for c in spec.data_cols}
         cols |= set(self._expressions)
         return cols
 
@@ -509,7 +474,7 @@ class SynapseTable:
         collisions = set(data_cols) & self._current_columns()
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-        self._synapse_annotations[name] = (lf, data_cols)
+        self._synapse_annotations[name] = SynapseAnnotationSpec(lf, data_cols)
         self._cache = None
         return self
 
@@ -585,7 +550,9 @@ class SynapseTable:
         collisions = new_cols & self._current_columns()
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-        self._cell_annotations[name] = (lf, cell_id_col, join_on_alias, data_cols)
+        self._cell_annotations[name] = CellAnnotationSpec(
+            lf, cell_id_col, join_on_alias, data_cols
+        )
         self._cache = None
         if alias_col is not None:
             self.set_cell_alias(name, alias_col, alias_name)
@@ -602,8 +569,8 @@ class SynapseTable:
         if removed_aliases:
             broken = [
                 n
-                for n, (_, _, join_on_alias, _) in self._cell_annotations.items()
-                if join_on_alias in removed_aliases and n != name
+                for n, spec in self._cell_annotations.items()
+                if spec.join_on_alias in removed_aliases and n != name
             ]
             msg = (
                 f"Removing annotation {name!r} which sourced cell "
@@ -660,17 +627,17 @@ class SynapseTable:
         """
         if annotation_name not in self._cell_annotations:
             raise KeyError(f"No cell annotation named {annotation_name!r}")
-        _, _, join_on_alias, data_cols = self._cell_annotations[annotation_name]
-        if join_on_alias is not None:
+        spec = self._cell_annotations[annotation_name]
+        if spec.join_on_alias is not None:
             raise ValueError(
-                f"Annotation {annotation_name!r} uses join_on_alias={join_on_alias!r} "
+                f"Annotation {annotation_name!r} uses join_on_alias={spec.join_on_alias!r} "
                 f"and cannot itself be a cell alias source. The alias source must "
                 f"join on root ID (join_on_alias=None)."
             )
-        if col not in data_cols:
+        if col not in spec.data_cols:
             raise ValueError(
                 f"Column {col!r} not found in annotation {annotation_name!r}. "
-                f"Available columns: {data_cols}"
+                f"Available columns: {spec.data_cols}"
             )
         key = alias_name if alias_name is not None else annotation_name
         self._cell_aliases[key] = (annotation_name, col)
@@ -712,11 +679,9 @@ class SynapseTable:
         if isinstance(position_cols, str):
             position_cols = [position_cols]
 
-        existing_lf, cell_id_col, join_on_alias, existing_data_cols = (
-            self._cell_annotations[name]
-        )
+        existing = self._cell_annotations[name]
 
-        existing_schema = existing_lf.collect_schema().names()
+        existing_schema = existing.lf.collect_schema().names()
         if on not in existing_schema:
             raise ValueError(
                 f"Join key {on!r} not found in annotation {name!r}. "
@@ -737,12 +702,11 @@ class SynapseTable:
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
 
-        merged_lf = existing_lf.join(new_lf, on=on, how="left")
-        self._cell_annotations[name] = (
-            merged_lf,
-            cell_id_col,
-            join_on_alias,
-            existing_data_cols + extra_cols,
+        self._cell_annotations[name] = CellAnnotationSpec(
+            lf=existing.lf.join(new_lf, on=on, how="left"),
+            cell_id_col=existing.cell_id_col,
+            join_on_alias=existing.join_on_alias,
+            data_cols=existing.data_cols + extra_cols,
         )
         self._cache = None
         return self
@@ -808,12 +772,12 @@ class SynapseTable:
         collisions = new_cols & self._current_columns()
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-        self._vertex_annotations[name] = (
-            lf,
-            vertex_id_col,
-            pre_vertex_col,
-            post_vertex_col,
-            data_cols,
+        self._vertex_annotations[name] = VertexAnnotationSpec(
+            lf=lf,
+            vertex_id_col=vertex_id_col,
+            pre_vertex_col=pre_vertex_col,
+            post_vertex_col=post_vertex_col,
+            data_cols=data_cols,
         )
         self._cache = None
         return self
@@ -842,9 +806,9 @@ class SynapseTable:
         """
         cell_pre: set[str] = set()
         cell_post: set[str] = set()
-        for _, _, _, data_cols in self._cell_annotations.values():
-            cell_pre |= {f"{c}_pre" for c in data_cols}
-            cell_post |= {f"{c}_post" for c in data_cols}
+        for spec in self._cell_annotations.values():
+            cell_pre |= {f"{c}_pre" for c in spec.data_cols}
+            cell_post |= {f"{c}_post" for c in spec.data_cols}
 
         root_names = expr.meta.root_names()
         if not root_names:
@@ -1056,43 +1020,40 @@ class SynapseTable:
         """
         lf = self._syn_lf
 
-        for ann_lf, _ in self._synapse_annotations.values():
-            lf = lf.join(ann_lf, on=self._id_col, how="left")
+        for spec in self._synapse_annotations.values():
+            lf = lf.join(spec.lf, on=self._id_col, how="left")
 
-        for (
-            ann_lf,
-            cell_id_col,
-            join_on_alias,
-            data_cols,
-        ) in self._cell_annotations.values():
-            if join_on_alias is not None:
-                alias_col = self._cell_aliases[join_on_alias][1]
+        for spec in self._cell_annotations.values():
+            if spec.join_on_alias is not None:
+                alias_col = self._cell_aliases[spec.join_on_alias][1]
                 pre_key = f"{alias_col}_pre"
                 post_key = f"{alias_col}_post"
             else:
                 pre_key = self._pre_col
                 post_key = self._post_col
-            pre_lf = ann_lf.rename({c: f"{c}_pre" for c in data_cols})
-            lf = lf.join(pre_lf, left_on=pre_key, right_on=cell_id_col, how="left")
-            post_lf = ann_lf.rename({c: f"{c}_post" for c in data_cols})
-            lf = lf.join(post_lf, left_on=post_key, right_on=cell_id_col, how="left")
+            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
+            lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
+            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
+            lf = lf.join(
+                post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
+            )
 
-        for (
-            ann_lf,
-            vertex_id_col,
-            pre_v_col,
-            post_v_col,
-            data_cols,
-        ) in self._vertex_annotations.values():
-            if pre_v_col is not None:
-                pre_lf = ann_lf.rename({c: f"{c}_pre" for c in data_cols})
+        for spec in self._vertex_annotations.values():
+            if spec.pre_vertex_col is not None:
+                pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
                 lf = lf.join(
-                    pre_lf, left_on=pre_v_col, right_on=vertex_id_col, how="left"
+                    pre_lf,
+                    left_on=spec.pre_vertex_col,
+                    right_on=spec.vertex_id_col,
+                    how="left",
                 )
-            if post_v_col is not None:
-                post_lf = ann_lf.rename({c: f"{c}_post" for c in data_cols})
+            if spec.post_vertex_col is not None:
+                post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
                 lf = lf.join(
-                    post_lf, left_on=post_v_col, right_on=vertex_id_col, how="left"
+                    post_lf,
+                    left_on=spec.post_vertex_col,
+                    right_on=spec.vertex_id_col,
+                    how="left",
                 )
 
         for expr in self._expressions.values():
@@ -1220,9 +1181,9 @@ class SynapseTable:
     def _annotation_null_expr(self, annotation_name: str, side: str) -> pl.Expr:
         """is_not_null() for the first data column of a cell/vertex annotation on pre or post."""
         if annotation_name in self._cell_annotations:
-            data_cols = self._cell_annotations[annotation_name][3]
+            data_cols = self._cell_annotations[annotation_name].data_cols
         elif annotation_name in self._vertex_annotations:
-            data_cols = self._vertex_annotations[annotation_name][4]
+            data_cols = self._vertex_annotations[annotation_name].data_cols
         else:
             raise KeyError(f"No cell or vertex annotation named {annotation_name!r}")
         return pl.col(f"{data_cols[0]}_{side}").is_not_null()
@@ -1621,11 +1582,13 @@ class SynapseTable:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
 
         if pre_anno or post_anno:
-            for _, _, _, data_cols in self._cell_annotations.values():
+            for spec in self._cell_annotations.values():
                 if pre_anno:
-                    agg_exprs.extend(pl.col(f"{c}_pre").first() for c in data_cols)
+                    agg_exprs.extend(pl.col(f"{c}_pre").first() for c in spec.data_cols)
                 if post_anno:
-                    agg_exprs.extend(pl.col(f"{c}_post").first() for c in data_cols)
+                    agg_exprs.extend(
+                        pl.col(f"{c}_post").first() for c in spec.data_cols
+                    )
             for name, side in self._expression_sides.items():
                 if side == "pre" and pre_anno:
                     agg_exprs.append(pl.col(name).first())
@@ -1820,9 +1783,7 @@ class SynapseTable:
         lf = self.build_lazy()
 
         anno_cols: list[str] = [
-            c
-            for _, _, _, data_cols in self._cell_annotations.values()
-            for c in data_cols
+            c for spec in self._cell_annotations.values() for c in spec.data_cols
         ]
 
         # Pre-side aggregation (cell as sender)
@@ -1982,8 +1943,8 @@ class SynapseTable:
                 for name, expr in self._expressions.items()
             },
             "synapse_annotations": {
-                name: {"data_cols": data_cols}
-                for name, (_, data_cols) in self._synapse_annotations.items()
+                name: {"data_cols": spec.data_cols}
+                for name, spec in self._synapse_annotations.items()
             },
             "cell_aliases": {
                 alias_name: {"annotation_name": ann_name, "col": col}
@@ -1991,43 +1952,36 @@ class SynapseTable:
             },
             "cell_annotations": {
                 name: {
-                    "cell_id_col": cell_id_col,
-                    "join_on_alias": join_on_alias,
-                    "data_cols": data_cols,
+                    "cell_id_col": spec.cell_id_col,
+                    "join_on_alias": spec.join_on_alias,
+                    "data_cols": spec.data_cols,
                 }
-                for name, (
-                    _,
-                    cell_id_col,
-                    join_on_alias,
-                    data_cols,
-                ) in self._cell_annotations.items()
+                for name, spec in self._cell_annotations.items()
             },
             "vertex_annotations": {
                 name: {
-                    "vertex_id_col": vertex_id_col,
-                    "pre_vertex_col": pre_v_col,
-                    "post_vertex_col": post_v_col,
-                    "data_cols": data_cols,
+                    "vertex_id_col": spec.vertex_id_col,
+                    "pre_vertex_col": spec.pre_vertex_col,
+                    "post_vertex_col": spec.post_vertex_col,
+                    "data_cols": spec.data_cols,
                 }
-                for name, (
-                    _,
-                    vertex_id_col,
-                    pre_v_col,
-                    post_v_col,
-                    data_cols,
-                ) in self._vertex_annotations.items()
+                for name, spec in self._vertex_annotations.items()
             },
         }
         folio.add_json("config", config, overwrite=overwrite)
         if self.metadata:
             folio.metadata.update(self.metadata)
         folio.add_table("synapses", self._syn_lf.collect(), overwrite=overwrite)
-        for name, (lf, _) in self._synapse_annotations.items():
-            folio.add_table(f"synapse_ann_{name}", lf.collect(), overwrite=overwrite)
-        for name, (lf, _, _, _) in self._cell_annotations.items():
-            folio.add_table(f"cell_ann_{name}", lf.collect(), overwrite=overwrite)
-        for name, (lf, _, _, _, _) in self._vertex_annotations.items():
-            folio.add_table(f"vertex_ann_{name}", lf.collect(), overwrite=overwrite)
+        for name, spec in self._synapse_annotations.items():
+            folio.add_table(
+                f"synapse_ann_{name}", spec.lf.collect(), overwrite=overwrite
+            )
+        for name, spec in self._cell_annotations.items():
+            folio.add_table(f"cell_ann_{name}", spec.lf.collect(), overwrite=overwrite)
+        for name, spec in self._vertex_annotations.items():
+            folio.add_table(
+                f"vertex_ann_{name}", spec.lf.collect(), overwrite=overwrite
+            )
 
     @classmethod
     def load(cls, folio: Union[str, Path, object]) -> SynapseTable:
