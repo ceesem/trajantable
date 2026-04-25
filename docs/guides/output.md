@@ -30,60 +30,113 @@ el = st.edgelist(agg={
 # pre_pt_root_id | post_pt_root_id | n_syn | cell_type_pre | cell_type_post | mean_size | total_area
 ```
 
-## Connectivity matrix
+## EdgeList
 
-`matrix()` pivots the edgelist into a pre × post matrix:
+`SynapseTable.edgelist()` returns an `EdgeList` — a pair-level table with
+one row per `(pre, post)` cell pair. Work in pair-space continues through
+the EdgeList (further filtering, aggregation to types, matrix export)
+rather than dropping back to a raw DataFrame. Access the materialized pair
+DataFrame via `el.pairs` when needed.
 
 ```python
-mat = st.matrix()          # synapse counts, all cells
-mat = st.matrix(values="mean_size")   # any other edgelist column
+el = st.edgelist()
+el.pairs  # pl.DataFrame with [pre, post, n_syn, cell_type_pre, ...]
 ```
 
-Constrain or pad to a fixed cell set with `pre_ids` / `post_ids`:
+Pair-level filtering returns an `EdgeList`:
 
 ```python
-mat = st.matrix(
-    pre_ids=excitatory_ids,
-    post_ids=inhibitory_ids,
-    fill_value=0,
+strong = el.filter(pl.col("n_syn") >= 3)
+```
+
+Cell-id restriction:
+
+```python
+el.filter_by_ids(pre_ids=[111, 222], post_ids=[333, 444])
+```
+
+Spatial filters — the position-column names are passed explicitly; trajan
+does not infer them. Positions are typically brought into the plan via a
+cell annotation whose data columns include a position struct (the
+annotation join produces `{col}_pre` / `{col}_post`):
+
+```python
+near = el.filter_by_soma_distance(
+    100_000,  # same units as your position data
+    pre_position_col="soma_pt_position_pre",
+    post_position_col="soma_pt_position_post",
 )
 ```
 
-Restrict to annotated cells only via `filter_annotated`:
+## Connectivity matrix
+
+Pivot an EdgeList into a dense pre × post matrix via `to_dense`:
 
 ```python
-# Drop rows/columns for unannotated cells
-mat = st.matrix(filter_annotated="cell_type")
-
-# Per-side control
-mat = st.matrix(filter_annotated={"pre": "cell_type", "post": "proofread"})
+mat = st.edgelist().to_dense()                       # n_syn counts
+mat = st.edgelist().to_dense(values="size")          # any weight column
+mat = st.edgelist().to_dense(fill_value=-1)          # non-existing pairs
 ```
+
+`ConnectivityTable` (returned by `type_edgelist` or by promoting an
+EdgeList) is the general matrix tier — it supports the same `to_dense`,
+plus shape-preserving operations like `normalize`, `binarize`, `log1p`.
 
 ## Normalized connectivity
 
-`normalized()` computes fractional output (by pre) or fractional input (by post):
+`ConnectivityTable.normalize(by="pre" | "post")` produces a new
+ConnectivityTable with a `fraction` column replacing the weight. Two
+modes:
 
 ```python
-# Each pre cell's output weight distributed across post cells (tidy)
-frac = st.normalized(by="pre")
-# pre_pt_root_id | post_pt_root_id | fraction
+# Internal mode — divide by the current table's axis sum.
+# Semantics are dynamic: if the table has been filtered, fractions are
+# relative to currently-visible totals.
+frac = st.edgelist().normalize(by="post")
 
-# Each post cell's input weight distributed across pre cells
-frac = st.normalized(by="post")
+# External mode — divide by a user-supplied column.
+# Trajan does not interpret what the column means, only divides by it.
+# Useful when the denominator (e.g. the cell's true total input, from
+# an annotation) should not change with filtering.
+frac = st.edgelist().normalize(by="post", total_col="n_syn_input_post")
 ```
 
-Collapse the "other" side by a cell type annotation before normalizing:
+Collapse one axis to a cell-type annotation column via
+`EdgeList.aggregate_to_type` before normalizing:
 
 ```python
 # Fraction of each pre cell's output going to each post cell *type*
-frac = st.normalized(by="pre", group_col="cell_type")
-# pre_pt_root_id | cell_type_post | fraction
+ct = st.edgelist().aggregate_to_type(post="cell_type_post")
+frac = ct.normalize(by="pre")  # ConnectivityTable with fraction column
 ```
 
-Pivot into a matrix directly:
+Pivot to a dense matrix at any step:
 
 ```python
-mat = st.normalized(by="pre", group_col="cell_type", pivot=True)
+frac.to_dense(values="fraction")
+```
+
+## Per-cell summary
+
+`trajan.cell_summary(st)` aggregates synapse-level data into one row per
+cell, combining output and input statistics. It's a free function because
+it's a derived statistic, not a chaining operation.
+
+```python
+import trajan
+
+cs = trajan.cell_summary(st)
+# cell_id | n_syn_output | n_syn_input | {weight}_output | {weight}_input | ...
+
+# custom per-direction aggregations
+cs = trajan.cell_summary(
+    st,
+    pre_agg={"mean_size_out": pl.mean("size")},
+    post_agg={"mean_size_in": pl.mean("size")},
+)
+
+# skip annotation columns
+cs = trajan.cell_summary(st, include_annotations=False)
 ```
 
 ## Selective view
@@ -153,27 +206,32 @@ el = st.type_edgelist("cell_type_pre", agg={"mean_size": pl.mean("size")})
 
 ## Graph export
 
-`to_graph()` exports the synapse table as a directed graph. Cell annotation
-columns become node attributes with the `_pre` / `_post` suffix stripped:
+`trajan.to_graph(st, ...)` exports the synapse table as a directed graph. It is
+a free function (not a method on `SynapseTable`) because it produces a derived
+artifact rather than mutating or chaining state. Cell annotation columns
+become node attributes with the `_pre` / `_post` suffix stripped:
 
 ```python
+import trajan
+
 # NetworkX (default) — requires: uv add networkx
-G = st.to_graph()
+G = trajan.to_graph(st)
 G.nodes[111]   # {'cell_type': 'L2/3 ET'}
 G.edges[111, 222]  # {'n_syn': 14}
 
 # igraph — requires: uv add igraph
-g = st.to_graph(backend="igraph")
+g = trajan.to_graph(st, backend="igraph")
 
 # Scipy sparse matrix — requires: uv add scipy
-mat, cell_ids = st.to_graph(backend="csgraph")
+mat, cell_ids = trajan.to_graph(st, backend="csgraph")
 # returns (csr_array, array of cell IDs) rather than a graph object
 ```
 
 Add edge attributes with `edge_agg` and per-cell node attributes with `cell_agg`:
 
 ```python
-G = st.to_graph(
+G = trajan.to_graph(
+    st,
     edge_agg={"mean_size": pl.mean("size")},
     cell_agg={"n_output": pl.len()},  # computed from the pre side
 )
@@ -181,12 +239,13 @@ G = st.to_graph(
 
 ## Pandas export
 
-`to_dataframe()` materializes `.synapses` as a pandas DataFrame. Polars struct
-columns (positions) cannot be represented directly in pandas, so they are
-automatically unpacked into flat `_x` / `_y` / `_z` columns:
+`trajan.to_dataframe(st)` materializes `.synapses` as a pandas DataFrame. Like
+`to_graph`, it is a free function. Polars struct columns (positions) cannot be
+represented directly in pandas, so they are automatically unpacked into flat
+`_x` / `_y` / `_z` columns:
 
 ```python
-df = st.to_dataframe()
+df = trajan.to_dataframe(st)
 # Returns a pandas DataFrame; e.g. ctr_pt_position → ctr_pt_position_x/y/z
 ```
 

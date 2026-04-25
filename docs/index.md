@@ -52,10 +52,12 @@ See the [Cell ID aliasing guide](guides/cell-aliases.md).
 **Filters** accumulate as Polars expressions pushed into the lazy plan.
 See the [Filtering guide](guides/filtering.md).
 
-**Output methods** (`edgelist`, `type_edgelist`, `matrix`, `normalized`,
-`to_graph`, `to_dataframe`) materialize the lazy plan and reshape the result.
-Graph export supports NetworkX, igraph, and scipy sparse backends.
-See the [Connectivity representations guide](guides/output.md).
+**Output methods** on `SynapseTable` (`edgelist`, `type_edgelist`, `matrix`,
+`normalized`) materialize the lazy plan and reshape the result. Graph and
+DataFrame export are free functions (`trajan.to_graph`, `trajan.to_dataframe`)
+rather than methods, because they produce derived artifacts rather than
+chaining state. Graph export supports NetworkX, igraph, and scipy sparse
+backends. See the [Connectivity representations guide](guides/output.md).
 
 **Persistence** via DataFolio round-trips the full table including all annotations,
 filters, and expressions. See the [Persistence guide](guides/persistence.md).
