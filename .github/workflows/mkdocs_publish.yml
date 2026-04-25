@@ -15,9 +15,7 @@ jobs:
         run: |
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-      - uses: actions/setup-python@v5
-        with:
-          python-version: 3.x
+      - uses: astral-sh/setup-uv@v5
       - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV
       - uses: actions/cache@v4
         with:
@@ -25,5 +23,5 @@ jobs:
           path: .cache
           restore-keys: |
             mkdocs-material-
-      - run: pip install mkdocs-material mkdocstrings[python]
-      - run: mkdocs gh-deploy --force
+      - run: uv sync --no-default-groups --group docs
+      - run: uv run mkdocs gh-deploy --force
