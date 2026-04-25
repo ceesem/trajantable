@@ -287,3 +287,95 @@ def test_add_remove_weight(ct):
 def test_add_weight_missing_column(ct):
     with pytest.raises(ValueError, match="not found"):
         ct.add_weight("bogus")
+
+
+# ── persistence ──────────────────────────────────────────────────────────────
+
+
+def test_save_load_basic_roundtrip(ct, tmp_path):
+    """Round-trip a ConnectivityTable with no annotations / filters / expressions."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    ct.save(folio)
+
+    loaded = ConnectivityTable.load(folio)
+    assert isinstance(loaded, ConnectivityTable)
+    assert loaded.pre_col == ct.pre_col
+    assert loaded.post_col == ct.post_col
+    assert loaded.weights == ct.weights
+    # pair data equal after sort
+    left = ct.pairs.sort("pre", "post")
+    right = loaded.pairs.sort("pre", "post")
+    assert left.equals(right)
+
+
+def test_save_load_with_annotations(ct, tmp_path):
+    """Registered annotations round-trip and produce the same merged pairs."""
+    import datafolio
+
+    ann = pl.DataFrame(
+        {
+            "entity_id": [1, 2, 3, 10, 11],
+            "cell_type": ["exc", "exc", "inh", "exc", "inh"],
+        }
+    )
+    ct.add_annotation("types", ann, entity_id_col="entity_id")
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    ct.save(folio)
+    loaded = ConnectivityTable.load(folio)
+
+    assert "types" in loaded.annotation_names
+    assert (
+        loaded.pairs.sort("pre", "post")["cell_type_pre"].to_list()
+        == ct.pairs.sort("pre", "post")["cell_type_pre"].to_list()
+    )
+
+
+def test_save_load_with_filter(ct, tmp_path):
+    """A registered filter survives save/load."""
+    import datafolio
+
+    filtered = ct.filter(pl.col("n_syn") >= 3)
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    filtered.save(folio)
+
+    loaded = ConnectivityTable.load(folio)
+    assert len(loaded.pairs) == 3
+    assert (loaded.pairs["n_syn"] >= 3).all()
+
+
+def test_save_load_with_expression(ct, tmp_path):
+    """Named expressions survive save/load (binary-format round-trip)."""
+    import datafolio
+
+    ct.add_expression("double", pl.col("n_syn") * 2)
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    ct.save(folio)
+
+    loaded = ConnectivityTable.load(folio)
+    result = loaded.pairs.sort("pre", "post")
+    expected = (ct.pairs.sort("pre", "post")["n_syn"] * 2).to_list()
+    assert result["double"].to_list() == expected
+
+
+def test_save_load_accepts_path(ct, tmp_path):
+    """save()/load() accept str/Path in addition to DataFolio instances."""
+    folio_path = tmp_path / "folio"
+    ct.save(str(folio_path))
+    loaded = ConnectivityTable.load(str(folio_path))
+    assert loaded.pairs.sort("pre", "post").equals(ct.pairs.sort("pre", "post"))
+
+
+def test_save_load_overwrite(ct, tmp_path):
+    """save(overwrite=True) replaces an existing folio."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    ct.save(folio)
+    # Modify and re-save — must pass overwrite=True
+    ct2 = ct.filter(pl.col("n_syn") >= 3)
+    ct2.save(folio, overwrite=True)
+    loaded = ConnectivityTable.load(folio)
+    assert len(loaded.pairs) == 3

@@ -23,6 +23,7 @@ be factored from observed duplication rather than speculated in advance.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Union
 
 import polars as pl
@@ -183,3 +184,16 @@ def _auto_pack(lf: pl.LazyFrame, col: str | None) -> pl.LazyFrame:
     if all(f"{col}_{ax}" in names for ax in ("x", "y", "z")):
         return pack_position(lf, col)
     return lf
+
+
+# ── DataFolio helpers ─────────────────────────────────────────────────────────
+
+
+def _as_folio(folio):
+    """Return ``folio`` unchanged if it's already a DataFolio; otherwise open
+    a DataFolio at the given path. Accepts ``str``, ``Path``, or DataFolio."""
+    if isinstance(folio, (str, Path)):
+        from datafolio import DataFolio
+
+        return DataFolio(folio)
+    return folio

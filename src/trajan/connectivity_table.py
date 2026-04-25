@@ -14,15 +14,21 @@ belong on the narrower ``EdgeList`` subclass, not here (see
 This first landing is dense-only (``to_dense`` via Polars pivot). A sparse
 backend is tracked as a follow-up (Phase 3b in REFACTOR.md).
 
-Save/load via DataFolio is deferred to a later phase; the class is otherwise
-usable end-to-end.
+Persistence via DataFolio is supported and preserves the concrete class —
+a saved ``EdgeList`` round-trips as an ``EdgeList`` even when loaded via
+``ConnectivityTable.load`` — through a ``__type__`` marker in the config.
 """
 
 from __future__ import annotations
 
+import base64
+import warnings
+from pathlib import Path
+from typing import Union
+
 import polars as pl
 
-from ._base import CellAnnotationSpec, _to_lazy
+from ._base import CellAnnotationSpec, _as_folio, _to_lazy
 
 
 class ConnectivityTable:
@@ -49,6 +55,10 @@ class ConnectivityTable:
     both pre and post entity columns, producing ``{col}_pre`` / ``{col}_post``
     outputs analogous to ``SynapseTable.add_cell_annotation``.
     """
+
+    # ``__type__`` marker written into saved config so ``load`` can dispatch
+    # to the correct concrete class (EdgeList overrides). See save/load.
+    _TYPE_TAG: str = "ConnectivityTable"
 
     def __init__(
         self,
@@ -458,3 +468,124 @@ class ConnectivityTable:
             )
             .fill_null(fill_value)
         )
+
+    # ── persistence ────────────────────────────────────────────────────────
+
+    def save(self, folio: Union[str, Path, object], overwrite: bool = False) -> None:
+        """Save this ConnectivityTable (or EdgeList) to a DataFolio.
+
+        Materializes the base pair frame and every registered annotation
+        as Parquet tables; serializes filters as polars JSON expressions
+        and named expressions as base64-encoded polars binary. The concrete
+        class (``ConnectivityTable`` vs ``EdgeList``) is stored in a
+        ``__type__`` marker so ``load`` can return the correct subclass.
+
+        Parameters
+        ----------
+        folio : str, Path, or DataFolio
+            Target folio.
+        overwrite : bool, optional
+            If True, overwrite existing items in the folio.
+        """
+        folio = _as_folio(folio)
+        config = {
+            "__type__": self._TYPE_TAG,
+            "pre_col": self._pre_col,
+            "post_col": self._post_col,
+            "weights": list(self._weights),
+            "filters": [f.meta.serialize(format="json") for f in self._filters],
+            "expressions": {
+                name: base64.b64encode(expr.meta.serialize(format="binary")).decode(
+                    "ascii"
+                )
+                for name, expr in self._expressions.items()
+            },
+            "annotations": {
+                name: {
+                    "entity_id_col": spec.cell_id_col,
+                    "data_cols": list(spec.data_cols),
+                }
+                for name, spec in self._annotations.items()
+            },
+        }
+        folio.add_json("config", config, overwrite=overwrite)
+        folio.add_table("pairs", self._pair_lf.collect(), overwrite=overwrite)
+        for name, spec in self._annotations.items():
+            folio.add_table(f"ann_{name}", spec.lf.collect(), overwrite=overwrite)
+
+    @classmethod
+    def load(cls, folio: Union[str, Path, object]) -> ConnectivityTable:
+        """Load a ConnectivityTable (or EdgeList) from a DataFolio.
+
+        When called on ``ConnectivityTable.load``, dispatches to
+        ``EdgeList.load`` if the saved folio's ``__type__`` marker says
+        the data was an EdgeList. When called on ``EdgeList.load``, the
+        marker must match — loading a plain ConnectivityTable as an
+        EdgeList raises ``TypeError`` because the cell-axis invariant
+        isn't guaranteed.
+        """
+        folio = _as_folio(folio)
+        config = folio.get_json("config")
+        saved_type = config.get("__type__", "ConnectivityTable")
+
+        # Dispatch from the base class to the concrete subclass if needed.
+        if cls is ConnectivityTable and saved_type != "ConnectivityTable":
+            if saved_type == "EdgeList":
+                from .edgelist import EdgeList
+
+                return EdgeList.load(folio)
+            raise TypeError(
+                f"Saved folio's __type__ is {saved_type!r}; unknown at "
+                f"ConnectivityTable.load."
+            )
+        if cls is not ConnectivityTable and saved_type != cls._TYPE_TAG:
+            raise TypeError(
+                f"Saved folio is a {saved_type!r}; cannot load as "
+                f"{cls.__name__}. Call the matching .load() — or "
+                f"ConnectivityTable.load(folio), which dispatches."
+            )
+
+        def _lf(name: str) -> pl.LazyFrame:
+            return pl.scan_parquet(folio.get_data_path(name))
+
+        instance = cls(
+            _lf("pairs"),
+            pre_col=config["pre_col"],
+            post_col=config["post_col"],
+            weight_cols=config.get("weights", []),
+        )
+
+        for name, ann_meta in config.get("annotations", {}).items():
+            instance.add_annotation(
+                name,
+                _lf(f"ann_{name}"),
+                entity_id_col=ann_meta["entity_id_col"],
+            )
+
+        # Named expressions — binary format first (round-trips literals
+        # correctly), with a JSON fallback for older saved folios.
+        for name, expr_val in config.get("expressions", {}).items():
+            expr = None
+            try:
+                expr = pl.Expr.deserialize(base64.b64decode(expr_val), format="binary")
+            except Exception:
+                pass
+            if expr is None:
+                try:
+                    expr = pl.Expr.deserialize(expr_val.encode(), format="json")
+                except Exception:
+                    warnings.warn(
+                        f"Could not deserialize expression {name!r} from folio "
+                        "(likely a Polars version incompatibility). Re-save to fix.",
+                        stacklevel=2,
+                    )
+                    continue
+            instance.add_expression(name, expr)
+
+        # Filters accumulate via .filter() which returns a new instance.
+        for f_json in config.get("filters", []):
+            instance = instance.filter(
+                pl.Expr.deserialize(f_json.encode(), format="json")
+            )
+
+        return instance

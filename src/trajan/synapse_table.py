@@ -12,6 +12,7 @@ from ._base import (
     CellAnnotationSpec,
     SynapseAnnotationSpec,
     VertexAnnotationSpec,
+    _as_folio,
     _auto_pack,
     _to_lazy,
 )
@@ -53,15 +54,6 @@ class _AnnotationProxy:
 
     def __repr__(self) -> str:
         return f"AnnotationProxy({list(self._store)})"
-
-
-def _as_folio(folio):
-    """Return folio unchanged if it's a DataFolio; otherwise open DataFolio(path)."""
-    if isinstance(folio, (str, Path)):
-        from datafolio import DataFolio
-
-        return DataFolio(folio)
-    return folio
 
 
 def _spatial_col_name(prefix: str, feature: str) -> str:

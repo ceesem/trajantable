@@ -29,7 +29,7 @@ class EdgeList(ConnectivityTable):
     """A pair-level connectivity table where both axes are cells.
 
     Constructed either by direct frame passing (for published edgelists etc.)
-    or — in a later phase — as the output of ``SynapseTable.edgelist()``.
+    or as the output of ``SynapseTable.edgelist()``.
 
     The cell invariant is documented rather than statically enforced: a
     ConnectivityTable has no distinguished "kind" on its axes, so EdgeList's
@@ -48,6 +48,11 @@ class EdgeList(ConnectivityTable):
     weight_cols : list[str] or str or None, optional
         Weight columns (defaults to ``["n_syn"]`` when present).
     """
+
+    # Overrides ConnectivityTable._TYPE_TAG so save() writes "EdgeList" and
+    # ConnectivityTable.load() can dispatch back to this class when the
+    # saved folio contains an EdgeList.
+    _TYPE_TAG: str = "EdgeList"
 
     # ── cell-specific filters ──────────────────────────────────────────────
 

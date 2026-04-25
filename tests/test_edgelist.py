@@ -196,3 +196,77 @@ def test_aggregate_to_type_requires_weight(pair_frame):
     el.add_annotation("types", types, entity_id_col="cid")
     with pytest.raises(ValueError, match="weight"):
         el.aggregate_to_type(pre="t_pre", post="t_post")
+
+
+# ── persistence: type is preserved across save/load ─────────────────────────
+
+
+def test_edgelist_saves_and_loads_as_edgelist(el, tmp_path):
+    """EdgeList round-trips as EdgeList, not demoted to ConnectivityTable."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    el.save(folio)
+
+    via_edgelist = EdgeList.load(folio)
+    assert isinstance(via_edgelist, EdgeList)
+    assert via_edgelist.pairs.sort("pre", "post").equals(el.pairs.sort("pre", "post"))
+
+
+def test_connectivitytable_load_dispatches_to_edgelist(el, tmp_path):
+    """ConnectivityTable.load() on a folio saved as EdgeList returns an EdgeList."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    el.save(folio)
+
+    via_parent = ConnectivityTable.load(folio)
+    assert isinstance(via_parent, EdgeList)  # dispatched, not demoted
+
+
+def test_edgelist_load_on_plain_connectivity_table_raises(tmp_path, pair_frame):
+    """Loading a plain ConnectivityTable as EdgeList raises — the cell-axis
+    invariant can't be guaranteed for arbitrary ConnectivityTable data."""
+    import datafolio
+
+    ct = ConnectivityTable(pair_frame, pre_col="pre", post_col="post")
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    ct.save(folio)
+
+    with pytest.raises(TypeError, match="ConnectivityTable"):
+        EdgeList.load(folio)
+
+
+def test_edgelist_save_load_preserves_annotations_and_filter(el, tmp_path):
+    """Annotations, weights, and filters survive the EdgeList round-trip."""
+    import datafolio
+
+    types = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "cell_type": ["a", "b", "c", "d", "e"]}
+    )
+    el.add_annotation("types", types, entity_id_col="cid")
+    filtered = el.filter(pl.col("n_syn") >= 3)
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    filtered.save(folio)
+    loaded = EdgeList.load(folio)
+
+    assert isinstance(loaded, EdgeList)
+    assert "types" in loaded.annotation_names
+    assert len(loaded.pairs) == 3
+    assert "cell_type_pre" in loaded.pairs.columns
+
+
+def test_edgelist_cell_specific_ops_after_load(el, tmp_path):
+    """After loading, cell-specific operations (filter_by_ids) still work —
+    confirming the restored object is a real EdgeList, not a ConnectivityTable
+    with a class-tag sticker."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    el.save(folio)
+    loaded = EdgeList.load(folio)
+
+    out = loaded.filter_by_ids(pre_ids=[1])
+    assert isinstance(out, EdgeList)
+    assert set(out.pairs["pre"].to_list()) == {1}
