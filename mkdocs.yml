@@ -54,12 +54,12 @@ markdown_extensions:
 plugins:
   - mkdocstrings:
       default_handler: python
+      import:
+        - https://docs.python.org/3/objects.inv
+        - https://numpy.org/doc/stable/objects.inv
+        - https://pandas.pydata.org/pandas-docs/stable/objects.inv
       handlers:
         python:
-          import:
-            - https://docs.python.org/3/objects.inv
-            - https://numpy.org/doc/stable/objects.inv
-            - https://pandas.pydata.org/pandas-docs/stable/objects.inv
           paths: [.]
           options:
             show_source: false
