@@ -767,7 +767,7 @@ wheels = [
 [[package]]
 name = "datafolio"
 version = "1.3.0"
-source = { editable = "../datafolio" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "click" },
     { name = "cloud-files" },
@@ -780,38 +780,8 @@ dependencies = [
     { name = "rich" },
     { name = "skops" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "click", specifier = ">=8.1.0" },
-    { name = "cloud-files", specifier = ">=5.8.1" },
-    { name = "filelock", specifier = ">=3.12.0" },
-    { name = "joblib", specifier = ">=1.3.0" },
-    { name = "orjson", specifier = ">=3.9.0" },
-    { name = "pandas", specifier = ">=2.0.0" },
-    { name = "pyarrow", specifier = ">=14.0.0" },
-    { name = "rich", specifier = ">=13.0.0" },
-    { name = "skops", specifier = ">=0.10.0" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "bump-my-version" },
-    { name = "ipykernel" },
-    { name = "poethepoet" },
-    { name = "pytest" },
-    { name = "pytest-cov" },
-    { name = "scikit-learn" },
-]
-docs = [
-    { name = "mkdocs" },
-    { name = "mkdocs-material" },
-    { name = "mkdocstrings", extras = ["python"] },
-]
-lint = [{ name = "ruff" }]
-profile = [
-    { name = "pyinstrument" },
-    { name = "scalene" },
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d0/1d/65d304bf4c7d3d0a151f441a590ae3c7bcedcbc9f4d42cc5695a165ddb1a/datafolio-1.3.0-py3-none-any.whl", hash = "sha256:ac542218dac9f052d8960f8ddc99b20b15c7550a8adfd8242bef51c3670c7154", size = 100791, upload-time = "2026-04-22T02:53:10.822Z" },
 ]
 
 [[package]]
@@ -3539,7 +3509,7 @@ profile = [
 
 [package.metadata]
 requires-dist = [
-    { name = "datafolio", editable = "../datafolio" },
+    { name = "datafolio", specifier = ">=1.3.0" },
     { name = "polars", specifier = ">=1.39.3" },
 ]
 

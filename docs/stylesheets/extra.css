@@ -1,0 +1,16 @@
+/* Tyrian / Roman imperial purple — matches Material's own selector specificity */
+[data-md-color-primary] {
+  --md-primary-fg-color: #5C1A82;
+  --md-primary-fg-color--light: #7A3A9E;
+  --md-primary-fg-color--dark: #3E0D62;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.7);
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #f5f1f9;
+  --md-default-bg-color--light: #f8f5fb;
+  --md-default-bg-color--lighter: #fbf8fd;
+  --md-default-bg-color--lightest: #fefcff;
+  --md-code-bg-color: #ede8f5;
+}
