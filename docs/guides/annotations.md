@@ -47,6 +47,39 @@ extra = pl.read_parquet("soma_extra.parquet")  # root_id, volume
 st = st.extend_cell_annotation("soma", extra, on="root_id")
 ```
 
+### Declaring annotation roles
+
+Cell annotations can carry **role declarations** that let library operations
+locate them without explicit per-call arguments:
+
+- `position_col=<col>` — names a data column carrying the cell's position as
+  a struct with `x` / `y` / `z` fields. Picked up by `filter_by_soma_distance`
+  and `add_spatial_features`.
+- `is_universe=True` — marks this annotation's cell-id set as the
+  authoritative cell universe (the set of cells that *exist*, including those
+  with zero observed connections). Picked up by denominator-bearing
+  statistics and null-model shufflers.
+
+```python
+soma = pl.read_parquet("soma_positions.parquet")  # root_id, pt_position
+st = st.add_cell_annotation(
+    "soma",
+    soma,
+    cell_id_col="root_id",
+    position_col="pt_position",   # spatial filters auto-locate this
+    is_universe=True,             # this set defines "the cells we know about"
+)
+```
+
+Resolution rules: with exactly one annotation declaring a given role, it's
+auto-selected. With multiple, pass `annotation=<name>` to disambiguate. With
+zero, the operation raises with a clear error.
+
+!!! note
+    A future `Universe` class will likely supersede the `is_universe` flag.
+    The flag is the migration anchor — code that uses it today will get a
+    clean upgrade path.
+
 ## Vertex-level annotations
 
 Joined on a vertex (supervoxel) ID column for pre, post, or both sides.

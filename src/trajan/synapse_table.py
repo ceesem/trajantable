@@ -84,12 +84,14 @@ class SynapseTable:
     synapse_position_col : str or None, optional
         Column in syn_df holding synapse positions as a struct with x, y, z fields.
         Required for filter_by_bbox.
-    soma_position_annotation : str or None, optional
-        Name of the registered cell annotation that holds soma positions.
-        Required for filter_by_soma_distance.
-    soma_position_col : str or None, optional
-        Column within the soma position annotation that holds positions as a struct
-        with x, y, z fields. Required for filter_by_soma_distance.
+
+    Notes
+    -----
+    Soma-position support is now declared on the cell annotation itself, via
+    ``add_cell_annotation(..., position_col=<col>)``. Spatial filters
+    (``filter_by_soma_distance``, ``add_spatial_features``) auto-resolve the
+    position-bearing annotation; pass ``annotation=<name>`` when more than one
+    is registered.
     """
 
     def __init__(
@@ -99,16 +101,12 @@ class SynapseTable:
         post_col: str = "post_pt_root_id",
         id_col: str = "id",
         synapse_position_col: str | None = None,
-        soma_position_annotation: str | None = None,
-        soma_position_col: str | None = None,
     ):
         self._syn_lf = _auto_pack(_to_lazy(syn_df), synapse_position_col)
         self._pre_col = pre_col
         self._post_col = post_col
         self._id_col = id_col
         self._synapse_position_col = synapse_position_col
-        self._soma_position_annotation = soma_position_annotation
-        self._soma_position_col = soma_position_col
 
         # Cache base schema names once — _syn_lf never changes
         self._syn_col_names: list[str] = self._syn_lf.collect_schema().names()
@@ -170,11 +168,12 @@ class SynapseTable:
         lines.append(f"  id_col             : {self._id_col}")
         if self._synapse_position_col:
             lines.append(f"  synapse_position   : {self._synapse_position_col}")
-        if self._soma_position_annotation:
-            lines.append(
-                f"  soma_position      : {self._soma_position_col} "
-                f"(from annotation {self._soma_position_annotation!r})"
-            )
+        for ann_name, spec in self._cell_annotations.items():
+            if spec.position_col is not None:
+                lines.append(
+                    f"  soma_position      : {spec.position_col} "
+                    f"(from annotation {ann_name!r})"
+                )
 
         # ── base synapse columns
         other_cols = [
@@ -214,7 +213,15 @@ class SynapseTable:
                     if spec.join_on_alias
                     else f"join on {spec.cell_id_col!r}"
                 )
-                lines.append(f"  {name!r} ({len(spec.data_cols)} col(s), {join_info})")
+                role_tags = []
+                if spec.is_universe:
+                    role_tags.append("universe")
+                if spec.position_col is not None:
+                    role_tags.append(f"position={spec.position_col!r}")
+                role_str = f"  [{', '.join(role_tags)}]" if role_tags else ""
+                lines.append(
+                    f"  {name!r} ({len(spec.data_cols)} col(s), {join_info}){role_str}"
+                )
                 for c in spec.data_cols:
                     tag = "  [position]" if self._is_position_col(spec.lf, c) else ""
                     lines.append(f"    {c}  ->  {c}_pre, {c}_post{tag}")
@@ -385,15 +392,80 @@ class SynapseTable:
         """Column holding synapse positions as a struct with x, y, z fields, if declared."""
         return self._synapse_position_col
 
-    @property
-    def soma_position_annotation(self) -> str | None:
-        """Name of the registered cell annotation that holds soma positions, if declared."""
-        return self._soma_position_annotation
+    def _resolve_position_annotation(self, annotation: str | None = None) -> str:
+        """Return the name of the cell annotation whose ``position_col`` to use.
 
-    @property
-    def soma_position_col(self) -> str | None:
-        """Column within the soma position annotation that holds positions, if declared."""
-        return self._soma_position_col
+        If ``annotation`` is given, validate that it's registered and has a
+        ``position_col`` set. Otherwise: find the unique cell annotation with
+        a ``position_col``; error on zero matches or ambiguity.
+        """
+        if annotation is not None:
+            if annotation not in self._cell_annotations:
+                raise KeyError(
+                    f"No cell annotation named {annotation!r}. "
+                    f"Registered: {list(self._cell_annotations)}"
+                )
+            if self._cell_annotations[annotation].position_col is None:
+                raise ValueError(
+                    f"Cell annotation {annotation!r} has no position_col declared. "
+                    f"Re-register with add_cell_annotation(..., position_col=<col>)."
+                )
+            return annotation
+
+        with_pos = [
+            n
+            for n, spec in self._cell_annotations.items()
+            if spec.position_col is not None
+        ]
+        if not with_pos:
+            raise ValueError(
+                "No cell annotation with a position_col is registered. "
+                "Pass position_col=<col> to add_cell_annotation when "
+                "registering the annotation that carries soma positions."
+            )
+        if len(with_pos) > 1:
+            raise ValueError(
+                f"Multiple cell annotations carry positions ({with_pos}); "
+                "pass annotation=<name> to disambiguate."
+            )
+        return with_pos[0]
+
+    def _resolve_universe_annotation(self, annotation: str | None = None) -> str:
+        """Return the name of the cell annotation that defines the cell universe.
+
+        If ``annotation`` is given, validate that it's registered and has
+        ``is_universe=True``. Otherwise: find the unique cell annotation
+        marked universe; error on zero matches or ambiguity.
+        """
+        if annotation is not None:
+            if annotation not in self._cell_annotations:
+                raise KeyError(
+                    f"No cell annotation named {annotation!r}. "
+                    f"Registered: {list(self._cell_annotations)}"
+                )
+            if not self._cell_annotations[annotation].is_universe:
+                raise ValueError(
+                    f"Cell annotation {annotation!r} is not marked "
+                    f"is_universe=True. Re-register with add_cell_annotation"
+                    f"(..., is_universe=True)."
+                )
+            return annotation
+
+        universes = [
+            n for n, spec in self._cell_annotations.items() if spec.is_universe
+        ]
+        if not universes:
+            raise ValueError(
+                "No cell annotation is marked is_universe=True. Pass "
+                "is_universe=True to add_cell_annotation on the annotation "
+                "whose cell-id set defines the authoritative universe."
+            )
+        if len(universes) > 1:
+            raise ValueError(
+                f"Multiple cell annotations are marked is_universe=True "
+                f"({universes}); pass annotation=<name> to disambiguate."
+            )
+        return universes[0]
 
     def cell_annotation_data_cols(self) -> dict[str, list[str]]:
         """Data columns (non-key) for each registered cell annotation.
@@ -490,6 +562,8 @@ class SynapseTable:
         alias_col: str | None = None,
         alias_name: str | None = None,
         position_cols: list[str] | str | None = None,
+        position_col: str | None = None,
+        is_universe: bool = False,
     ) -> SynapseTable:
         """Register a cell-level annotation, joined symmetrically for pre and post.
 
@@ -520,6 +594,19 @@ class SynapseTable:
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "soma_pt_position" or ["soma_pt_position"] will
             pack soma_pt_position_x/y/z into a struct named soma_pt_position.
+        position_col : str or None, optional
+            Name of a data column in this annotation that carries the cell's
+            position as a struct with x/y/z fields. Declaring this role lets
+            ``filter_by_soma_distance`` and ``add_spatial_features`` find it
+            without further configuration. The column must be packed (use
+            ``position_cols=`` above or call ``pack_position`` ahead of time).
+        is_universe : bool, optional
+            If True, this annotation's cell-id set is treated as the
+            authoritative cell universe — the set of cells that *exist* for
+            the purposes of denominator-bearing statistics, including those
+            with zero observed connections. Use ``annotation=`` on stats /
+            resolvers to disambiguate when more than one is registered.
+            See ``CellAnnotationSpec.is_universe``.
 
         Returns
         -------
@@ -540,12 +627,22 @@ class SynapseTable:
             lf = _auto_pack(lf, col)
         self._validate_join_key_unique(lf, cell_id_col)
         data_cols = [c for c in lf.collect_schema().names() if c != cell_id_col]
+        if position_col is not None and position_col not in data_cols:
+            raise ValueError(
+                f"position_col {position_col!r} not found in annotation data "
+                f"columns. Available: {data_cols}"
+            )
         new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
         collisions = new_cols & self._current_columns()
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
         self._cell_annotations[name] = CellAnnotationSpec(
-            lf, cell_id_col, join_on_alias, data_cols
+            lf,
+            cell_id_col,
+            join_on_alias,
+            data_cols,
+            position_col=position_col,
+            is_universe=is_universe,
         )
         self._cache = None
         if alias_col is not None:
@@ -643,6 +740,8 @@ class SynapseTable:
         df,
         on: str,
         position_cols: list[str] | str | None = None,
+        position_col: str | None = None,
+        is_universe: bool | None = None,
     ) -> SynapseTable:
         """Join additional columns into an already-registered cell annotation.
 
@@ -662,6 +761,14 @@ class SynapseTable:
         position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z into a position
             struct before registering.
+        position_col : str or None, optional
+            Declare a column being added by this extension as the annotation's
+            position role. Overrides any previously declared ``position_col``
+            on this annotation. The column must be among the extension's data
+            columns (use ``position_cols=`` above to pack it if needed).
+        is_universe : bool or None, optional
+            If given, set the annotation's ``is_universe`` flag (True or
+            False). ``None`` (default) leaves the existing flag unchanged.
 
         Returns
         -------
@@ -696,11 +803,24 @@ class SynapseTable:
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
 
+        if position_col is not None and position_col not in extra_cols:
+            raise ValueError(
+                f"position_col {position_col!r} not found among extension data "
+                f"columns. Available: {extra_cols}"
+            )
+        merged_position_col = (
+            position_col if position_col is not None else existing.position_col
+        )
+        merged_is_universe = (
+            is_universe if is_universe is not None else existing.is_universe
+        )
         self._cell_annotations[name] = CellAnnotationSpec(
             lf=existing.lf.join(new_lf, on=on, how="left"),
             cell_id_col=existing.cell_id_col,
             join_on_alias=existing.join_on_alias,
             data_cols=existing.data_cols + extra_cols,
+            position_col=merged_position_col,
+            is_universe=merged_is_universe,
         )
         self._cache = None
         return self
@@ -1077,8 +1197,6 @@ class SynapseTable:
         new._post_col = self._post_col
         new._id_col = self._id_col
         new._synapse_position_col = self._synapse_position_col
-        new._soma_position_annotation = self._soma_position_annotation
-        new._soma_position_col = self._soma_position_col
         new._synapse_annotations = self._synapse_annotations.copy()
         new._cell_annotations = self._cell_annotations.copy()
         new._vertex_annotations = self._vertex_annotations.copy()
@@ -1146,8 +1264,6 @@ class SynapseTable:
         new._post_col = self._post_col
         new._id_col = self._id_col
         new._synapse_position_col = self._synapse_position_col
-        new._soma_position_annotation = self._soma_position_annotation
-        new._soma_position_col = self._soma_position_col
         new._n_syn_base = self._n_syn_base
         new._cache = None
         new._synapse_annotations = _select(
@@ -1245,19 +1361,27 @@ class SynapseTable:
     def filter_by_soma_distance(
         self,
         max_distance: float,
+        *,
+        annotation: str | None = None,
         distance_fn: Callable[[str, str], pl.Expr] = euclidean_distance,
     ) -> SynapseTable:
         """Return a new SynapseTable keeping only synapses where soma-soma
         distance is ≤ max_distance (in the same units as your position columns).
 
-        Requires soma_position_annotation and soma_position_col to be set, with
-        the position column being a struct with x, y, z fields (see pack_position).
+        Positions are looked up from a registered cell annotation whose
+        ``position_col`` was declared at ``add_cell_annotation`` time. The
+        position column must be packed as a struct with ``x`` / ``y`` / ``z``
+        fields (see ``pack_position``).
 
         Parameters
         ----------
         max_distance : float
             Maximum soma-to-soma distance to retain, in the same units as
             the position columns.
+        annotation : str or None, optional
+            Name of the cell annotation whose ``position_col`` to use. If
+            ``None`` (default), uses the unique position-bearing annotation;
+            raises if zero or more than one are registered.
         distance_fn : Callable[[str, str], pl.Expr], optional
             Callable taking two column name strings and returning a pl.Expr for
             the distance. Defaults to euclidean_distance. Use radial_distance to
@@ -1268,18 +1392,11 @@ class SynapseTable:
         SynapseTable
             A new SynapseTable keeping only synapses within max_distance.
         """
-        if self._soma_position_annotation is None:
-            raise ValueError("soma_position_annotation not set on this SynapseTable")
-        if self._soma_position_annotation not in self._cell_annotations:
-            raise ValueError(
-                f"Soma position annotation {self._soma_position_annotation!r} "
-                f"not registered. Call add_cell_annotation first."
-            )
-        if self._soma_position_col is None:
-            raise ValueError("soma_position_col not set on this SynapseTable")
-        pre_col = f"{self._soma_position_col}_pre"
-        post_col = f"{self._soma_position_col}_post"
-        return self.filter(distance_fn(pre_col, post_col) <= max_distance)
+        ann_name = self._resolve_position_annotation(annotation)
+        pos_col = self._cell_annotations[ann_name].position_col
+        return self.filter(
+            distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
+        )
 
     def add_spatial_features(
         self,
@@ -1291,6 +1408,8 @@ class SynapseTable:
         depth_diff: bool = True,
         spherical: bool = True,
         cylindrical: bool = True,
+        *,
+        annotation: str | None = None,
     ) -> SynapseTable:
         """Register a standard battery of spatial features for a two-point vector.
 
@@ -1324,6 +1443,10 @@ class SynapseTable:
         cylindrical : bool, optional
             Include ``rho`` (lateral distance), ``phi`` (shared with spherical),
             and ``dy`` (= depth_diff).
+        annotation : str or None, optional
+            Cell annotation whose ``position_col`` to use for soma positions.
+            Auto-resolved when exactly one position-bearing annotation is
+            registered; pass explicitly to disambiguate.
 
         Returns
         -------
@@ -1333,9 +1456,9 @@ class SynapseTable:
         Raises
         ------
         ValueError
-            If ``center == target``, soma position is not configured, the soma
-            annotation is not registered, or ``target="syn"`` but
-            ``synapse_position_col`` is not set.
+            If ``center == target``, no position-bearing cell annotation is
+            registered (or the named ``annotation`` lacks a ``position_col``),
+            or ``target="syn"`` but ``synapse_position_col`` is not set.
 
         Examples
         --------
@@ -1360,17 +1483,8 @@ class SynapseTable:
         if target not in ("pre", "post", "syn"):
             raise ValueError(f"target must be 'pre', 'post', or 'syn', got {target!r}")
 
-        if self._soma_position_annotation is None:
-            raise ValueError("soma_position_annotation not set on this SynapseTable")
-        if self._soma_position_annotation not in self._cell_annotations:
-            raise ValueError(
-                f"Soma position annotation {self._soma_position_annotation!r} "
-                f"not registered. Call add_cell_annotation first."
-            )
-        if self._soma_position_col is None:
-            raise ValueError("soma_position_col not set on this SynapseTable")
-
-        soma_col = self._soma_position_col
+        ann_name = self._resolve_position_annotation(annotation)
+        soma_col = self._cell_annotations[ann_name].position_col
         soma_cols = {
             "pre": f"{soma_col}_pre",
             "post": f"{soma_col}_post",
@@ -1689,8 +1803,6 @@ class SynapseTable:
             "post_col": self._post_col,
             "id_col": self._id_col,
             "synapse_position_col": self._synapse_position_col,
-            "soma_position_annotation": self._soma_position_annotation,
-            "soma_position_col": self._soma_position_col,
             "weights": self._weights,
             "filters": [f.meta.serialize(format="json") for f in self._filters],
             "expressions": {
@@ -1712,6 +1824,8 @@ class SynapseTable:
                     "cell_id_col": spec.cell_id_col,
                     "join_on_alias": spec.join_on_alias,
                     "data_cols": spec.data_cols,
+                    "position_col": spec.position_col,
+                    "is_universe": spec.is_universe,
                 }
                 for name, spec in self._cell_annotations.items()
             },
@@ -1768,8 +1882,6 @@ class SynapseTable:
             post_col=config["post_col"],
             id_col=config["id_col"],
             synapse_position_col=config["synapse_position_col"],
-            soma_position_annotation=config["soma_position_annotation"],
-            soma_position_col=config["soma_position_col"],
         )
         for name in config["synapse_annotations"]:
             st.add_synapse_annotation(name, _lf(f"synapse_ann_{name}"))
@@ -1779,6 +1891,8 @@ class SynapseTable:
                 _lf(f"cell_ann_{name}"),
                 cell_id_col=meta["cell_id_col"],
                 join_on_alias=meta.get("join_on_alias"),
+                position_col=meta.get("position_col"),
+                is_universe=meta.get("is_universe", False),
             )
         for alias_name, alias_meta in config.get("cell_aliases", {}).items():
             st.set_cell_alias(

@@ -75,17 +75,20 @@ st_local = st.filter_by_bbox(bbox)
 
 ## Soma-soma distance
 
-Requires `soma_position_annotation` and `soma_position_col` to be set, and the
-corresponding cell annotation to be registered:
+Declare which cell annotation carries soma positions by passing
+`position_col=` at registration. Spatial filters auto-resolve to the unique
+position-bearing annotation; pass `annotation=<name>` to disambiguate when
+more than one is registered.
 
 ```python
-st = trajan.SynapseTable(
-    pl.scan_parquet("synapses.parquet"),
-    soma_position_annotation="soma",
-    soma_position_col="pt_position",
-)
+st = trajan.SynapseTable(pl.scan_parquet("synapses.parquet"))
 soma = pl.read_parquet("soma_positions.parquet")  # root_id, pt_position (struct)
-st = st.add_cell_annotation("soma", soma, cell_id_col="root_id")
+st = st.add_cell_annotation(
+    "soma",
+    soma,
+    cell_id_col="root_id",
+    position_col="pt_position",   # declare the position role on this annotation
+)
 
 # Keep only local connections (soma < 100 µm apart)
 st_local = st.filter_by_soma_distance(100_000)  # units match your position data

@@ -379,3 +379,50 @@ def test_save_load_overwrite(ct, tmp_path):
     ct2.save(folio, overwrite=True)
     loaded = ConnectivityTable.load(folio)
     assert len(loaded.pairs) == 3
+
+
+# ── is_universe role ─────────────────────────────────────────────────────────
+
+
+def test_is_universe_default_false(ct):
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
+    ct.add_annotation("types", types, entity_id_col="cid")
+    assert ct._annotations["types"].is_universe is False
+
+
+def test_resolve_universe_annotation_single(ct):
+    cells = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
+    ct.add_annotation("cells", cells, entity_id_col="cid", is_universe=True)
+    assert ct._resolve_universe_annotation() == "cells"
+
+
+def test_resolve_universe_annotation_zero_raises(ct):
+    with pytest.raises(ValueError, match="No annotation is marked is_universe"):
+        ct._resolve_universe_annotation()
+
+
+def test_resolve_universe_annotation_ambiguous_raises(ct):
+    a = pl.DataFrame({"cid": [1, 2, 3], "ta": ["x"] * 3})
+    b = pl.DataFrame({"cid": [10, 11], "tb": ["y"] * 2})
+    ct.add_annotation("a", a, entity_id_col="cid", is_universe=True)
+    ct.add_annotation("b", b, entity_id_col="cid", is_universe=True)
+    with pytest.raises(ValueError, match="Multiple annotations are marked is_universe"):
+        ct._resolve_universe_annotation()
+    assert ct._resolve_universe_annotation("a") == "a"
+
+
+def test_resolve_universe_annotation_named_not_universe_raises(ct):
+    cells = pl.DataFrame({"cid": [1, 2], "t": ["x"] * 2})
+    ct.add_annotation("cells", cells, entity_id_col="cid")  # is_universe=False
+    with pytest.raises(ValueError, match="not marked is_universe=True"):
+        ct._resolve_universe_annotation("cells")
+
+
+def test_is_universe_persists_through_save_load(ct, tmp_path):
+    cells = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
+    ct.add_annotation("cells", cells, entity_id_col="cid", is_universe=True)
+    folio_path = tmp_path / "folio"
+    ct.save(str(folio_path))
+    loaded = ConnectivityTable.load(str(folio_path))
+    assert loaded._annotations["cells"].is_universe is True
+    assert loaded._resolve_universe_annotation() == "cells"

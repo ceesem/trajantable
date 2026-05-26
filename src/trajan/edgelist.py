@@ -79,57 +79,61 @@ class EdgeList(ConnectivityTable):
         self,
         max_distance: float,
         *,
-        pre_position_col: str,
-        post_position_col: str,
+        annotation: str | None = None,
         distance_fn: Callable[[str, str], pl.Expr] = euclidean_distance,
     ) -> EdgeList:
         """Keep pairs whose pre / post soma-soma distance is ``<= max_distance``.
 
-        The user supplies the position-column names explicitly — EdgeList does
-        not sniff or infer them. Positions are typically brought into the plan
-        via a registered cell annotation whose data columns include a position
-        struct; after registration the columns appear as e.g.
-        ``soma_pt_position_pre`` / ``soma_pt_position_post``.
+        Positions are looked up from the registered cell annotation whose
+        ``position_col`` was set at ``add_annotation`` time. The joined
+        per-side columns are ``{position_col}_pre`` / ``{position_col}_post``.
 
         Parameters
         ----------
         max_distance : float
             Maximum distance to retain. Units match the position columns.
-        pre_position_col : str
-            Name of the pre-side position struct column (post-annotation join).
-        post_position_col : str
-            Name of the post-side position struct column.
+        annotation : str or None, optional
+            Name of the annotation whose ``position_col`` to use. If ``None``
+            (default), uses the unique position-bearing annotation; raises if
+            zero or more than one are registered.
         distance_fn : callable
             Takes two position-column names and returns a ``pl.Expr`` for the
             distance. Defaults to 3-D Euclidean. Use ``radial_distance`` for
             lateral-only.
         """
+        ann_name = self._resolve_position_annotation(annotation)
+        pos_col = self._annotations[ann_name].position_col
         return self.filter(
-            distance_fn(pre_position_col, post_position_col) <= max_distance
+            distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
         )
 
     def filter_by_bbox(
         self,
         bbox,
         *,
-        pre_position_col: str,
-        post_position_col: str,
+        annotation: str | None = None,
     ) -> EdgeList:
         """Keep pairs where both pre and post soma positions fall inside a bbox.
 
         Unlike ``SynapseTable.filter_by_bbox`` (which filters on a single
         synapse position), EdgeList's bbox filter checks both cells — a pair
-        is kept only if both somas lie within the box. The user supplies the
-        pre / post position column names explicitly.
+        is kept only if both somas lie within the box. Positions are looked up
+        from the position-bearing cell annotation (see
+        ``filter_by_soma_distance`` for resolution rules).
 
         Parameters
         ----------
         bbox : Sequence
             ((xmin, ymin, zmin), (xmax, ymax, zmax)).
+        annotation : str or None, optional
+            Name of the annotation whose ``position_col`` to use; auto-resolved
+            when exactly one position-bearing annotation is registered.
         """
+        ann_name = self._resolve_position_annotation(annotation)
+        pos_col = self._annotations[ann_name].position_col
         (xmin, ymin, zmin), (xmax, ymax, zmax) = bbox
-        pre = pl.col(pre_position_col)
-        post = pl.col(post_position_col)
+        pre = pl.col(f"{pos_col}_pre")
+        post = pl.col(f"{pos_col}_post")
 
         def _inside(p):
             return (

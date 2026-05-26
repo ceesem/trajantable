@@ -142,6 +142,8 @@ class ConnectivityTable:
         name: str,
         df,
         entity_id_col: str,
+        position_col: str | None = None,
+        is_universe: bool = False,
     ) -> ConnectivityTable:
         """Register a per-entity annotation joined symmetrically on pre and post.
 
@@ -159,6 +161,18 @@ class ConnectivityTable:
         entity_id_col : str
             Column in ``df`` whose values are joined against both ``pre_col``
             and ``post_col``.
+        position_col : str or None, optional
+            Name of a data column carrying the entity's position as a struct
+            with ``x`` / ``y`` / ``z`` fields. Declaring this role lets
+            ``EdgeList`` spatial filters locate positions without explicit
+            per-call args. ConnectivityTable itself does not consume the role
+            (no built-in spatial ops on label-bearing tables), but the
+            declaration is preserved through save/load.
+        is_universe : bool, optional
+            If True, this annotation's entity-id set defines the authoritative
+            universe for denominator-bearing statistics. Auto-resolved when
+            exactly one annotation is marked universe; pass the annotation
+            name explicitly otherwise. See ``CellAnnotationSpec.is_universe``.
         """
         lf = _to_lazy(df)
         schema = lf.collect_schema().names()
@@ -176,6 +190,11 @@ class ConnectivityTable:
             )
 
         data_cols = [c for c in schema if c != entity_id_col]
+        if position_col is not None and position_col not in data_cols:
+            raise ValueError(
+                f"position_col {position_col!r} not found in annotation data "
+                f"columns. Available: {data_cols}"
+            )
         new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
         collisions = new_cols & self._current_columns()
         if collisions:
@@ -186,9 +205,83 @@ class ConnectivityTable:
             cell_id_col=entity_id_col,
             join_on_alias=None,
             data_cols=data_cols,
+            position_col=position_col,
+            is_universe=is_universe,
         )
         self._cache = None
         return self
+
+    # ── role resolvers (used by spatial filters and universe-aware stats) ──
+
+    def _resolve_position_annotation(self, annotation: str | None = None) -> str:
+        """Return the name of the annotation whose ``position_col`` we should use.
+
+        If ``annotation`` is given, validate that it's registered and has a
+        ``position_col`` set. Otherwise: find the unique annotation with a
+        ``position_col``; error on zero matches or ambiguity.
+        """
+        if annotation is not None:
+            if annotation not in self._annotations:
+                raise KeyError(
+                    f"No annotation named {annotation!r}. "
+                    f"Registered: {list(self._annotations)}"
+                )
+            if self._annotations[annotation].position_col is None:
+                raise ValueError(
+                    f"Annotation {annotation!r} has no position_col declared. "
+                    f"Re-register with add_annotation(..., position_col=<col>)."
+                )
+            return annotation
+
+        with_pos = [
+            n for n, spec in self._annotations.items() if spec.position_col is not None
+        ]
+        if not with_pos:
+            raise ValueError(
+                "No annotation with a position_col is registered. "
+                "Pass position_col=<col> to add_annotation when registering "
+                "the annotation that carries positions."
+            )
+        if len(with_pos) > 1:
+            raise ValueError(
+                f"Multiple annotations carry positions ({with_pos}); "
+                "pass annotation=<name> to disambiguate."
+            )
+        return with_pos[0]
+
+    def _resolve_universe_annotation(self, annotation: str | None = None) -> str:
+        """Return the name of the annotation that defines the cell universe.
+
+        If ``annotation`` is given, validate that it's registered and has
+        ``is_universe=True``. Otherwise: find the unique annotation marked
+        universe; error on zero matches or ambiguity.
+        """
+        if annotation is not None:
+            if annotation not in self._annotations:
+                raise KeyError(
+                    f"No annotation named {annotation!r}. "
+                    f"Registered: {list(self._annotations)}"
+                )
+            if not self._annotations[annotation].is_universe:
+                raise ValueError(
+                    f"Annotation {annotation!r} is not marked is_universe=True. "
+                    f"Re-register with add_annotation(..., is_universe=True)."
+                )
+            return annotation
+
+        universes = [n for n, spec in self._annotations.items() if spec.is_universe]
+        if not universes:
+            raise ValueError(
+                "No annotation is marked is_universe=True. Pass is_universe=True "
+                "to add_annotation on the annotation whose entity-id set defines "
+                "the authoritative universe."
+            )
+        if len(universes) > 1:
+            raise ValueError(
+                f"Multiple annotations are marked is_universe=True ({universes}); "
+                "pass annotation=<name> to disambiguate."
+            )
+        return universes[0]
 
     def remove_annotation(self, name: str) -> ConnectivityTable:
         if name not in self._annotations:
@@ -504,6 +597,8 @@ class ConnectivityTable:
                 name: {
                     "entity_id_col": spec.cell_id_col,
                     "data_cols": list(spec.data_cols),
+                    "position_col": spec.position_col,
+                    "is_universe": spec.is_universe,
                 }
                 for name, spec in self._annotations.items()
             },
@@ -560,6 +655,8 @@ class ConnectivityTable:
                 name,
                 _lf(f"ann_{name}"),
                 entity_id_col=ann_meta["entity_id_col"],
+                position_col=ann_meta.get("position_col"),
+                is_universe=ann_meta.get("is_universe", False),
             )
 
         # Named expressions — binary format first (round-trips literals

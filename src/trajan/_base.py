@@ -72,12 +72,29 @@ class CellAnnotationSpec:
     data_cols : list[str]
         Columns in ``lf`` (excluding the join key) that become
         ``_pre`` / ``_post`` columns on ``.synapses``.
+    position_col : str or None
+        Name of the data column (within ``data_cols``) that carries the cell's
+        position as a struct with ``x`` / ``y`` / ``z`` fields. Declaring this
+        role lets spatial filters (``filter_by_soma_distance``,
+        ``filter_by_bbox``) locate the position without explicit per-call args.
+        ``None`` means this annotation does not carry positions.
+    is_universe : bool
+        If True, this annotation's key set defines the authoritative cell
+        universe — including cells with zero connections. Statistics that need
+        a denominator (e.g. connection_probability) read membership from the
+        universe annotation; null-model shufflers enumerate possible partners
+        from it. See ``project_cell_annotation_as_universe.md``.
+
+        A future ``Universe`` class will subsume this role; the flag is the
+        migration anchor.
     """
 
     lf: pl.LazyFrame
     cell_id_col: str
     join_on_alias: str | None
     data_cols: list[str]
+    position_col: str | None = None
+    is_universe: bool = False
 
 
 @dataclass

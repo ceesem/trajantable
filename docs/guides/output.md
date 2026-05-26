@@ -55,17 +55,13 @@ Cell-id restriction:
 el.filter_by_ids(pre_ids=[111, 222], post_ids=[333, 444])
 ```
 
-Spatial filters — the position-column names are passed explicitly; trajan
-does not infer them. Positions are typically brought into the plan via a
-cell annotation whose data columns include a position struct (the
-annotation join produces `{col}_pre` / `{col}_post`):
+Spatial filters — declare the position column on the cell annotation that
+carries it (`add_annotation(..., position_col="soma_pt_position")`); the
+filter auto-resolves to it. Pass `annotation=<name>` to disambiguate if more
+than one position-bearing annotation is registered:
 
 ```python
-near = el.filter_by_soma_distance(
-    100_000,  # same units as your position data
-    pre_position_col="soma_pt_position_pre",
-    post_position_col="soma_pt_position_post",
-)
+near = el.filter_by_soma_distance(100_000)  # same units as your position data
 ```
 
 ## Connectivity matrix

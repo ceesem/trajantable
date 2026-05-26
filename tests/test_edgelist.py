@@ -114,7 +114,7 @@ def el_with_positions(pair_frame):
     )
     pos_packed = pack_position(pos, "soma", x="soma_x", y="soma_y", z="soma_z")
     el = EdgeList(pair_frame, pre_col="pre", post_col="post")
-    el.add_annotation("pos", pos_packed, entity_id_col="cid")
+    el.add_annotation("pos", pos_packed, entity_id_col="cid", position_col="soma")
     return el
 
 
@@ -125,11 +125,34 @@ def test_filter_by_soma_distance(el_with_positions):
       1->10 = 0, 1->11 = 500, 2->10 = 100, 2->11 = 400, 3->11 = 500
     With max=200: keep (1,10), (2,10). Two rows.
     """
-    out = el_with_positions.filter_by_soma_distance(
-        200.0, pre_position_col="soma_pre", post_position_col="soma_post"
-    )
+    out = el_with_positions.filter_by_soma_distance(200.0)
     assert isinstance(out, EdgeList)
     assert len(out.pairs) == 2
+
+
+def test_filter_by_soma_distance_no_position_annotation_raises(pair_frame):
+    el = EdgeList(pair_frame, pre_col="pre", post_col="post")
+    with pytest.raises(ValueError, match="No annotation with a position_col"):
+        el.filter_by_soma_distance(100.0)
+
+
+def test_filter_by_soma_distance_ambiguous_raises(pair_frame):
+    pos1 = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "a_x": [0.0] * 5, "a_y": [0.0] * 5, "a_z": [0.0] * 5}
+    )
+    pos2 = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "b_x": [0.0] * 5, "b_y": [0.0] * 5, "b_z": [0.0] * 5}
+    )
+    a_packed = pack_position(pos1, "a", x="a_x", y="a_y", z="a_z")
+    b_packed = pack_position(pos2, "b", x="b_x", y="b_y", z="b_z")
+    el = EdgeList(pair_frame, pre_col="pre", post_col="post")
+    el.add_annotation("a", a_packed, entity_id_col="cid", position_col="a")
+    el.add_annotation("b", b_packed, entity_id_col="cid", position_col="b")
+    with pytest.raises(ValueError, match="Multiple annotations carry positions"):
+        el.filter_by_soma_distance(100.0)
+    # disambiguating works
+    out = el.filter_by_soma_distance(100.0, annotation="a")
+    assert isinstance(out, EdgeList)
 
 
 # ── filter_by_bbox ───────────────────────────────────────────────────────────
@@ -144,9 +167,7 @@ def test_filter_by_bbox(el_with_positions):
     So pairs missing cell 11 survive: (1,10), (2,10). Two rows.
     """
     bbox = ((-10.0, -10.0, -10.0), (150.0, 10.0, 10.0))
-    out = el_with_positions.filter_by_bbox(
-        bbox, pre_position_col="soma_pre", post_position_col="soma_post"
-    )
+    out = el_with_positions.filter_by_bbox(bbox)
     assert isinstance(out, EdgeList)
     assert len(out.pairs) == 2
 

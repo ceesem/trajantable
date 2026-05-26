@@ -817,12 +817,14 @@ def st_spatial(base_synapses):
         SynapseTable(
             base_synapses,
             synapse_position_col="ctr_pt_position",
-            soma_position_annotation="soma",
-            soma_position_col="soma",
         )
         .add_synapse_annotation("ctr_pt", syn_pos_df, position_cols="ctr_pt_position")
         .add_cell_annotation(
-            "soma", soma_df, cell_id_col="root_id", position_cols="soma"
+            "soma",
+            soma_df,
+            cell_id_col="root_id",
+            position_cols="soma",
+            position_col="soma",
         )
     )
 
@@ -900,7 +902,7 @@ def test_add_spatial_features_center_equals_target_raises(st_spatial):
 
 def test_add_spatial_features_no_soma_config_raises(base_synapses):
     st = SynapseTable(base_synapses)
-    with pytest.raises(ValueError, match="soma_position_annotation"):
+    with pytest.raises(ValueError, match="position_col"):
         st.add_spatial_features()
 
 
@@ -913,13 +915,84 @@ def test_add_spatial_features_target_syn_no_synapse_col_raises(base_synapses):
             "soma_z": [0.0] * 3,
         }
     )
-    st = SynapseTable(
-        base_synapses,
-        soma_position_annotation="soma",
-        soma_position_col="soma",
-    ).add_cell_annotation("soma", soma_df, cell_id_col="root_id", position_cols="soma")
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma",
+        soma_df,
+        cell_id_col="root_id",
+        position_cols="soma",
+        position_col="soma",
+    )
     with pytest.raises(ValueError, match="synapse_position_col"):
         st.add_spatial_features(target="syn")
+
+
+def test_resolve_universe_annotation_single(base_synapses):
+    cells = pl.DataFrame({"root_id": [10, 20, 30, 40], "ct": ["a", "b", "c", "d"]})
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "cells", cells, cell_id_col="root_id", is_universe=True
+    )
+    assert st._resolve_universe_annotation() == "cells"
+
+
+def test_resolve_universe_annotation_zero_raises(base_synapses):
+    st = SynapseTable(base_synapses)
+    with pytest.raises(ValueError, match="No cell annotation is marked is_universe"):
+        st._resolve_universe_annotation()
+
+
+def test_resolve_universe_annotation_ambiguous_raises(base_synapses):
+    a = pl.DataFrame({"root_id": [10, 20], "ta": ["x"] * 2})
+    b = pl.DataFrame({"root_id": [30, 40], "tb": ["y"] * 2})
+    st = (
+        SynapseTable(base_synapses)
+        .add_cell_annotation("a", a, cell_id_col="root_id", is_universe=True)
+        .add_cell_annotation("b", b, cell_id_col="root_id", is_universe=True)
+    )
+    with pytest.raises(
+        ValueError, match="Multiple cell annotations are marked is_universe"
+    ):
+        st._resolve_universe_annotation()
+    assert st._resolve_universe_annotation("a") == "a"
+
+
+def test_is_universe_persists_through_save_load(base_synapses, tmp_path):
+    cells = pl.DataFrame({"root_id": [10, 20, 30, 40], "ct": ["a", "b", "c", "d"]})
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "cells", cells, cell_id_col="root_id", is_universe=True
+    )
+    folio_path = tmp_path / "folio"
+    st.save(str(folio_path))
+    loaded = SynapseTable.load(str(folio_path))
+    assert loaded._cell_annotations["cells"].is_universe is True
+
+
+def test_extend_cell_annotation_preserves_is_universe(base_synapses):
+    cells = pl.DataFrame({"root_id": [10, 20, 30, 40], "ct": ["a", "b", "c", "d"]})
+    more = pl.DataFrame({"root_id": [10, 20, 30, 40], "extra": [1, 2, 3, 4]})
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "cells", cells, cell_id_col="root_id", is_universe=True
+    )
+    st.extend_cell_annotation("cells", more, on="root_id")
+    assert st._cell_annotations["cells"].is_universe is True
+
+
+def test_resolve_position_annotation_ambiguous_raises(base_synapses):
+    soma_a = pl.DataFrame(
+        {"root_id": [10, 20, 30], "pos_a": [{"x": 0.0, "y": 0.0, "z": 0.0}] * 3}
+    )
+    soma_b = pl.DataFrame(
+        {"root_id": [10, 20, 30], "pos_b": [{"x": 0.0, "y": 0.0, "z": 0.0}] * 3}
+    )
+    st = (
+        SynapseTable(base_synapses)
+        .add_cell_annotation("a", soma_a, cell_id_col="root_id", position_col="pos_a")
+        .add_cell_annotation("b", soma_b, cell_id_col="root_id", position_col="pos_b")
+    )
+    with pytest.raises(ValueError, match="Multiple cell annotations"):
+        st.filter_by_soma_distance(10.0)
+    # Disambiguating works
+    out = st.filter_by_soma_distance(10.0, annotation="a")
+    assert isinstance(out, SynapseTable)
 
 
 # ── filter_by_min_synapses ─────────────────────────────────────────────────────
@@ -1158,21 +1231,28 @@ def test_role_accessors_default(st):
     assert st.post_col == "post_pt_root_id"
     assert st.id_col == "id"
     assert st.synapse_position_col is None
-    assert st.soma_position_annotation is None
-    assert st.soma_position_col is None
 
 
-def test_role_accessors_non_default(base_synapses):
-    st = SynapseTable(
-        base_synapses,
-        pre_col="pre_pt_root_id",
-        post_col="post_pt_root_id",
-        id_col="id",
-        soma_position_annotation="soma",
-        soma_position_col="pt_position",
+def test_position_col_declared_on_cell_annotation(base_synapses):
+    soma_df = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "pt_position_x": [0.0, 3.0, 0.0],
+            "pt_position_y": [0.0, 0.0, 4.0],
+            "pt_position_z": [0.0, 0.0, 0.0],
+        }
     )
-    assert st.soma_position_annotation == "soma"
-    assert st.soma_position_col == "pt_position"
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma",
+        soma_df,
+        cell_id_col="root_id",
+        position_cols="pt_position",
+        position_col="pt_position",
+    )
+    spec = st._cell_annotations["soma"]
+    assert spec.position_col == "pt_position"
+    # round-trip via the resolution helper
+    assert st._resolve_position_annotation() == "soma"
 
 
 def test_build_lazy_is_public(st):

@@ -132,28 +132,12 @@ st = trajan.SynapseTable(
 )
 ```
 
-`soma_position_annotation` and `soma_position_col` are only needed for
-`filter_by_soma_distance`. They name the registered cell annotation that holds
-soma positions and the position column within it. See the
-[Filtering guide](filtering.md) for a complete example.
-
-## Updating configuration
-
-If you forget to set `synapse_position_col` at construction time, use
-`update_metadata()` rather than rebuilding the table from scratch. It updates
-the position configuration without invalidating the annotation cache:
-
-```python
-st = trajan.SynapseTable(pl.scan_parquet("synapses.parquet"))
-# ... add annotations, register aliases ...
-
-# Later, realize you need spatial filtering:
-st = st.update_metadata(synapse_position_col="ctr_pt_position")
-```
-
-`update_metadata` accepts `synapse_position_col`, `soma_position_annotation`,
-and `soma_position_col` as keyword arguments. Any argument not passed is left
-unchanged.
+Soma positions for `filter_by_soma_distance` and `add_spatial_features` are
+declared on the cell annotation that carries them, not on the SynapseTable
+itself — pass `position_col=<col>` to `add_cell_annotation`. The annotation's
+cell-id set can also be marked as the authoritative cell universe with
+`is_universe=True`. See [Annotations](annotations.md) for the role-declaration
+pattern and the [Filtering guide](filtering.md) for spatial-filter examples.
 
 ## Inspecting the table
 
