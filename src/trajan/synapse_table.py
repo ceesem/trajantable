@@ -66,7 +66,7 @@ class SynapseTable:
     Owns the synapse list → edgelist → connectivity matrix → normalized
     connectivity pipeline. Cell annotations are merged symmetrically:
     adding an annotation named "cell_type" with a cell_type column produces
-    cell_type_pre and cell_type_post on .synapses automatically.
+    cell_type_pre and cell_type_post on .df automatically.
 
     Built on Polars lazy frames; the merged table is cached and invalidated
     only when annotations are added or removed.
@@ -147,7 +147,7 @@ class SynapseTable:
 
         Prints and returns a human-readable string showing every "blessed" column
         in the base synapse table and each registered annotation, how those columns
-        appear in ``.synapses``, cell aliases, expression dependencies, and weights.
+        appear in ``.df``, cell aliases, expression dependencies, and weights.
         """
         lines: list[str] = []
 
@@ -346,17 +346,14 @@ class SynapseTable:
     def expression_sides(self) -> dict[str, str | None]:
         """Cell-level classification of each expression: 'pre', 'post', 'both', or None.
 
-        'pre'  — depends only on pre-side cell annotation columns; included in edgelist
-                 when pre_anno=True.
-        'post' — depends only on post-side cell annotation columns; included in edgelist
-                 when post_anno=True.
-        'both' — depends on both sides but exclusively on cell annotation columns (e.g.
-                 a depth difference between pre and post somas); included in edgelist
-                 when either pre_anno or post_anno is True.
-        None   — depends on synapse- or vertex-level data; never auto-included in edgelist.
+        'pre' / 'post' / 'both' — depends only on cell-annotation columns on
+        the named side(s). These ride along into ``edgelist()`` as per-pair
+        values (aggregated via ``.first()`` since they're cell-invariant).
+        ``None`` — depends on synapse- or vertex-level data, so it cannot be
+        aggregated to the pair level and is excluded from ``edgelist()``.
 
-        Classification is computed at add_expression() time based on the cell annotations
-        registered at that moment.
+        Classification is computed at ``add_expression()`` time based on the
+        cell annotations registered at that moment.
         """
         return dict(self._expression_sides)
 
@@ -482,7 +479,7 @@ class SynapseTable:
     # ── internal column tracking ───────────────────────────────────────────
 
     def _current_columns(self) -> set[str]:
-        """All column names present (or that will be present) in .synapses."""
+        """All column names present (or that will be present) in .df."""
         cols = set(self._syn_col_names)
         for spec in self._synapse_annotations.values():
             cols |= set(spec.data_cols)
@@ -568,7 +565,7 @@ class SynapseTable:
         """Register a cell-level annotation, joined symmetrically for pre and post.
 
         Each column in df (other than cell_id_col) produces two columns in
-        .synapses: col_pre and col_post. Raises ValueError on any collision.
+        .df: col_pre and col_post. Raises ValueError on any collision.
 
         Parameters
         ----------
@@ -853,10 +850,10 @@ class SynapseTable:
             The column in df containing vertex ids to join on.
         pre_vertex_col : str or None, optional
             Column in the synapse table holding pre-synaptic vertex ids.
-            If provided, annotation columns appear as col_pre in .synapses.
+            If provided, annotation columns appear as col_pre in .df.
         post_vertex_col : str or None, optional
             Column in the synapse table holding post-synaptic vertex ids.
-            If provided, annotation columns appear as col_post in .synapses.
+            If provided, annotation columns appear as col_post in .df.
         position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "pt_position" or ["pt_position"] will pack
@@ -1125,12 +1122,12 @@ class SynapseTable:
 
         Applies all registered synapse, cell, and vertex annotation joins,
         computed expressions (in registration order), and accumulated filters.
-        Does not hit the materialization cache — call ``.synapses`` for the
+        Does not hit the materialization cache — call ``.df`` for the
         cached collected result.
 
         This is the public entry point for consumers (free functions, free-
         standing statistics) that need the lazy plan without going through
-        ``.synapses``. Renamed from the previous ``_build_lazy`` internal.
+        ``.df``. Renamed from the previous ``_build_lazy`` internal.
         """
         lf = self._syn_lf
 
@@ -1178,10 +1175,10 @@ class SynapseTable:
 
         return lf
 
-    # ── synapses property (cached) ─────────────────────────────────────────
+    # ── df property (cached) ───────────────────────────────────────────────
 
     @property
-    def synapses(self) -> pl.DataFrame:
+    def df(self) -> pl.DataFrame:
         """Full merged synapse table with all registered annotations. Cached."""
         if self._cache is None:
             self._cache = self.build_lazy().collect()
@@ -1336,7 +1333,7 @@ class SynapseTable:
         """Return a new SynapseTable with expr applied to the lazy plan.
 
         The filter is pushed into the query plan after all annotation joins,
-        so any column in .synapses is valid. Polars' optimizer will push
+        so any column in .df is valid. Polars' optimizer will push
         predicates on base synapse columns before the joins automatically.
 
         Parameters
@@ -1658,8 +1655,6 @@ class SynapseTable:
     def edgelist(
         self,
         agg: dict[str, pl.Expr] | None = None,
-        pre_anno: bool = True,
-        post_anno: bool = True,
     ) -> EdgeList:
         """Aggregate synapses into a cell-pair EdgeList.
 
@@ -1667,11 +1662,14 @@ class SynapseTable:
         Registered weights (``self.weights``) are auto-summed. Additional
         per-pair aggregations can be passed via ``agg``.
 
-        Cell annotation values are carried across as ``{col}_pre`` /
-        ``{col}_post`` columns using ``.first()`` aggregation (they're
-        invariant per cell so ``.first()`` is well-defined), subject to the
-        ``pre_anno`` / ``post_anno`` flags. Side-classified expressions
-        (see ``expression_sides``) ride along the matching side.
+        Cell annotations are *propagated* — registered on the resulting
+        EdgeList rather than inlined into the pair frame — so role
+        declarations (``position_col``, ``is_universe``) and aliases survive
+        the transition. Annotation columns still appear on ``el.df`` via the
+        symmetric pre/post join performed at access time.
+
+        Side-classified expressions (see ``expression_sides``) ride along as
+        per-pair values via ``.first()`` aggregation.
 
         Parameters
         ----------
@@ -1679,39 +1677,27 @@ class SynapseTable:
             {output_column_name: polars_expression} for additional per-pair
             aggregations. Example:
             ``{"mean_size": pl.mean("size"), "total_area": pl.sum("area")}``.
-        pre_anno : bool, optional
-            If True (default), carry pre-side cell annotation columns into
-            the EdgeList.
-        post_anno : bool, optional
-            If True (default), carry post-side cell annotation columns.
 
         Returns
         -------
         EdgeList
             Pair-level table with pre/post cell id columns, ``n_syn``, any
-            registered weights, ``agg`` outputs, and (by default) cell
-            annotation columns baked in.
+            registered weights, and ``agg`` outputs in the base pair frame;
+            cell annotations (with their roles and aliases) registered for
+            symmetric join via ``el.df``.
         """
         agg_exprs = [pl.len().alias("n_syn")]
         agg_exprs.extend(pl.sum(w).alias(w) for w in self._weights)
         if agg:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
 
-        if pre_anno or post_anno:
-            for spec in self._cell_annotations.values():
-                if pre_anno:
-                    agg_exprs.extend(pl.col(f"{c}_pre").first() for c in spec.data_cols)
-                if post_anno:
-                    agg_exprs.extend(
-                        pl.col(f"{c}_post").first() for c in spec.data_cols
-                    )
-            for name, side in self._expression_sides.items():
-                if side == "pre" and pre_anno:
-                    agg_exprs.append(pl.col(name).first())
-                elif side == "post" and post_anno:
-                    agg_exprs.append(pl.col(name).first())
-                elif side == "both" and (pre_anno or post_anno):
-                    agg_exprs.append(pl.col(name).first())
+        # Side-classified expressions are evaluated per-synapse at SynapseTable
+        # build_lazy() time (against the joined cell annotations) and then
+        # aggregated to the pair-level via .first() — annotation joins on the
+        # resulting EdgeList would happen too late to re-evaluate them.
+        for name, side in self._expression_sides.items():
+            if side in ("pre", "post", "both"):
+                agg_exprs.append(pl.col(name).first())
 
         pair_df = (
             self.build_lazy()
@@ -1719,18 +1705,28 @@ class SynapseTable:
             .agg(agg_exprs)
             .collect()
         )
-        # Registered weights on the resulting EdgeList: n_syn plus the
-        # SynapseTable's weights (which are also now summed per pair). Any
-        # ``agg`` columns are caller-defined; we do not attempt to classify
-        # them as weights — per the column-semantics principle, trajan does
-        # not interpret user-supplied column meanings.
+
         weight_cols = ["n_syn"] + list(self._weights)
-        return EdgeList(
+        el = EdgeList(
             pair_df,
             pre_col=self._pre_col,
             post_col=self._post_col,
             weight_cols=weight_cols,
+            cell_aliases=dict(self._cell_aliases),
         )
+        # Propagate cell annotations (including aliased ones — aliases are
+        # 1:1 with root cell ids, so the alias join on the EdgeList yields
+        # the same per-pair values that inlining via .first() would have).
+        for ann_name, spec in self._cell_annotations.items():
+            el.add_annotation(
+                ann_name,
+                spec.lf,
+                entity_id_col=spec.cell_id_col,
+                position_col=spec.position_col,
+                is_universe=spec.is_universe,
+                join_on_alias=spec.join_on_alias,
+            )
+        return el
 
     def type_edgelist(
         self,

@@ -46,7 +46,7 @@ class SynapseAnnotationSpec:
     """Synapse-level annotation: keyed on synapse id.
 
     Joined onto the base synapse lazy plan via the table's ``id_col``.
-    Contributes ``data_cols`` verbatim to ``.synapses``.
+    Contributes ``data_cols`` verbatim to ``.df``.
     """
 
     lf: pl.LazyFrame
@@ -58,7 +58,7 @@ class CellAnnotationSpec:
     """Cell-level annotation: keyed on cell id (or on an alias column).
 
     Joined symmetrically for pre and post cells; each ``data_col`` produces
-    ``{col}_pre`` and ``{col}_post`` columns on ``.synapses``.
+    ``{col}_pre`` and ``{col}_post`` columns on ``.df``.
 
     Parameters
     ----------
@@ -71,7 +71,7 @@ class CellAnnotationSpec:
         Otherwise names a registered cell alias.
     data_cols : list[str]
         Columns in ``lf`` (excluding the join key) that become
-        ``_pre`` / ``_post`` columns on ``.synapses``.
+        ``_pre`` / ``_post`` columns on ``.df``.
     position_col : str or None
         Name of the data column (within ``data_cols``) that carries the cell's
         position as a struct with ``x`` / ``y`` / ``z`` fields. Declaring this
@@ -115,7 +115,7 @@ class VertexAnnotationSpec:
         If given, annotation data columns appear as ``{col}_post``.
     data_cols : list[str]
         Columns in ``lf`` (excluding the join key) that become
-        ``_pre`` / ``_post`` columns on ``.synapses``.
+        ``_pre`` / ``_post`` columns on ``.df``.
     """
 
     lf: pl.LazyFrame

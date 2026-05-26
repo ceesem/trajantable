@@ -27,14 +27,14 @@ except ImportError:
 
 
 def to_dataframe(st: SynapseTable, *, unpack_positions: bool = True):
-    """Return ``st.synapses`` as a pandas DataFrame.
+    """Return ``st.df`` as a pandas DataFrame.
 
     Requires pandas (``uv add pandas``).
 
     Parameters
     ----------
     st : SynapseTable
-        The synapse table to export. ``st.synapses`` is materialized.
+        The synapse table to export. ``st.df`` is materialized.
     unpack_positions : bool, optional
         If True (default), unpack any struct columns with ``x`` / ``y`` / ``z``
         fields into flat ``{col}_x`` / ``{col}_y`` / ``{col}_z`` columns.
@@ -53,7 +53,7 @@ def to_dataframe(st: SynapseTable, *, unpack_positions: bool = True):
         raise ImportError(
             "pandas is required for to_dataframe(). Install it with: uv add pandas"
         )
-    df = st.synapses
+    df = st.df
     if unpack_positions:
         from .spatial import unpack_all_positions
 
@@ -128,7 +128,7 @@ def to_graph(
 
     pre_col, post_col = st.pre_col, st.post_col
     # st.edgelist() returns an EdgeList; pull its materialized pair frame.
-    el_df = st.edgelist(agg=edge_agg).pairs
+    el_df = st.edgelist(agg=edge_agg).df
 
     # Cell annotation attribute columns (present in el_df as *_pre / *_post)
     anno_cols: list[str] = []

@@ -57,5 +57,5 @@ st.save(folio)
 
 # Load in another session
 st2 = trajan.SynapseTable.load(folio)
-assert st.synapses.equals(st2.synapses)
+assert st.df.equals(st2.df)
 ```

@@ -371,7 +371,7 @@ class ConnectivityTable:
         return lf
 
     @property
-    def pairs(self) -> pl.DataFrame:
+    def df(self) -> pl.DataFrame:
         """Full merged pair-level table with annotations joined. Cached."""
         if self._cache is None:
             self._cache = self.build_lazy().collect()
@@ -594,19 +594,35 @@ class ConnectivityTable:
                 for name, expr in self._expressions.items()
             },
             "annotations": {
-                name: {
-                    "entity_id_col": spec.cell_id_col,
-                    "data_cols": list(spec.data_cols),
-                    "position_col": spec.position_col,
-                    "is_universe": spec.is_universe,
-                }
+                name: self._spec_to_config(spec)
                 for name, spec in self._annotations.items()
             },
+            **self._extra_save_config(),
         }
         folio.add_json("config", config, overwrite=overwrite)
         folio.add_table("pairs", self._pair_lf.collect(), overwrite=overwrite)
         for name, spec in self._annotations.items():
             folio.add_table(f"ann_{name}", spec.lf.collect(), overwrite=overwrite)
+
+    def _spec_to_config(self, spec: CellAnnotationSpec) -> dict:
+        """Serialize an annotation spec to a config dict.
+
+        Hook for subclasses (notably ``EdgeList``) to extend with extra
+        spec fields like ``join_on_alias``.
+        """
+        return {
+            "entity_id_col": spec.cell_id_col,
+            "data_cols": list(spec.data_cols),
+            "position_col": spec.position_col,
+            "is_universe": spec.is_universe,
+        }
+
+    def _extra_save_config(self) -> dict:
+        """Extra top-level config fields beyond the base ConnectivityTable set.
+
+        Hook for subclasses to add fields like ``cell_aliases``.
+        """
+        return {}
 
     @classmethod
     def load(cls, folio: Union[str, Path, object]) -> ConnectivityTable:

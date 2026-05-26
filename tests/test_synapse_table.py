@@ -49,8 +49,8 @@ def test_repr_uncached_when_filtered(st):
 
 
 def test_repr_shows_count_after_collect(st):
-    """After accessing .synapses the repr should reflect the actual count."""
-    _ = st.synapses
+    """After accessing .df the repr should reflect the actual count."""
+    _ = st.df
     assert "n_syn=5" in repr(st)
 
 
@@ -94,21 +94,21 @@ def test_synapse_annotation_does_not_expand_rows(st):
     """A valid synapse annotation must not change the synapse count."""
     ann = pl.DataFrame({"id": [1, 2, 3, 4, 5], "score": [0.1, 0.2, 0.3, 0.4, 0.5]})
     st.add_synapse_annotation("scores", ann)
-    assert len(st.synapses) == 5
+    assert len(st.df) == 5
 
 
 def test_cell_annotation_does_not_expand_rows(st):
     """A valid cell annotation must not change the synapse count."""
     cell_ann = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["A", "B", "C"]})
     st.add_cell_annotation("types", cell_ann, cell_id_col="root_id")
-    assert len(st.synapses) == 5
+    assert len(st.df) == 5
 
 
 def test_cell_annotation_partial_coverage_does_not_expand_rows(st):
     """Cell annotation that doesn't cover all ids leaves nulls, not extra rows."""
     partial_ann = pl.DataFrame({"root_id": [10, 20], "cell_type": ["A", "B"]})
     st.add_cell_annotation("types", partial_ann, cell_id_col="root_id")
-    result = st.synapses
+    result = st.df
     assert len(result) == 5
     # cell 30 has no annotation — should produce nulls on post side for row where post=30
     assert result["cell_type_post"].null_count() > 0
@@ -123,7 +123,7 @@ def test_extend_cell_annotation_adds_columns(st):
     types = pl.DataFrame({"nucleus_id": [100, 200], "cell_type": ["A", "B"]})
     st.add_cell_annotation("cells", cells, cell_id_col="root_id")
     st.extend_cell_annotation("cells", types, on="nucleus_id")
-    result = st.synapses
+    result = st.df
     assert len(result) == 5
     assert "cell_type_pre" in result.columns
     assert "cell_type_post" in result.columns
@@ -135,7 +135,7 @@ def test_extend_cell_annotation_partial_coverage_nulls(st):
     types = pl.DataFrame({"nucleus_id": [100, 200], "cell_type": ["A", "B"]})
     st.add_cell_annotation("cells", cells, cell_id_col="root_id")
     st.extend_cell_annotation("cells", types, on="nucleus_id")
-    result = st.synapses
+    result = st.df
     # root_id=30 has no cell_type — expect nulls on whichever side it appears
     assert (
         result["cell_type_pre"].null_count() > 0
@@ -196,36 +196,26 @@ def st_with_cell_ann(st):
 
 def test_edgelist_includes_anno_columns_by_default(st_with_cell_ann):
     """edgelist() includes cell annotation columns for both sides by default."""
-    el = st_with_cell_ann.edgelist().pairs
+    el = st_with_cell_ann.edgelist().df
     assert "cell_type_pre" in el.columns
     assert "cell_type_post" in el.columns
 
 
-def test_edgelist_no_anno_columns(st_with_cell_ann):
-    """edgelist(pre_anno=False, post_anno=False) excludes annotation columns."""
-    el = st_with_cell_ann.edgelist(pre_anno=False, post_anno=False).pairs
-    assert "cell_type_pre" not in el.columns
-    assert "cell_type_post" not in el.columns
-    assert "n_syn" in el.columns
-
-
-def test_edgelist_pre_anno_only(st_with_cell_ann):
-    """edgelist(post_anno=False) includes only pre-side annotation columns."""
-    el = st_with_cell_ann.edgelist(pre_anno=True, post_anno=False).pairs
-    assert "cell_type_pre" in el.columns
-    assert "cell_type_post" not in el.columns
-
-
-def test_edgelist_post_anno_only(st_with_cell_ann):
-    """edgelist(pre_anno=False) includes only post-side annotation columns."""
-    el = st_with_cell_ann.edgelist(pre_anno=False, post_anno=True).pairs
-    assert "cell_type_pre" not in el.columns
-    assert "cell_type_post" in el.columns
+def test_edgelist_removes_propagated_annotation_columns(st_with_cell_ann):
+    """Cell annotations propagate as registered annotations on the EdgeList;
+    removing one drops its columns from el.df."""
+    el = st_with_cell_ann.edgelist()
+    assert "types" in el.annotation_names
+    el.remove_annotation("types")
+    df = el.df
+    assert "cell_type_pre" not in df.columns
+    assert "cell_type_post" not in df.columns
+    assert "n_syn" in df.columns
 
 
 def test_edgelist_anno_values_correct(st_with_cell_ann):
     """Annotation values in edgelist match the cell annotation data."""
-    el = st_with_cell_ann.edgelist().pairs.sort(
+    el = st_with_cell_ann.edgelist().df.sort(
         [st_with_cell_ann._pre_col, st_with_cell_ann._post_col]
     )
     # pre=10 -> "A", pre=20 -> "B", pre=30 -> "C"
@@ -238,10 +228,137 @@ def test_edgelist_anno_values_correct(st_with_cell_ann):
 
 
 def test_edgelist_no_cell_annotations(st):
-    """edgelist() with no cell annotations and pre_anno/post_anno=True works fine."""
-    el = st.edgelist().pairs
+    """edgelist() with no cell annotations works fine."""
+    el = st.edgelist().df
     assert "n_syn" in el.columns
     assert len(el.columns) == 3  # pre_col, post_col, n_syn
+
+
+# ── edgelist() propagation (annotations + roles + aliases) ──────────────────
+
+
+def test_edgelist_propagates_annotation_registration(st_with_cell_ann):
+    """Cell annotations on the SynapseTable become registered annotations on
+    the EdgeList (not just inlined columns)."""
+    el = st_with_cell_ann.edgelist()
+    assert "types" in el.annotation_names
+    # Underlying pair frame doesn't pre-bake the columns
+    assert "cell_type_pre" not in el._pair_col_names
+    # But el.df materializes them via the registered annotation's join
+    assert "cell_type_pre" in el.df.columns
+
+
+def test_edgelist_propagates_position_col_role(base_synapses):
+    """position_col declared on a cell annotation survives edgelist()."""
+    soma = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "pt_x": [0.0, 3.0, 0.0],
+            "pt_y": [0.0, 0.0, 4.0],
+            "pt_z": [0.0, 0.0, 0.0],
+        }
+    )
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma",
+        soma,
+        cell_id_col="root_id",
+        position_cols="pt",
+        position_col="pt",
+    )
+    el = st.edgelist()
+    assert el._resolve_position_annotation() == "soma"
+    # Spatial filter works on the propagated annotation without explicit args
+    out = el.filter_by_soma_distance(10.0)
+    assert isinstance(out, type(el))
+
+
+def test_edgelist_propagates_is_universe_role(base_synapses):
+    """is_universe declared on a cell annotation survives edgelist()."""
+    cells = pl.DataFrame({"root_id": [10, 20, 30, 40], "ct": ["a", "b", "c", "d"]})
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "cells", cells, cell_id_col="root_id", is_universe=True
+    )
+    el = st.edgelist()
+    assert el._resolve_universe_annotation() == "cells"
+
+
+def test_edgelist_propagates_cell_aliases(base_synapses):
+    """SynapseTable cell aliases are carried onto the EdgeList registry."""
+    proofread = pl.DataFrame({"root_id": [10, 20, 30], "nucleus_id": [101, 202, 303]})
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "proofread",
+        proofread,
+        cell_id_col="root_id",
+        alias_col="nucleus_id",
+    )
+    el = st.edgelist()
+    assert "proofread" in el.cell_aliases
+    assert el.cell_aliases["proofread"] == ("proofread", "nucleus_id")
+
+
+def test_edgelist_propagates_aliased_annotation(base_synapses):
+    """An annotation joined via an alias on the SynapseTable still joins
+    correctly when propagated to the EdgeList."""
+    proofread = pl.DataFrame({"root_id": [10, 20, 30], "nucleus_id": [101, 202, 303]})
+    by_nucleus = pl.DataFrame(
+        {"nucleus_id": [101, 202, 303], "axon_length": [1.5, 2.5, 3.5]}
+    )
+    st = (
+        SynapseTable(base_synapses)
+        .add_cell_annotation(
+            "proofread", proofread, cell_id_col="root_id", alias_col="nucleus_id"
+        )
+        .add_cell_annotation(
+            "morpho",
+            by_nucleus,
+            cell_id_col="nucleus_id",
+            join_on_alias="proofread",
+        )
+    )
+    el = st.edgelist()
+    assert "morpho" in el.annotation_names
+    df = el.df.sort(["pre_pt_root_id", "post_pt_root_id"])
+    # axon_length should appear for both sides; e.g. pre=10 -> 1.5
+    for row in df.iter_rows(named=True):
+        expected = {10: 1.5, 20: 2.5, 30: 3.5}
+        assert row["axon_length_pre"] == pytest.approx(expected[row["pre_pt_root_id"]])
+        assert row["axon_length_post"] == pytest.approx(
+            expected[row["post_pt_root_id"]]
+        )
+
+
+def test_edgelist_save_load_roundtrip_with_alias(base_synapses, tmp_path):
+    """EdgeList propagated from a SynapseTable with aliased annotations
+    round-trips through save/load with aliases intact."""
+    proofread = pl.DataFrame({"root_id": [10, 20, 30], "nucleus_id": [101, 202, 303]})
+    by_nucleus = pl.DataFrame(
+        {"nucleus_id": [101, 202, 303], "axon_length": [1.5, 2.5, 3.5]}
+    )
+    st = (
+        SynapseTable(base_synapses)
+        .add_cell_annotation(
+            "proofread", proofread, cell_id_col="root_id", alias_col="nucleus_id"
+        )
+        .add_cell_annotation(
+            "morpho",
+            by_nucleus,
+            cell_id_col="nucleus_id",
+            join_on_alias="proofread",
+        )
+    )
+    el = st.edgelist()
+    folio_path = tmp_path / "folio"
+    el.save(str(folio_path))
+
+    from trajan import EdgeList
+
+    loaded = EdgeList.load(str(folio_path))
+    assert "proofread" in loaded.cell_aliases
+    assert "morpho" in loaded.annotation_names
+    assert loaded._annotations["morpho"].join_on_alias == "proofread"
+    assert loaded.df.sort(["pre_pt_root_id", "post_pt_root_id"]).equals(
+        el.df.sort(["pre_pt_root_id", "post_pt_root_id"])
+    )
 
 
 # ── to_graph ──────────────────────────────────────────────────────────────────
@@ -424,53 +541,39 @@ def test_expression_sides_property(st_with_depth):
 
 
 def test_edgelist_includes_pre_expression(st_with_depth):
-    """edgelist() includes pre-side expression column when pre_anno=True."""
+    """edgelist() includes pre-classified expression columns."""
     st_with_depth.add_expression("depth_pre_scaled", pl.col("depth_pre") * 2)
-    el = st_with_depth.edgelist().pairs
+    el = st_with_depth.edgelist().df
     assert "depth_pre_scaled" in el.columns
 
 
 def test_edgelist_includes_post_expression(st_with_depth):
-    """edgelist() includes post-side expression column when post_anno=True."""
+    """edgelist() includes post-classified expression columns."""
     st_with_depth.add_expression("depth_post_scaled", pl.col("depth_post") * 2)
-    el = st_with_depth.edgelist().pairs
+    el = st_with_depth.edgelist().df
     assert "depth_post_scaled" in el.columns
 
 
 def test_edgelist_includes_both_expression(st_with_depth):
-    """edgelist() includes 'both'-side expression column when pre_anno or post_anno=True."""
+    """edgelist() includes 'both'-classified expression columns."""
     st_with_depth.add_expression(
         "depth_diff", pl.col("depth_post") - pl.col("depth_pre")
     )
-    el = st_with_depth.edgelist().pairs
+    el = st_with_depth.edgelist().df
     assert "depth_diff" in el.columns
-
-
-def test_edgelist_excludes_pre_expression_when_no_pre_anno(st_with_depth):
-    """edgelist(pre_anno=False) excludes pre-side expression columns."""
-    st_with_depth.add_expression("depth_pre_scaled", pl.col("depth_pre") * 2)
-    el = st_with_depth.edgelist(pre_anno=False).pairs
-    assert "depth_pre_scaled" not in el.columns
-
-
-def test_edgelist_excludes_post_expression_when_no_post_anno(st_with_depth):
-    """edgelist(post_anno=False) excludes post-side expression columns."""
-    st_with_depth.add_expression("depth_post_scaled", pl.col("depth_post") * 2)
-    el = st_with_depth.edgelist(post_anno=False).pairs
-    assert "depth_post_scaled" not in el.columns
 
 
 def test_edgelist_excludes_synapse_level_expression(st_with_depth):
     """edgelist() never auto-includes expressions that reference synapse columns."""
     st_with_depth.add_expression("id_doubled", pl.col("id") * 2)
-    el = st_with_depth.edgelist().pairs
+    el = st_with_depth.edgelist().df
     assert "id_doubled" not in el.columns
 
 
 def test_edgelist_expression_value_correct(st_with_depth):
     """Expression values in edgelist match the expected per-cell values."""
     st_with_depth.add_expression("depth_pre_scaled", pl.col("depth_pre") * 2)
-    el = st_with_depth.edgelist().pairs.sort(
+    el = st_with_depth.edgelist().df.sort(
         [st_with_depth._pre_col, st_with_depth._post_col]
     )
     # depth_pre for cell 10 = 100.0 → scaled = 200.0
@@ -522,7 +625,7 @@ def test_weights_property(st_with_size):
 def test_edgelist_includes_weight_sum(st_with_size):
     """Registered weight appears summed in edgelist alongside n_syn."""
     st_with_size.add_weight("size")
-    el = st_with_size.edgelist(pre_anno=False, post_anno=False).pairs
+    el = st_with_size.edgelist().df
     assert "n_syn" in el.columns
     assert "size" in el.columns
 
@@ -530,9 +633,7 @@ def test_edgelist_includes_weight_sum(st_with_size):
 def test_edgelist_weight_values_correct(st_with_size):
     """Weight column in edgelist is summed per cell pair, not .first()."""
     st_with_size.add_weight("size")
-    el = st_with_size.edgelist(pre_anno=False, post_anno=False).pairs.sort(
-        ["pre_pt_root_id", "post_pt_root_id"]
-    )
+    el = st_with_size.edgelist().df.sort(["pre_pt_root_id", "post_pt_root_id"])
     # pre=10, post=20: synapse 1 → size=1.0
     # pre=10, post=30: synapse 2 → size=2.0
     # pre=20, post=10: synapse 3 → size=3.0
@@ -555,7 +656,7 @@ def test_type_edgelist_includes_weight_sum(st_with_size):
     cell_ann = pl.DataFrame({"root_id": [10, 20, 30], "ct": ["A", "B", "A"]})
     st_with_size.add_cell_annotation("types", cell_ann, cell_id_col="root_id")
     st_with_size.add_weight("size")
-    el = st_with_size.type_edgelist("ct_pre").pairs
+    el = st_with_size.type_edgelist("ct_pre").df
     assert "n_syn" in el.columns
     assert "size" in el.columns
 
@@ -563,7 +664,7 @@ def test_type_edgelist_includes_weight_sum(st_with_size):
 def test_edgelist_to_dense_weight_column(st_with_size):
     """EdgeList.to_dense(values=weight) produces a dense matrix with totals."""
     st_with_size.add_weight("size")
-    mat = st_with_size.edgelist(pre_anno=False, post_anno=False).to_dense(values="size")
+    mat = st_with_size.edgelist().to_dense(values="size")
     assert mat.shape[0] > 0
     total = sum(mat.select(pl.exclude("pre_pt_root_id")).sum().row(0))
     assert total == pytest.approx(15.0)  # 1+2+3+4+5
@@ -573,7 +674,7 @@ def test_remove_weight(st_with_size):
     """After remove_weight the column no longer appears in edgelist automatically."""
     st_with_size.add_weight("size")
     st_with_size.remove_weight("size")
-    el = st_with_size.edgelist(pre_anno=False, post_anno=False).pairs
+    el = st_with_size.edgelist().df
     assert "size" not in el.columns
 
 
@@ -785,7 +886,7 @@ def test_save_load_with_path(base_synapses):
         st.metadata["note"] = "path test"
         st.save(folio_path)
         st2 = SynapseTable.load(str(folio_path))
-        assert st2.synapses.shape == st.synapses.shape
+        assert st2.df.shape == st.df.shape
         assert st2.metadata["note"] == "path test"
 
 
@@ -831,7 +932,7 @@ def st_spatial(base_synapses):
 
 def test_add_spatial_features_default_columns(st_spatial):
     st_spatial.add_spatial_features(prefix="soma")
-    cols = st_spatial.synapses.columns
+    cols = st_spatial.df.columns
     for feat in (
         "soma_euclidean",
         "soma_depth_diff",
@@ -846,14 +947,14 @@ def test_add_spatial_features_default_columns(st_spatial):
 
 def test_add_spatial_features_phi_not_duplicated(st_spatial):
     st_spatial.add_spatial_features(prefix="s")
-    assert st_spatial.synapses.columns.count("s_phi") == 1
+    assert st_spatial.df.columns.count("s_phi") == 1
 
 
 def test_add_spatial_features_euclidean_value(st_spatial):
     import math
 
     st_spatial.add_spatial_features(prefix="soma")
-    syn = st_spatial.synapses
+    syn = st_spatial.df
     # Synapse 1: pre=cell10 (0,0,0), post=cell20 (3,0,0) → euclidean=3
     row = syn.filter(pl.col("id") == 1).row(0, named=True)
     assert math.isclose(row["soma_euclidean"], 3.0)
@@ -864,7 +965,7 @@ def test_add_spatial_features_post_pre_negates_depth(st_spatial):
 
     st_spatial.add_spatial_features(prefix="fwd")
     st_spatial.add_spatial_features(prefix="rev", center="post", target="pre")
-    syn = st_spatial.synapses
+    syn = st_spatial.df
     # Synapse 5: pre=cell30 (0,4,0), post=cell10 (0,0,0) → fwd depth_diff = -4
     row = syn.filter(pl.col("id") == 5).row(0, named=True)
     assert math.isclose(row["fwd_depth_diff"], -4.0)
@@ -876,7 +977,7 @@ def test_add_spatial_features_target_syn(st_spatial):
     import math
 
     st_spatial.add_spatial_features(prefix="pre_syn", center="pre", target="syn")
-    cols = st_spatial.synapses.columns
+    cols = st_spatial.df.columns
     for feat in ("pre_syn_euclidean", "pre_syn_depth_diff"):
         assert feat in cols
 
@@ -884,14 +985,14 @@ def test_add_spatial_features_target_syn(st_spatial):
 def test_add_spatial_features_soma_soma_in_edgelist(st_spatial):
     """Soma→soma features (classified 'both') appear in edgelist."""
     st_spatial.add_spatial_features(prefix="soma")
-    el = st_spatial.edgelist().pairs
+    el = st_spatial.edgelist().df
     assert "soma_euclidean" in el.columns
 
 
 def test_add_spatial_features_syn_not_in_edgelist(st_spatial):
     """Soma→synapse features (classified None) do not appear in edgelist."""
     st_spatial.add_spatial_features(prefix="pre_syn", center="pre", target="syn")
-    el = st_spatial.edgelist().pairs
+    el = st_spatial.edgelist().df
     assert "pre_syn_euclidean" not in el.columns
 
 
@@ -1015,40 +1116,34 @@ def st_multi_syn():
 def test_filter_by_min_synapses_removes_weak_pairs(st_multi_syn):
     st2 = st_multi_syn.filter_by_min_synapses(2)
     # (20,30) had only 1 synapse — should be gone; 5 remain
-    assert len(st2.synapses) == 5
-    pairs = set(
-        map(tuple, st2.synapses.select(["pre_pt_root_id", "post_pt_root_id"]).rows())
-    )
+    assert len(st2.df) == 5
+    pairs = set(map(tuple, st2.df.select(["pre_pt_root_id", "post_pt_root_id"]).rows()))
     assert (20, 30) not in pairs
 
 
 def test_filter_by_min_synapses_keeps_exact_threshold(st_multi_syn):
     st2 = st_multi_syn.filter_by_min_synapses(2)
-    pairs = set(
-        map(tuple, st2.synapses.select(["pre_pt_root_id", "post_pt_root_id"]).rows())
-    )
+    pairs = set(map(tuple, st2.df.select(["pre_pt_root_id", "post_pt_root_id"]).rows()))
     assert (30, 10) in pairs  # exactly 2 synapses — should be kept
 
 
 def test_filter_by_min_synapses_all_removed(st_multi_syn):
     st2 = st_multi_syn.filter_by_min_synapses(10)
-    assert len(st2.synapses) == 0
+    assert len(st2.df) == 0
 
 
 def test_filter_by_min_synapses_by_weight(st_multi_syn):
     # sum(size): (10,20)=6, (20,30)=5, (30,10)=2 — threshold 3 removes (30,10)
     st2 = st_multi_syn.filter_by_min_synapses(3, weight_col="size")
-    assert len(st2.synapses) == 4
-    pairs = set(
-        map(tuple, st2.synapses.select(["pre_pt_root_id", "post_pt_root_id"]).rows())
-    )
+    assert len(st2.df) == 4
+    pairs = set(map(tuple, st2.df.select(["pre_pt_root_id", "post_pt_root_id"]).rows()))
     assert (30, 10) not in pairs
     assert (20, 30) in pairs  # size sum=5 >= 3
 
 
 def test_filter_by_min_synapses_edgelist_reflects_threshold(st_multi_syn):
     st2 = st_multi_syn.filter_by_min_synapses(2)
-    el = st2.edgelist().pairs
+    el = st2.edgelist().df
     assert (20, 30) not in set(
         map(tuple, el.select(["pre_pt_root_id", "post_pt_root_id"]).rows())
     )
@@ -1063,7 +1158,7 @@ def test_filter_by_min_synapses_preserves_annotations(st_multi_syn):
     """Annotations and expressions registered before the filter still work after."""
     st_multi_syn.add_expression("size_sq", pl.col("size").pow(2))
     st2 = st_multi_syn.filter_by_min_synapses(2)
-    assert "size_sq" in st2.synapses.columns
+    assert "size_sq" in st2.df.columns
 
 
 # ── add_weight_transform ───────────────────────────────────────────────────────
@@ -1077,14 +1172,14 @@ def st_const_size(base_synapses):
 
 def test_add_weight_transform_column_appears(st_const_size):
     st_const_size.add_weight_transform("log_size", "size")
-    assert "log_size" in st_const_size.synapses.columns
+    assert "log_size" in st_const_size.df.columns
 
 
 def test_add_weight_transform_log1p_values(st_const_size):
     import math
 
     st_const_size.add_weight_transform("log_size", "size")
-    vals = st_const_size.synapses["log_size"].to_list()
+    vals = st_const_size.df["log_size"].to_list()
     assert all(math.isclose(v, math.log1p(2.0)) for v in vals)
 
 
@@ -1095,14 +1190,14 @@ def test_add_weight_transform_registered_as_weight_by_default(st_const_size):
 
 def test_add_weight_transform_sums_in_edgelist(st_const_size):
     st_const_size.add_weight_transform("log_size", "size")
-    el = st_const_size.edgelist().pairs
+    el = st_const_size.edgelist().df
     assert "log_size" in el.columns
 
 
 def test_add_weight_transform_no_weight_registration(st_const_size):
     st_const_size.add_weight_transform("log_size", "size", register_as_weight=False)
     assert "log_size" not in st_const_size.weights
-    el = st_const_size.edgelist().pairs
+    el = st_const_size.edgelist().df
     assert "log_size" not in el.columns
 
 
@@ -1110,7 +1205,7 @@ def test_add_weight_transform_sqrt(st_const_size):
     import math
 
     st_const_size.add_weight_transform("sqrt_size", "size", transform="sqrt")
-    vals = st_const_size.synapses["sqrt_size"].to_list()
+    vals = st_const_size.df["sqrt_size"].to_list()
     assert all(math.isclose(v, math.sqrt(2.0)) for v in vals)
 
 
@@ -1258,7 +1353,7 @@ def test_position_col_declared_on_cell_annotation(base_synapses):
 def test_build_lazy_is_public(st):
     lf = st.build_lazy()
     assert isinstance(lf, pl.LazyFrame)
-    assert lf.collect().equals(st.synapses)
+    assert lf.collect().equals(st.df)
 
 
 def test_cell_annotation_data_cols(st):

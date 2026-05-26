@@ -39,19 +39,19 @@ def test_is_a_connectivity_table(el):
 
 
 def test_inherits_pairs_property(el):
-    assert len(el.pairs) == 5
+    assert len(el.df) == 5
 
 
 def test_inherits_normalize(el):
     out = el.normalize(by="post")
-    totals = out.pairs.group_by("post").agg(pl.sum("fraction").alias("s"))
+    totals = out.df.group_by("post").agg(pl.sum("fraction").alias("s"))
     for s in totals["s"].to_list():
         assert math.isclose(s, 1.0, rel_tol=1e-9)
 
 
 def test_inherits_binarize(el):
     out = el.binarize(threshold=2)
-    vals = out.pairs.sort("pre", "post")["n_syn"].to_list()
+    vals = out.df.sort("pre", "post")["n_syn"].to_list()
     assert vals == [1, 0, 0, 1, 1]
 
 
@@ -67,7 +67,7 @@ def test_filter_returns_edgelist(el):
     """filter() returning an EdgeList preserves the cell-axis invariant."""
     filtered = el.filter(pl.col("n_syn") >= 3)
     assert isinstance(filtered, EdgeList)
-    assert len(filtered.pairs) == 3
+    assert len(filtered.df) == 3
 
 
 # ── filter_by_ids ────────────────────────────────────────────────────────────
@@ -76,25 +76,25 @@ def test_filter_returns_edgelist(el):
 def test_filter_by_ids_pre_only(el):
     out = el.filter_by_ids(pre_ids=[1, 2])
     assert isinstance(out, EdgeList)
-    assert out.pairs["pre"].to_list() == [1, 1, 2, 2]
+    assert out.df["pre"].to_list() == [1, 1, 2, 2]
 
 
 def test_filter_by_ids_post_only(el):
     out = el.filter_by_ids(post_ids=[10])
-    assert out.pairs["post"].to_list() == [10, 10]
+    assert out.df["post"].to_list() == [10, 10]
 
 
 def test_filter_by_ids_both(el):
     out = el.filter_by_ids(pre_ids=[1], post_ids=[11])
-    assert len(out.pairs) == 1
-    assert out.pairs["pre"].item() == 1
-    assert out.pairs["post"].item() == 11
+    assert len(out.df) == 1
+    assert out.df["pre"].item() == 1
+    assert out.df["post"].item() == 11
 
 
 def test_filter_by_ids_neither_returns_copy(el):
     out = el.filter_by_ids()
     assert isinstance(out, EdgeList)
-    assert len(out.pairs) == 5
+    assert len(out.df) == 5
 
 
 # ── filter_by_soma_distance ──────────────────────────────────────────────────
@@ -127,7 +127,7 @@ def test_filter_by_soma_distance(el_with_positions):
     """
     out = el_with_positions.filter_by_soma_distance(200.0)
     assert isinstance(out, EdgeList)
-    assert len(out.pairs) == 2
+    assert len(out.df) == 2
 
 
 def test_filter_by_soma_distance_no_position_annotation_raises(pair_frame):
@@ -169,7 +169,7 @@ def test_filter_by_bbox(el_with_positions):
     bbox = ((-10.0, -10.0, -10.0), (150.0, 10.0, 10.0))
     out = el_with_positions.filter_by_bbox(bbox)
     assert isinstance(out, EdgeList)
-    assert len(out.pairs) == 2
+    assert len(out.df) == 2
 
 
 # ── aggregate_to_type ────────────────────────────────────────────────────────
@@ -194,7 +194,7 @@ def test_aggregate_to_type_both_sides(el):
     # exc -> inh: (1,11), (2,11) → 1+4 = 5
     # inh -> inh: (3,11) → 5
     # exc -> inh overlap from (2,10) = exc->exc → add 2 more. So exc->exc = 3+2 = 5
-    df = ct.pairs.sort("type_pre", "type_post")
+    df = ct.df.sort("type_pre", "type_post")
     sums = {
         (row["type_pre"], row["type_post"]): row["n_syn"]
         for row in df.iter_rows(named=True)
@@ -231,7 +231,7 @@ def test_edgelist_saves_and_loads_as_edgelist(el, tmp_path):
 
     via_edgelist = EdgeList.load(folio)
     assert isinstance(via_edgelist, EdgeList)
-    assert via_edgelist.pairs.sort("pre", "post").equals(el.pairs.sort("pre", "post"))
+    assert via_edgelist.df.sort("pre", "post").equals(el.df.sort("pre", "post"))
 
 
 def test_connectivitytable_load_dispatches_to_edgelist(el, tmp_path):
@@ -274,8 +274,8 @@ def test_edgelist_save_load_preserves_annotations_and_filter(el, tmp_path):
 
     assert isinstance(loaded, EdgeList)
     assert "types" in loaded.annotation_names
-    assert len(loaded.pairs) == 3
-    assert "cell_type_pre" in loaded.pairs.columns
+    assert len(loaded.df) == 3
+    assert "cell_type_pre" in loaded.df.columns
 
 
 def test_edgelist_cell_specific_ops_after_load(el, tmp_path):
@@ -290,4 +290,4 @@ def test_edgelist_cell_specific_ops_after_load(el, tmp_path):
 
     out = loaded.filter_by_ids(pre_ids=[1])
     assert isinstance(out, EdgeList)
-    assert set(out.pairs["pre"].to_list()) == {1}
+    assert set(out.df["pre"].to_list()) == {1}

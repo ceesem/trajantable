@@ -21,6 +21,7 @@ from typing import Callable, Iterable
 
 import polars as pl
 
+from ._base import CellAnnotationSpec, _to_lazy
 from .connectivity_table import ConnectivityTable
 from .spatial import euclidean_distance
 
@@ -33,9 +34,16 @@ class EdgeList(ConnectivityTable):
 
     The cell invariant is documented rather than statically enforced: a
     ConnectivityTable has no distinguished "kind" on its axes, so EdgeList's
-    promise is semantic, not type-checked. Operations that require points-in-
-    space (spatial filters) take the position-column names explicitly at call
-    time; the user is responsible for having registered them.
+    promise is semantic, not type-checked. Spatial filters resolve to the
+    position-bearing cell annotation declared via ``position_col=`` at
+    registration.
+
+    EdgeList strengthens ``ConnectivityTable.add_annotation`` to accept
+    ``join_on_alias=``, mirroring ``SynapseTable.add_cell_annotation``. An
+    alias is a (annotation_name, col) pair: the named column on the source
+    annotation provides cell ids that downstream annotations can join on
+    instead of root pre/post ids. Aliases survive ``SynapseTable.edgelist()``
+    because they are 1:1 with root cell ids by contract.
 
     Parameters
     ----------
@@ -47,12 +55,174 @@ class EdgeList(ConnectivityTable):
         Column holding post-synaptic cell ids.
     weight_cols : list[str] or str or None, optional
         Weight columns (defaults to ``["n_syn"]`` when present).
+    cell_aliases : dict[str, tuple[str, str]] or None, optional
+        Pre-populated cell-alias registry: ``{alias_name: (source_annotation,
+        col_in_source)}``. Typically passed by ``SynapseTable.edgelist()`` to
+        carry forward aliases registered on the source SynapseTable. Direct
+        users normally start empty and grow the registry via ``set_cell_alias``.
     """
 
     # Overrides ConnectivityTable._TYPE_TAG so save() writes "EdgeList" and
     # ConnectivityTable.load() can dispatch back to this class when the
     # saved folio contains an EdgeList.
     _TYPE_TAG: str = "EdgeList"
+
+    def __init__(
+        self,
+        df,
+        pre_col: str,
+        post_col: str,
+        weight_cols: list[str] | str | None = None,
+        *,
+        cell_aliases: dict[str, tuple[str, str]] | None = None,
+    ):
+        super().__init__(
+            df, pre_col=pre_col, post_col=post_col, weight_cols=weight_cols
+        )
+        self._cell_aliases: dict[str, tuple[str, str]] = dict(cell_aliases or {})
+
+    # ── alias registration ────────────────────────────────────────────────
+
+    @property
+    def cell_aliases(self) -> dict[str, tuple[str, str]]:
+        """Registered cell aliases: ``{alias_name: (annotation_name, col)}``."""
+        return dict(self._cell_aliases)
+
+    def set_cell_alias(
+        self,
+        annotation_name: str,
+        col: str,
+        alias_name: str | None = None,
+    ) -> EdgeList:
+        """Declare a cell alias column produced by a registered annotation.
+
+        Once registered, additional annotations can be added with
+        ``join_on_alias=<alias_name>`` to key on the aliased ids rather than
+        the table's root pre/post ids. Mirrors the SynapseTable method.
+
+        Parameters
+        ----------
+        annotation_name : str
+            Name of an already-registered annotation whose data columns
+            include ``col``. The source annotation must itself join on root
+            ids (``join_on_alias=None``).
+        col : str
+            Column within the source annotation that carries the aliased ids.
+        alias_name : str or None, optional
+            Name under which to register the alias. Defaults to
+            ``annotation_name``.
+        """
+        if annotation_name not in self._annotations:
+            raise KeyError(f"No annotation named {annotation_name!r}")
+        spec = self._annotations[annotation_name]
+        if spec.join_on_alias is not None:
+            raise ValueError(
+                f"Annotation {annotation_name!r} uses join_on_alias="
+                f"{spec.join_on_alias!r} and cannot itself be an alias source. "
+                f"The alias source must join on root id (join_on_alias=None)."
+            )
+        if col not in spec.data_cols:
+            raise ValueError(
+                f"Column {col!r} not found in annotation {annotation_name!r}. "
+                f"Available columns: {spec.data_cols}"
+            )
+        key = alias_name if alias_name is not None else annotation_name
+        self._cell_aliases[key] = (annotation_name, col)
+        return self
+
+    # ── annotation registration (overrides ConnectivityTable) ─────────────
+
+    def add_annotation(
+        self,
+        name: str,
+        df,
+        entity_id_col: str,
+        position_col: str | None = None,
+        is_universe: bool = False,
+        join_on_alias: str | None = None,
+    ) -> EdgeList:
+        """Register a per-cell annotation, optionally keyed on a cell alias.
+
+        Extends :meth:`ConnectivityTable.add_annotation` with the
+        ``join_on_alias`` kwarg. With ``join_on_alias=None`` (the default),
+        the annotation is joined symmetrically on the EdgeList's
+        ``pre_col`` / ``post_col``. With ``join_on_alias=<alias>``, the
+        annotation joins on the alias-source's ``{alias_col}_pre`` /
+        ``{alias_col}_post`` columns produced by the source annotation.
+
+        See :class:`ConnectivityTable` for the full parameter list.
+        """
+        if join_on_alias is not None and join_on_alias not in self._cell_aliases:
+            raise ValueError(
+                f"No cell alias named {join_on_alias!r}. Register the source "
+                f"annotation and call set_cell_alias() first. Registered "
+                f"aliases: {list(self._cell_aliases)}"
+            )
+        lf = _to_lazy(df)
+        schema = lf.collect_schema().names()
+        if entity_id_col not in schema:
+            raise ValueError(
+                f"entity_id_col {entity_id_col!r} not found in annotation. "
+                f"Available: {schema}"
+            )
+        n_total = lf.select(pl.len()).collect().item()
+        n_unique = lf.select(pl.col(entity_id_col).n_unique()).collect().item()
+        if n_total != n_unique:
+            raise ValueError(
+                f"Annotation key {entity_id_col!r} has {n_total - n_unique} "
+                "duplicate value(s); each entity id must appear at most once."
+            )
+        data_cols = [c for c in schema if c != entity_id_col]
+        if position_col is not None and position_col not in data_cols:
+            raise ValueError(
+                f"position_col {position_col!r} not found in annotation data "
+                f"columns. Available: {data_cols}"
+            )
+        new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
+        collisions = new_cols & self._current_columns()
+        if collisions:
+            raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
+        self._annotations[name] = CellAnnotationSpec(
+            lf=lf,
+            cell_id_col=entity_id_col,
+            join_on_alias=join_on_alias,
+            data_cols=data_cols,
+            position_col=position_col,
+            is_universe=is_universe,
+        )
+        self._cache = None
+        return self
+
+    # ── lazy plan (overrides to handle alias-keyed joins) ─────────────────
+
+    def build_lazy(self) -> pl.LazyFrame:
+        """Construct the annotated + filtered lazy plan, honoring aliases.
+
+        Joins non-aliased annotations (which provide alias source columns)
+        before aliased ones, in registration order. This matches the
+        SynapseTable contract that an alias source must be registered before
+        any annotation that joins on it.
+        """
+        lf = self._pair_lf
+        for spec in self._annotations.values():
+            if spec.join_on_alias is not None:
+                alias_col = self._cell_aliases[spec.join_on_alias][1]
+                pre_key = f"{alias_col}_pre"
+                post_key = f"{alias_col}_post"
+            else:
+                pre_key = self._pre_col
+                post_key = self._post_col
+            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
+            lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
+            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
+            lf = lf.join(
+                post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
+            )
+        for expr in self._expressions.values():
+            lf = lf.with_columns(expr)
+        for f in self._filters:
+            lf = lf.filter(f)
+        return lf
 
     # ── cell-specific filters ──────────────────────────────────────────────
 
@@ -234,6 +404,7 @@ class EdgeList(ConnectivityTable):
         new._annotations = self._annotations.copy()
         new._filters = self._filters.copy()
         new._expressions = self._expressions.copy()
+        new._cell_aliases = self._cell_aliases.copy()
         new._cache = None
         return new
 
@@ -246,3 +417,107 @@ class EdgeList(ConnectivityTable):
     # If per-op EdgeList-preservation is desired later (e.g. binarize should
     # stay an EdgeList because entities are unchanged), override _replace_base
     # to preserve type for the right ops. Not done here.
+
+    # ── persistence hooks ──────────────────────────────────────────────────
+
+    def _spec_to_config(self, spec: CellAnnotationSpec) -> dict:
+        config = super()._spec_to_config(spec)
+        config["join_on_alias"] = spec.join_on_alias
+        return config
+
+    def _extra_save_config(self) -> dict:
+        return {
+            "cell_aliases": {
+                alias_name: {"annotation_name": ann_name, "col": col}
+                for alias_name, (ann_name, col) in self._cell_aliases.items()
+            },
+        }
+
+    @classmethod
+    def load(cls, folio) -> EdgeList:
+        """Load an EdgeList from a DataFolio.
+
+        Loads non-aliased annotations first (so their data columns are
+        available as alias sources), then sets cell aliases, then loads
+        aliased annotations. This avoids the join-key validation race that
+        would arise from a single in-order loop.
+        """
+        import base64
+        import warnings
+
+        from ._base import _as_folio
+
+        folio = _as_folio(folio)
+        config = folio.get_json("config")
+        saved_type = config.get("__type__", "ConnectivityTable")
+        if saved_type != cls._TYPE_TAG:
+            raise TypeError(
+                f"Saved folio is a {saved_type!r}; cannot load as "
+                f"{cls.__name__}. Call the matching .load() — or "
+                f"ConnectivityTable.load(folio), which dispatches."
+            )
+
+        def _lf(name: str) -> pl.LazyFrame:
+            return pl.scan_parquet(folio.get_data_path(name))
+
+        instance = cls(
+            _lf("pairs"),
+            pre_col=config["pre_col"],
+            post_col=config["post_col"],
+            weight_cols=config.get("weights", []),
+        )
+
+        annotations = config.get("annotations", {})
+        # Non-aliased pass — these may be alias sources.
+        for name, ann_meta in annotations.items():
+            if ann_meta.get("join_on_alias") is None:
+                instance.add_annotation(
+                    name,
+                    _lf(f"ann_{name}"),
+                    entity_id_col=ann_meta["entity_id_col"],
+                    position_col=ann_meta.get("position_col"),
+                    is_universe=ann_meta.get("is_universe", False),
+                )
+        # Cell aliases must be set after their source annotations are present.
+        for alias_name, alias_meta in config.get("cell_aliases", {}).items():
+            instance.set_cell_alias(
+                alias_meta["annotation_name"],
+                alias_meta["col"],
+                alias_name=alias_name,
+            )
+        # Aliased annotations now find their alias.
+        for name, ann_meta in annotations.items():
+            if ann_meta.get("join_on_alias") is not None:
+                instance.add_annotation(
+                    name,
+                    _lf(f"ann_{name}"),
+                    entity_id_col=ann_meta["entity_id_col"],
+                    position_col=ann_meta.get("position_col"),
+                    is_universe=ann_meta.get("is_universe", False),
+                    join_on_alias=ann_meta["join_on_alias"],
+                )
+
+        for name, expr_val in config.get("expressions", {}).items():
+            expr = None
+            try:
+                expr = pl.Expr.deserialize(base64.b64decode(expr_val), format="binary")
+            except Exception:
+                pass
+            if expr is None:
+                try:
+                    expr = pl.Expr.deserialize(expr_val.encode(), format="json")
+                except Exception:
+                    warnings.warn(
+                        f"Could not deserialize expression {name!r} from folio "
+                        "(likely a Polars version incompatibility). Re-save to fix.",
+                        stacklevel=2,
+                    )
+                    continue
+            instance.add_expression(name, expr)
+
+        for f_json in config.get("filters", []):
+            instance = instance.filter(
+                pl.Expr.deserialize(f_json.encode(), format="json")
+            )
+
+        return instance

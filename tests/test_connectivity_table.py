@@ -46,7 +46,7 @@ def test_construct_from_dataframe(pair_frame):
     assert ct.pre_col == "pre"
     assert ct.post_col == "post"
     assert ct.weights == ["n_syn"]  # auto-detected
-    assert len(ct.pairs) == 5
+    assert len(ct.df) == 5
 
 
 def test_construct_explicit_weight(pair_frame):
@@ -93,7 +93,7 @@ def test_add_annotation_symmetric_join(ct):
         }
     )
     ct.add_annotation("types", ann, entity_id_col="entity_id")
-    result = ct.pairs
+    result = ct.df
     assert "cell_type_pre" in result.columns
     assert "cell_type_post" in result.columns
     assert result.filter(pl.col("pre") == 3)["cell_type_pre"].item() == "inh"
@@ -145,9 +145,9 @@ def test_remove_annotation(ct):
 
 def test_filter_returns_new_table(ct):
     filtered = ct.filter(pl.col("n_syn") >= 3)
-    assert len(filtered.pairs) == 3
+    assert len(filtered.df) == 3
     # original is unchanged
-    assert len(ct.pairs) == 5
+    assert len(ct.df) == 5
 
 
 # ── normalize — internal axis sum ───────────────────────────────────────────
@@ -156,7 +156,7 @@ def test_filter_returns_new_table(ct):
 def test_normalize_by_post_internal(ct):
     """Each post column should sum to 1 after normalize(by='post')."""
     out = ct.normalize(by="post")
-    df = out.pairs
+    df = out.df
     assert "fraction" in df.columns
     assert "n_syn" not in df.columns  # replaced
     # per-post totals of fraction
@@ -168,7 +168,7 @@ def test_normalize_by_post_internal(ct):
 def test_normalize_by_pre_internal(ct):
     """Each pre row should sum to 1 after normalize(by='pre')."""
     out = ct.normalize(by="pre")
-    df = out.pairs
+    df = out.df
     totals = df.group_by("pre").agg(pl.sum("fraction").alias("s")).sort("pre")
     for s in totals["s"].to_list():
         assert math.isclose(s, 1.0, rel_tol=1e-9)
@@ -204,7 +204,7 @@ def test_normalize_external_total_col():
     )
     ct = ConnectivityTable(df, pre_col="pre", post_col="post")
     out = ct.normalize(by="post", total_col="post_total_input")
-    result = out.pairs.sort("pre", "post")
+    result = out.df.sort("pre", "post")
     # row (pre=1, post=10): 3 / 100 = 0.03
     # row (pre=1, post=11): 1 / 50  = 0.02
     # row (pre=2, post=10): 2 / 100 = 0.02
@@ -223,12 +223,12 @@ def test_normalize_external_missing_total_col_raises(ct):
 
 def test_binarize_default(ct):
     out = ct.binarize()  # threshold=0, all weights > 0 → all 1
-    assert set(out.pairs["n_syn"].to_list()) == {1}
+    assert set(out.df["n_syn"].to_list()) == {1}
 
 
 def test_binarize_threshold(ct):
     out = ct.binarize(threshold=2)  # weights 3,1,2,4,5 → > 2: 3,4,5 → 1,0,0,1,1
-    vals = out.pairs.sort("pre", "post")["n_syn"].to_list()
+    vals = out.df.sort("pre", "post")["n_syn"].to_list()
     assert vals == [1, 0, 0, 1, 1]
 
 
@@ -237,7 +237,7 @@ def test_binarize_threshold(ct):
 
 def test_log1p(ct):
     out = ct.log1p()
-    df = out.pairs
+    df = out.df
     assert "log1p_n_syn" in df.columns
     # n_syn=3 → log1p(3) = ln(4)
     row = df.filter((pl.col("pre") == 1) & (pl.col("post") == 10))
@@ -305,8 +305,8 @@ def test_save_load_basic_roundtrip(ct, tmp_path):
     assert loaded.post_col == ct.post_col
     assert loaded.weights == ct.weights
     # pair data equal after sort
-    left = ct.pairs.sort("pre", "post")
-    right = loaded.pairs.sort("pre", "post")
+    left = ct.df.sort("pre", "post")
+    right = loaded.df.sort("pre", "post")
     assert left.equals(right)
 
 
@@ -328,8 +328,8 @@ def test_save_load_with_annotations(ct, tmp_path):
 
     assert "types" in loaded.annotation_names
     assert (
-        loaded.pairs.sort("pre", "post")["cell_type_pre"].to_list()
-        == ct.pairs.sort("pre", "post")["cell_type_pre"].to_list()
+        loaded.df.sort("pre", "post")["cell_type_pre"].to_list()
+        == ct.df.sort("pre", "post")["cell_type_pre"].to_list()
     )
 
 
@@ -342,8 +342,8 @@ def test_save_load_with_filter(ct, tmp_path):
     filtered.save(folio)
 
     loaded = ConnectivityTable.load(folio)
-    assert len(loaded.pairs) == 3
-    assert (loaded.pairs["n_syn"] >= 3).all()
+    assert len(loaded.df) == 3
+    assert (loaded.df["n_syn"] >= 3).all()
 
 
 def test_save_load_with_expression(ct, tmp_path):
@@ -355,8 +355,8 @@ def test_save_load_with_expression(ct, tmp_path):
     ct.save(folio)
 
     loaded = ConnectivityTable.load(folio)
-    result = loaded.pairs.sort("pre", "post")
-    expected = (ct.pairs.sort("pre", "post")["n_syn"] * 2).to_list()
+    result = loaded.df.sort("pre", "post")
+    expected = (ct.df.sort("pre", "post")["n_syn"] * 2).to_list()
     assert result["double"].to_list() == expected
 
 
@@ -365,7 +365,7 @@ def test_save_load_accepts_path(ct, tmp_path):
     folio_path = tmp_path / "folio"
     ct.save(str(folio_path))
     loaded = ConnectivityTable.load(str(folio_path))
-    assert loaded.pairs.sort("pre", "post").equals(ct.pairs.sort("pre", "post"))
+    assert loaded.df.sort("pre", "post").equals(ct.df.sort("pre", "post"))
 
 
 def test_save_load_overwrite(ct, tmp_path):
@@ -378,7 +378,7 @@ def test_save_load_overwrite(ct, tmp_path):
     ct2 = ct.filter(pl.col("n_syn") >= 3)
     ct2.save(folio, overwrite=True)
     loaded = ConnectivityTable.load(folio)
-    assert len(loaded.pairs) == 3
+    assert len(loaded.df) == 3
 
 
 # ── is_universe role ─────────────────────────────────────────────────────────

@@ -142,7 +142,7 @@ def unpack_all_positions(
 
     Examples
     --------
-    >>> df = unpack_all_positions(st.synapses)
+    >>> df = unpack_all_positions(st.df)
     """
     if isinstance(df, pl.LazyFrame):
         schema = df.collect_schema()

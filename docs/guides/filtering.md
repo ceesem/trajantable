@@ -2,7 +2,7 @@
 
 All filter methods return a **new** `SynapseTable`; the original is unchanged.
 Filters accumulate as Polars expressions in the lazy plan and are applied after
-all annotation joins, so any column in `.synapses` is valid.
+all annotation joins, so any column in `.df` is valid.
 
 ## Arbitrary Polars expressions
 

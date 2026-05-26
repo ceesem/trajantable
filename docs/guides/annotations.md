@@ -12,8 +12,8 @@ Use these for per-synapse attributes like confidence scores or cleft size.
 scores = pl.read_parquet("synapse_scores.parquet")  # id, confidence, cleft_size
 st = st.add_synapse_annotation("scores", scores)
 
-# Columns appear directly on .synapses
-st.synapses[["id", "confidence", "cleft_size"]]
+# Columns appear directly on .df
+st.df[["id", "confidence", "cleft_size"]]
 ```
 
 The source DataFrame must have one row per synapse ID.
@@ -21,7 +21,7 @@ The source DataFrame must have one row per synapse ID.
 ## Cell-level annotations
 
 Joined on a cell ID column, **symmetrically** for both pre- and post-synaptic cells.
-Each data column in your annotation produces two columns in `.synapses`:
+Each data column in your annotation produces two columns in `.df`:
 `{col}_pre` and `{col}_post`.
 
 ```python
@@ -29,7 +29,7 @@ cell_types = pl.read_parquet("cell_types.parquet")  # root_id, cell_type, layer
 st = st.add_cell_annotation("cell_type", cell_types, cell_id_col="root_id")
 
 # Produces cell_type_pre, cell_type_post, layer_pre, layer_post
-st.synapses[["pre_pt_root_id", "cell_type_pre", "cell_type_post"]]
+st.df[["pre_pt_root_id", "cell_type_pre", "cell_type_post"]]
 ```
 
 The source DataFrame must have one row per cell ID.

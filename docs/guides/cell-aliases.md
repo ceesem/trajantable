@@ -57,7 +57,7 @@ st = st.add_cell_annotation(
     cell_id_col="cell_id",
     join_on_alias="proofread",  # name matches alias_name (or annotation_name)
 )
-# .synapses now has axon_length_pre and axon_length_post
+# .df now has axon_length_pre and axon_length_post
 ```
 
 ## Alias constraints
@@ -78,7 +78,7 @@ st = st.remove_cell_annotation("proofread")
 ```
 
 To recover, register a new alias source and call `set_cell_alias` again before
-accessing `.synapses`.
+accessing `.df`.
 
 ## Inspecting registered aliases
 

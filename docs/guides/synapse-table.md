@@ -48,7 +48,7 @@ st = trajan.SynapseTable(df)  # converted to Polars internally
 
 The synapse table must contain at minimum the pre-cell, post-cell, and synapse
 ID columns named by `pre_col`, `post_col`, and `id_col`. All other columns
-pass through unchanged and are available in `.synapses` and in output
+pass through unchanged and are available in `.df` and in output
 aggregations.
 
 ```python
@@ -58,7 +58,7 @@ aggregations.
 
 Any additional columns — synapse size, cleft scores, supervoxel IDs, position
 structs — pass through unchanged and require no special handling at construction
-time. They appear in `.synapses` automatically and can be used in `filter()`,
+time. They appear in `.df` automatically and can be used in `filter()`,
 `edgelist(agg=...)`, and `add_expression()`. A position column is needed for
 spatial filtering; see [Spatial configuration](#spatial-configuration) below.
 
@@ -66,7 +66,7 @@ spatial filtering; see [Spatial configuration](#spatial-configuration) below.
 
 `SynapseTable` is built on Polars lazy frames. No data is loaded or processed
 until you explicitly request it. Annotation joins, expressions, and filters all
-accumulate as a query plan that is executed only when `.synapses` is accessed or
+accumulate as a query plan that is executed only when `.df` is accessed or
 an output method like `edgelist()` is called.
 
 For large datasets, pass a `pl.LazyFrame` at construction time so that even the
@@ -87,21 +87,21 @@ is already collected into a DataFrame.
 
 ## Accessing the merged table
 
-The `.synapses` property builds and collects the full lazy plan and returns a
+The `.df` property builds and collects the full lazy plan and returns a
 `pl.DataFrame` with all annotation columns joined in and all filters applied:
 
 ```python
-df = st.synapses
+df = st.df
 # Returns a pl.DataFrame: pre_pt_root_id | post_pt_root_id | id | cell_type_pre | cell_type_post | ...
 ```
 
-The result is cached. Accessing `.synapses` a second time returns the cached
+The result is cached. Accessing `.df` a second time returns the cached
 DataFrame immediately without re-executing the plan. The cache is invalidated
 automatically whenever you add or remove an annotation, expression, or filter —
 the next access re-executes the full plan.
 
 If you only need a subset of columns, avoid materializing the full merged table.
-Use `view()` to drop unneeded annotations before accessing `.synapses`, or call
+Use `view()` to drop unneeded annotations before accessing `.df`, or call
 an output method directly:
 
 ```python
@@ -149,7 +149,7 @@ st
 ```
 
 `n_syn` shows the base synapse count before filters when the cache is cold.
-Once `.synapses` has been accessed it shows the filtered count. If filters are
+Once `.df` has been accessed it shows the filtered count. If filters are
 registered but the cache is cold it shows `uncached`.
 
 The annotation name list properties let you check what is registered without

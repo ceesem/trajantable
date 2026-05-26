@@ -2,25 +2,26 @@
 
 ## Edgelist
 
-`edgelist()` aggregates synapses into one row per cell pair with a synapse count.
-Cell annotation columns (the `*_pre` / `*_post` pairs from registered cell
-annotations) are included automatically via `.first()`:
+`edgelist()` aggregates synapses into one row per cell pair with a synapse
+count. Registered cell annotations — including their role declarations
+(`position_col`, `is_universe`) and any cell aliases — are *propagated* onto
+the returned `EdgeList` rather than inlined into the pair frame. Annotation
+columns (`*_pre` / `*_post`) appear on `el.df` via a symmetric pre/post join
+performed at access time:
 
 ```python
 el = st.edgelist()
-# pre_pt_root_id | post_pt_root_id | n_syn | cell_type_pre | cell_type_post
+el.df  # pre_pt_root_id | post_pt_root_id | n_syn | cell_type_pre | cell_type_post | ...
 ```
 
-Set `pre_anno=False` or `post_anno=False` to omit annotation columns on either
-side — useful when only synapse counts are needed and you want to avoid the
-overhead of carrying annotation data through the aggregation:
+To drop an annotation's columns from `el.df`, remove the annotation:
 
 ```python
-el = st.edgelist(pre_anno=False, post_anno=False)
-# pre_pt_root_id | post_pt_root_id | n_syn
+el.remove_annotation("types")
+el.df  # pre_pt_root_id | post_pt_root_id | n_syn
 ```
 
-Additional per-pair aggregations over any column in `.synapses`:
+Additional per-pair aggregations over any column in `.df`:
 
 ```python
 el = st.edgelist(agg={
@@ -36,11 +37,11 @@ el = st.edgelist(agg={
 one row per `(pre, post)` cell pair. Work in pair-space continues through
 the EdgeList (further filtering, aggregation to types, matrix export)
 rather than dropping back to a raw DataFrame. Access the materialized pair
-DataFrame via `el.pairs` when needed.
+DataFrame via `el.df` when needed.
 
 ```python
 el = st.edgelist()
-el.pairs  # pl.DataFrame with [pre, post, n_syn, cell_type_pre, ...]
+el.df  # pl.DataFrame with [pre, post, n_syn, cell_type_pre, ...]
 ```
 
 Pair-level filtering returns an `EdgeList`:
@@ -169,7 +170,7 @@ st = st.add_expression(
     "soma_dist",
     euclidean_distance("pt_position_pre", "pt_position_post"),
 )
-# Now available in .synapses and in edgelist agg
+# Now available in .df and in edgelist agg
 el = st.edgelist(agg={"mean_soma_dist": pl.mean("soma_dist")})
 ```
 
@@ -235,7 +236,7 @@ G = trajan.to_graph(
 
 ## Pandas export
 
-`trajan.to_dataframe(st)` materializes `.synapses` as a pandas DataFrame. Like
+`trajan.to_dataframe(st)` materializes `.df` as a pandas DataFrame. Like
 `to_graph`, it is a free function. Polars struct columns (positions) cannot be
 represented directly in pandas, so they are automatically unpacked into flat
 `_x` / `_y` / `_z` columns:
@@ -253,5 +254,5 @@ for use on arbitrary Polars DataFrames:
 df = trajan.unpack_position(df, "soma_pt_position")
 
 # Unpack all position struct columns at once
-df = trajan.unpack_all_positions(st.synapses)
+df = trajan.unpack_all_positions(st.df)
 ```
