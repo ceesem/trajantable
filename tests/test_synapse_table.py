@@ -327,6 +327,40 @@ def test_edgelist_propagates_aliased_annotation(base_synapses):
         )
 
 
+def test_edgelist_re_registers_cell_level_expression(st_with_cell_ann):
+    """Cell-level expressions propagate as registered expressions on the
+    EdgeList (not baked columns), so they re-evaluate against current data."""
+    st_with_cell_ann.add_expression("pre_is_a", pl.col("cell_type_pre") == "A")
+    assert st_with_cell_ann.expression_sides["pre_is_a"] == "pre"
+    el = st_with_cell_ann.edgelist()
+    # registered as an expression, not just a baked column
+    assert "pre_is_a" in el._expressions
+    # and produces the right column on el.df
+    df = el.df
+    assert "pre_is_a" in df.columns
+
+
+def test_edgelist_cell_level_expression_evaluates_live(st_with_cell_ann):
+    """Re-registered cell-level expressions evaluate against the EdgeList's
+    current annotation data, not a frozen snapshot from edgelist() time."""
+    st_with_cell_ann.add_expression("pre_label", pl.col("cell_type_pre"))
+    el = st_with_cell_ann.edgelist()
+    original = (
+        el.df.select("pre_pt_root_id", "pre_label").unique().sort("pre_pt_root_id")
+    )
+    assert original["pre_label"].to_list() == ["A", "B", "C"]
+
+    # Replace the cell annotation with one that maps cells to different labels.
+    el.remove_annotation("types")
+    new_types = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["X", "Y", "Z"]})
+    el.add_annotation("types", new_types, entity_id_col="root_id")
+    updated = (
+        el.df.select("pre_pt_root_id", "pre_label").unique().sort("pre_pt_root_id")
+    )
+    # The expression re-evaluates against the new annotation data
+    assert updated["pre_label"].to_list() == ["X", "Y", "Z"]
+
+
 def test_edgelist_save_load_roundtrip_with_alias(base_synapses, tmp_path):
     """EdgeList propagated from a SynapseTable with aliased annotations
     round-trips through save/load with aliases intact."""

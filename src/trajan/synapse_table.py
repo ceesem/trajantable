@@ -1691,14 +1691,6 @@ class SynapseTable:
         if agg:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
 
-        # Side-classified expressions are evaluated per-synapse at SynapseTable
-        # build_lazy() time (against the joined cell annotations) and then
-        # aggregated to the pair-level via .first() — annotation joins on the
-        # resulting EdgeList would happen too late to re-evaluate them.
-        for name, side in self._expression_sides.items():
-            if side in ("pre", "post", "both"):
-                agg_exprs.append(pl.col(name).first())
-
         pair_df = (
             self.build_lazy()
             .group_by([self._pre_col, self._post_col])
@@ -1726,6 +1718,16 @@ class SynapseTable:
                 is_universe=spec.is_universe,
                 join_on_alias=spec.join_on_alias,
             )
+        # Re-register cell-level expressions. Their bodies reference
+        # annotation-derived columns (e.g. cell_type_pre) which the
+        # EdgeList's annotation joins now provide; they evaluate live at
+        # el.df access. Synapse-level expressions (side=None) drop here —
+        # Phase 2 will give them a declared pair_agg= aggregation path.
+        # Registration order matters when expressions depend on prior ones;
+        # dict ordering preserves it.
+        for name, side in self._expression_sides.items():
+            if side in ("pre", "post", "both"):
+                el.add_expression(name, self._expressions[name])
         return el
 
     def type_edgelist(
