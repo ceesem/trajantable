@@ -1,0 +1,34 @@
+/* Tyrian / Roman imperial purple — matches Material's own selector specificity */
+[data-md-color-primary] {
+  --md-primary-fg-color: #5C1A82;
+  --md-primary-fg-color--light: #7A3A9E;
+  --md-primary-fg-color--dark: #3E0D62;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: rgba(255, 255, 255, 0.7);
+}
+
+[data-md-color-scheme="default"] {
+  --md-default-bg-color: #f5f1f9;
+  --md-default-bg-color--light: #f8f5fb;
+  --md-default-bg-color--lighter: #fbf8fd;
+  --md-default-bg-color--lightest: #fefcff;
+  --md-code-bg-color: #ede8f5;
+}
+
+/* Mermaid in dark mode: the node boxes carry their own (light) fills via
+   classDef, but the connector lines and edge labels inherit from the theme.
+   Material's defaults leave them low-contrast on the slate background, so
+   drive them from the dark scheme's own fg/bg variables. */
+[data-md-color-scheme="slate"] {
+  --md-mermaid-edge-color: #b39ddb;
+  --md-mermaid-label-bg-color: var(--md-default-bg-color);
+  --md-mermaid-label-fg-color: var(--md-default-fg-color);
+}
+
+/* Edge labels and node labels share --md-mermaid-label-fg-color, but the nodes
+   keep their own light fills (via classDef) in both schemes — so their text
+   must stay dark. The extra scheme selector outranks Material's .nodeLabel rule
+   without !important; color cascades to the <b>/<small> children. */
+[data-md-color-scheme="slate"] .mermaid .nodeLabel {
+  color: #21163a;
+}
