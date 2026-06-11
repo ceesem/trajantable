@@ -21,9 +21,14 @@ from typing import Callable, Iterable
 
 import polars as pl
 
-from ._base import CellAnnotationSpec, _to_lazy
+from ._base import (
+    CellAnnotationSpec,
+    build_cell_annotation_spec,
+    build_pair_plan,
+    filter_by_id_sets,
+)
 from .connectivity_table import ConnectivityTable
-from .spatial import euclidean_distance
+from .spatial import bbox_predicate, euclidean_distance
 
 
 class EdgeList(ConnectivityTable):
@@ -112,9 +117,9 @@ class EdgeList(ConnectivityTable):
             Name under which to register the alias. Defaults to
             ``annotation_name``.
         """
-        if annotation_name not in self._annotations:
+        if annotation_name not in self._cell_annotations:
             raise KeyError(f"No annotation named {annotation_name!r}")
-        spec = self._annotations[annotation_name]
+        spec = self._cell_annotations[annotation_name]
         if spec.join_on_alias is not None:
             raise ValueError(
                 f"Annotation {annotation_name!r} uses join_on_alias="
@@ -136,7 +141,7 @@ class EdgeList(ConnectivityTable):
         self,
         name: str,
         df,
-        entity_id_col: str,
+        cell_id_col: str,
         position_col: str | None = None,
         is_universe: bool = False,
         join_on_alias: str | None = None,
@@ -158,37 +163,13 @@ class EdgeList(ConnectivityTable):
                 f"annotation and call set_cell_alias() first. Registered "
                 f"aliases: {list(self._cell_aliases)}"
             )
-        lf = _to_lazy(df)
-        schema = lf.collect_schema().names()
-        if entity_id_col not in schema:
-            raise ValueError(
-                f"entity_id_col {entity_id_col!r} not found in annotation. "
-                f"Available: {schema}"
-            )
-        n_total = lf.select(pl.len()).collect().item()
-        n_unique = lf.select(pl.col(entity_id_col).n_unique()).collect().item()
-        if n_total != n_unique:
-            raise ValueError(
-                f"Annotation key {entity_id_col!r} has {n_total - n_unique} "
-                "duplicate value(s); each entity id must appear at most once."
-            )
-        data_cols = [c for c in schema if c != entity_id_col]
-        if position_col is not None and position_col not in data_cols:
-            raise ValueError(
-                f"position_col {position_col!r} not found in annotation data "
-                f"columns. Available: {data_cols}"
-            )
-        new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
-        collisions = new_cols & self._current_columns()
-        if collisions:
-            raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-        self._annotations[name] = CellAnnotationSpec(
-            lf=lf,
-            cell_id_col=entity_id_col,
-            join_on_alias=join_on_alias,
-            data_cols=data_cols,
+        self._cell_annotations[name] = build_cell_annotation_spec(
+            df,
+            cell_id_col=cell_id_col,
             position_col=position_col,
             is_universe=is_universe,
+            join_on_alias=join_on_alias,
+            current_columns=self._current_columns(),
         )
         self._cache = None
         return self
@@ -203,26 +184,15 @@ class EdgeList(ConnectivityTable):
         SynapseTable contract that an alias source must be registered before
         any annotation that joins on it.
         """
-        lf = self._pair_lf
-        for spec in self._annotations.values():
-            if spec.join_on_alias is not None:
-                alias_col = self._cell_aliases[spec.join_on_alias][1]
-                pre_key = f"{alias_col}_pre"
-                post_key = f"{alias_col}_post"
-            else:
-                pre_key = self._pre_col
-                post_key = self._post_col
-            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
-            lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
-            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
-            lf = lf.join(
-                post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
-            )
-        for expr in self._expressions.values():
-            lf = lf.with_columns(expr)
-        for f in self._filters:
-            lf = lf.filter(f)
-        return lf
+        return build_pair_plan(
+            self._pair_lf,
+            self._cell_annotations,
+            pre_col=self._pre_col,
+            post_col=self._post_col,
+            aliases=self._cell_aliases,
+            expressions=self._expressions,
+            filters=self._filters,
+        )
 
     # ── cell-specific filters ──────────────────────────────────────────────
 
@@ -236,14 +206,7 @@ class EdgeList(ConnectivityTable):
         Either or both arguments may be None to leave that side unfiltered.
         Returns a new EdgeList.
         """
-        if pre_ids is None and post_ids is None:
-            return self._copy()
-        new = self
-        if pre_ids is not None:
-            new = new.filter(pl.col(self._pre_col).is_in(list(pre_ids)))
-        if post_ids is not None:
-            new = new.filter(pl.col(self._post_col).is_in(list(post_ids)))
-        return new
+        return filter_by_id_sets(self, pre_ids, post_ids)
 
     def filter_by_soma_distance(
         self,
@@ -272,7 +235,7 @@ class EdgeList(ConnectivityTable):
             lateral-only.
         """
         ann_name = self._resolve_position_annotation(annotation)
-        pos_col = self._annotations[ann_name].position_col
+        pos_col = self._cell_annotations[ann_name].position_col
         return self.filter(
             distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
         )
@@ -300,22 +263,11 @@ class EdgeList(ConnectivityTable):
             when exactly one position-bearing annotation is registered.
         """
         ann_name = self._resolve_position_annotation(annotation)
-        pos_col = self._annotations[ann_name].position_col
-        (xmin, ymin, zmin), (xmax, ymax, zmax) = bbox
-        pre = pl.col(f"{pos_col}_pre")
-        post = pl.col(f"{pos_col}_post")
-
-        def _inside(p):
-            return (
-                (p.struct.field("x") >= xmin)
-                & (p.struct.field("x") <= xmax)
-                & (p.struct.field("y") >= ymin)
-                & (p.struct.field("y") <= ymax)
-                & (p.struct.field("z") >= zmin)
-                & (p.struct.field("z") <= zmax)
-            )
-
-        return self.filter(_inside(pre) & _inside(post))
+        pos_col = self._cell_annotations[ann_name].position_col
+        return self.filter(
+            bbox_predicate(f"{pos_col}_pre", bbox)
+            & bbox_predicate(f"{pos_col}_post", bbox)
+        )
 
     # ── tier promotion ─────────────────────────────────────────────────────
 
@@ -401,9 +353,11 @@ class EdgeList(ConnectivityTable):
         new._pre_col = self._pre_col
         new._post_col = self._post_col
         new._weights = self._weights.copy()
-        new._annotations = self._annotations.copy()
+        new._cell_annotations = self._cell_annotations.copy()
         new._filters = self._filters.copy()
+        new._filter_sides = self._filter_sides.copy()
         new._expressions = self._expressions.copy()
+        new._expression_sides = self._expression_sides.copy()
         new._cell_aliases = self._cell_aliases.copy()
         new._cache = None
         return new
@@ -474,7 +428,7 @@ class EdgeList(ConnectivityTable):
                 instance.add_annotation(
                     name,
                     _lf(f"ann_{name}"),
-                    entity_id_col=ann_meta["entity_id_col"],
+                    cell_id_col=ann_meta["cell_id_col"],
                     position_col=ann_meta.get("position_col"),
                     is_universe=ann_meta.get("is_universe", False),
                 )
@@ -491,7 +445,7 @@ class EdgeList(ConnectivityTable):
                 instance.add_annotation(
                     name,
                     _lf(f"ann_{name}"),
-                    entity_id_col=ann_meta["entity_id_col"],
+                    cell_id_col=ann_meta["cell_id_col"],
                     position_col=ann_meta.get("position_col"),
                     is_universe=ann_meta.get("is_universe", False),
                     join_on_alias=ann_meta["join_on_alias"],
@@ -515,9 +469,12 @@ class EdgeList(ConnectivityTable):
                     continue
             instance.add_expression(name, expr)
 
-        for f_json in config.get("filters", []):
+        saved_sides = config.get("filter_sides")
+        for i, f_json in enumerate(config.get("filters", [])):
             instance = instance.filter(
                 pl.Expr.deserialize(f_json.encode(), format="json")
             )
+            if saved_sides is not None and i < len(saved_sides):
+                instance._filter_sides[-1] = saved_sides[i]
 
         return instance

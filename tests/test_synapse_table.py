@@ -262,7 +262,6 @@ def test_edgelist_propagates_position_col_role(base_synapses):
         "soma",
         soma,
         cell_id_col="root_id",
-        position_cols="pt",
         position_col="pt",
     )
     el = st.edgelist()
@@ -353,7 +352,7 @@ def test_edgelist_cell_level_expression_evaluates_live(st_with_cell_ann):
     # Replace the cell annotation with one that maps cells to different labels.
     el.remove_annotation("types")
     new_types = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["X", "Y", "Z"]})
-    el.add_annotation("types", new_types, entity_id_col="root_id")
+    el.add_annotation("types", new_types, cell_id_col="root_id")
     updated = (
         el.df.select("pre_pt_root_id", "pre_label").unique().sort("pre_pt_root_id")
     )
@@ -389,7 +388,7 @@ def test_edgelist_save_load_roundtrip_with_alias(base_synapses, tmp_path):
     loaded = EdgeList.load(str(folio_path))
     assert "proofread" in loaded.cell_aliases
     assert "morpho" in loaded.annotation_names
-    assert loaded._annotations["morpho"].join_on_alias == "proofread"
+    assert loaded._cell_annotations["morpho"].join_on_alias == "proofread"
     assert loaded.df.sort(["pre_pt_root_id", "post_pt_root_id"]).equals(
         el.df.sort(["pre_pt_root_id", "post_pt_root_id"])
     )
@@ -843,9 +842,11 @@ def test_cell_summary_custom_agg(st_summary):
     assert "mean_size_in" in cs.columns
 
 
-def test_cell_summary_null_for_absent_side(base_synapses):
-    """Cells that only appear on one side have nulls for the other side's count."""
-    # Cell 40 only appears as post, cell 30 only as pre in this subset
+def test_cell_summary_zero_count_for_absent_side(base_synapses):
+    """Cells appearing on only one side get 0 (not null) for the absent side's
+    additive counts — a cell with no output synapses makes zero of them.
+    Consistent with cells(participation=True)."""
+    # Cells 20 and 40 only appear as post, never as pre.
     syn = pl.DataFrame(
         {
             "id": [1, 2],
@@ -856,10 +857,32 @@ def test_cell_summary_null_for_absent_side(base_synapses):
     st2 = SynapseTable(syn)
     cs = cell_summary(st2, include_annotations=False)
     row = {r["cell_id"]: r for r in cs.iter_rows(named=True)}
-    # Cell 40 never appears as pre
-    assert row[40]["n_syn_output"] is None
-    # Cell 20 never appears as pre
-    assert row[20]["n_syn_output"] is None
+    assert row[40]["n_syn_output"] == 0
+    assert row[20]["n_syn_output"] == 0
+    # The side it does appear on is counted normally.
+    assert row[40]["n_syn_input"] == 1
+
+
+def test_cell_summary_custom_agg_null_for_absent_side():
+    """Custom pre_agg / post_agg outputs stay null on the absent side (a mean
+    over zero rows is undefined; 0 would be wrong)."""
+    syn = pl.DataFrame(
+        {
+            "id": [1, 2],
+            "pre_pt_root_id": [10, 10],
+            "post_pt_root_id": [20, 40],
+            "size": [5.0, 7.0],
+        }
+    )
+    st2 = SynapseTable(syn)
+    cs = cell_summary(
+        st2,
+        pre_agg={"mean_out_size": pl.mean("size")},
+        include_annotations=False,
+    )
+    row = {r["cell_id"]: r for r in cs.iter_rows(named=True)}
+    # Cell 20 never appears as pre → its mean output size is undefined (null).
+    assert row[20]["mean_out_size"] is None
 
 
 # ── metadata ──────────────────────────────────────────────────────────────────
@@ -958,7 +981,6 @@ def st_spatial(base_synapses):
             "soma",
             soma_df,
             cell_id_col="root_id",
-            position_cols="soma",
             position_col="soma",
         )
     )
@@ -1054,7 +1076,6 @@ def test_add_spatial_features_target_syn_no_synapse_col_raises(base_synapses):
         "soma",
         soma_df,
         cell_id_col="root_id",
-        position_cols="soma",
         position_col="soma",
     )
     with pytest.raises(ValueError, match="synapse_position_col"):
@@ -1375,13 +1396,78 @@ def test_position_col_declared_on_cell_annotation(base_synapses):
         "soma",
         soma_df,
         cell_id_col="root_id",
-        position_cols="pt_position",
         position_col="pt_position",
     )
     spec = st._cell_annotations["soma"]
     assert spec.position_col == "pt_position"
     # round-trip via the resolution helper
     assert st._resolve_position_annotation() == "soma"
+
+
+def test_position_col_auto_packs_from_split_xyz(base_synapses):
+    """Passing position_col alone should auto-pack soma_x/y/z into a struct."""
+    soma_df = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "soma_x": [0.0, 3.0, 0.0],
+            "soma_y": [0.0, 0.0, 4.0],
+            "soma_z": [0.0, 0.0, 0.0],
+        }
+    )
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma", soma_df, cell_id_col="root_id", position_col="soma"
+    )
+    assert st._cell_annotations["soma"].position_col == "soma"
+    assert "soma" in st._cell_annotations["soma"].data_cols
+    # add_spatial_features should resolve and produce the expected outputs
+    st.add_spatial_features(prefix="soma")
+    assert "soma_euclidean" in st.df.columns
+
+
+def test_position_cols_kwarg_removed_from_cell_methods(base_synapses):
+    """add_cell_annotation no longer accepts position_cols — position_col
+    (which auto-packs) is the only supported way to declare cell position."""
+    soma_df = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "soma_x": [0.0, 3.0, 0.0],
+            "soma_y": [0.0, 0.0, 4.0],
+            "soma_z": [0.0, 0.0, 0.0],
+        }
+    )
+    with pytest.raises(TypeError, match="position_cols"):
+        SynapseTable(base_synapses).add_cell_annotation(
+            "soma", soma_df, cell_id_col="root_id", position_cols="soma"
+        )
+
+
+def test_load_repacks_legacy_split_position_columns(base_synapses, tmp_path):
+    """A saved annotation with split soma_x/y/z must re-pack on load when
+    position_col is set in config — exercises the legacy-folio path where
+    earlier code stored scalar position columns rather than a struct."""
+    import polars as pl
+
+    soma_df = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "soma_x": [0.0, 3.0, 0.0],
+            "soma_y": [0.0, 0.0, 4.0],
+            "soma_z": [0.0, 0.0, 0.0],
+        }
+    )
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma", soma_df, cell_id_col="root_id", position_col="soma"
+    )
+    st.add_spatial_features(prefix="soma")
+    folio_path = tmp_path / "folio"
+    st.save(folio_path)
+    # Simulate a legacy save: overwrite the annotation parquet with the
+    # un-packed scalar version.
+    soma_df.write_parquet(folio_path / "tables" / "cell_ann_soma.parquet")
+    st2 = SynapseTable.load(folio_path)
+    assert "soma" in st2._cell_annotations["soma"].data_cols
+    # .df materialization should succeed (the bug was a ColumnNotFoundError here)
+    assert "soma_euclidean" in st2.df.columns
 
 
 def test_build_lazy_is_public(st):

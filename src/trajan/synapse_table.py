@@ -12,13 +12,22 @@ from ._base import (
     CellAnnotationSpec,
     SynapseAnnotationSpec,
     VertexAnnotationSpec,
+    _AnnotationProxy,
     _as_folio,
     _auto_pack,
     _to_lazy,
+    apply_plan_tail,
+    classify_by_cell_sides,
+    filter_by_id_sets,
+    join_cell_annotations_symmetric,
+    reject_reserved_names,
+    resolve_position_annotation,
+    resolve_universe_annotation,
+    validate_unique_key,
 )
 from .connectivity_table import ConnectivityTable
 from .edgelist import EdgeList
-from .spatial import euclidean_distance, spatial_feature_exprs
+from .spatial import bbox_predicate, euclidean_distance, spatial_feature_exprs
 
 try:
     import pandas as pd  # noqa: F401  (still used elsewhere for duck-typing)
@@ -26,34 +35,6 @@ try:
     _HAS_PANDAS = True
 except ImportError:
     _HAS_PANDAS = False
-
-
-class _AnnotationProxy:
-    """Lazy read-only view over stored annotation LazyFrames.
-
-    Collects the named annotation's LazyFrame only when accessed via ``[]``.
-    Iteration and membership checks work without collecting any data.
-    """
-
-    def __init__(self, store: dict) -> None:
-        self._store = store
-
-    def __getitem__(self, name: str) -> pl.DataFrame:
-        if name not in self._store:
-            raise KeyError(name)
-        return self._store[name].lf.collect()
-
-    def __iter__(self):
-        return iter(self._store)
-
-    def __len__(self) -> int:
-        return len(self._store)
-
-    def __contains__(self, name: object) -> bool:
-        return name in self._store
-
-    def __repr__(self) -> str:
-        return f"AnnotationProxy({list(self._store)})"
 
 
 def _spatial_col_name(prefix: str, feature: str) -> str:
@@ -92,6 +73,32 @@ class SynapseTable:
     (``filter_by_soma_distance``, ``add_spatial_features``) auto-resolve the
     position-bearing annotation; pass ``annotation=<name>`` when more than one
     is registered.
+
+    How ``.df`` is assembled
+    ------------------------
+    ``.df`` is built lazily by ``build_lazy()`` and cached. The plan is:
+
+    1. Start from the base synapse table (``synapses`` / ``synapses_lazy``).
+    2. Join each registered **synapse** annotation on ``id_col``
+       (contributes its columns verbatim).
+    3. Join each registered **cell** annotation symmetrically on
+       ``pre_col`` / ``post_col`` (or an alias key) — each data column
+       ``c`` produces ``c_pre`` and ``c_post``.
+    4. Join each registered **vertex** annotation on the declared
+       ``pre_vertex_col`` / ``post_vertex_col`` — same ``c_pre`` / ``c_post``
+       output convention.
+    5. Apply each registered **expression** in registration order via
+       ``with_columns`` (so later expressions can reference earlier ones).
+    6. Apply each accumulated **filter** in order via ``filter``.
+
+    To inspect any single piece without building the whole thing:
+
+    - ``st.synapses`` — base synapse DataFrame (step 1 only)
+    - ``st.synapse_annotations[name]`` — a specific synapse annotation frame
+    - ``st.cell_annotations[name]`` — a specific cell annotation frame
+    - ``st.vertex_annotations[name]`` — a specific vertex annotation frame
+    - ``st.build_lazy()`` — the full plan as a ``pl.LazyFrame`` (no collect)
+    - ``st.info()`` — a printed summary of everything registered.
     """
 
     def __init__(
@@ -118,6 +125,10 @@ class SynapseTable:
         self._vertex_annotations: dict[str, VertexAnnotationSpec] = {}
 
         self._filters: list[pl.Expr] = []
+        # Parallel to _filters: cell-side classification ('pre' / 'post' / 'both' / None)
+        # captured at filter() time against the annotations registered then.
+        # Drives cells() and possible_pairs() side-decomposed projection.
+        self._filter_sides: list[str | None] = []
         # name → aliased pl.Expr, applied in insertion order after joins and before filters
         self._expressions: dict[str, pl.Expr] = {}
         # free-form user metadata; persisted via folio.metadata on save/load
@@ -297,6 +308,19 @@ class SynapseTable:
             f"weights={self._weights})"
         )
 
+    def __len__(self) -> int:
+        """Number of synapses after filters; collects lazily if needed."""
+        if self._cache is not None:
+            return len(self._cache)
+        if not self._filters:
+            return self._n_syn_base
+        return self.build_lazy().select(pl.len()).collect().item()
+
+    def __bool__(self) -> bool:
+        # Always truthy: prevents `if st:` from implicitly forcing a collect
+        # via __len__. Use `len(st) > 0` for the row-count check.
+        return True
+
     # ── annotation name lists and accessors ───────────────────────────────
 
     @property
@@ -341,6 +365,22 @@ class SynapseTable:
     @property
     def expression_names(self) -> list[str]:
         return list(self._expressions)
+
+    @property
+    def filter_sides(self) -> list[str | None]:
+        """Cell-side classification of each accumulated filter.
+
+        Parallel to ``self._filters``. Each entry is ``'pre'``, ``'post'``,
+        ``'both'``, or ``None`` — captured at ``filter()`` time against the
+        cell annotations registered then. Classification does not retroactively
+        change when annotations are added or removed later (matching the
+        existing ``expression_sides`` caveat).
+
+        Consumed by ``cells()`` and ``possible_pairs()`` to project cell-level
+        filters onto per-cell and per-pair views without re-applying synapse-
+        or vertex-level constraints that have no cell-level meaning.
+        """
+        return list(self._filter_sides)
 
     @property
     def expression_sides(self) -> dict[str, str | None]:
@@ -389,80 +429,48 @@ class SynapseTable:
         """Column holding synapse positions as a struct with x, y, z fields, if declared."""
         return self._synapse_position_col
 
+    # ── raw-table introspection ────────────────────────────────────────────
+
+    @property
+    def synapses(self) -> pl.DataFrame:
+        """Base synapse table as a DataFrame — no joins, no filters, no expressions.
+
+        For the fully merged + filtered + computed table use ``.df``. To inspect
+        an individual registered annotation use ``synapse_annotations[name]``,
+        ``cell_annotations[name]``, or ``vertex_annotations[name]``.
+        """
+        return self._syn_lf.collect()
+
+    @property
+    def synapses_lazy(self) -> pl.LazyFrame:
+        """Lazy view of the base synapse table — for building custom plans."""
+        return self._syn_lf
+
     def _resolve_position_annotation(self, annotation: str | None = None) -> str:
         """Return the name of the cell annotation whose ``position_col`` to use.
 
-        If ``annotation`` is given, validate that it's registered and has a
-        ``position_col`` set. Otherwise: find the unique cell annotation with
-        a ``position_col``; error on zero matches or ambiguity.
+        Delegates to :func:`trajan._base.resolve_position_annotation`; see
+        there for the auto-resolution contract.
         """
-        if annotation is not None:
-            if annotation not in self._cell_annotations:
-                raise KeyError(
-                    f"No cell annotation named {annotation!r}. "
-                    f"Registered: {list(self._cell_annotations)}"
-                )
-            if self._cell_annotations[annotation].position_col is None:
-                raise ValueError(
-                    f"Cell annotation {annotation!r} has no position_col declared. "
-                    f"Re-register with add_cell_annotation(..., position_col=<col>)."
-                )
-            return annotation
-
-        with_pos = [
-            n
-            for n, spec in self._cell_annotations.items()
-            if spec.position_col is not None
-        ]
-        if not with_pos:
-            raise ValueError(
-                "No cell annotation with a position_col is registered. "
-                "Pass position_col=<col> to add_cell_annotation when "
-                "registering the annotation that carries soma positions."
-            )
-        if len(with_pos) > 1:
-            raise ValueError(
-                f"Multiple cell annotations carry positions ({with_pos}); "
-                "pass annotation=<name> to disambiguate."
-            )
-        return with_pos[0]
+        return resolve_position_annotation(
+            self._cell_annotations,
+            annotation,
+            noun="cell annotation",
+            register_method="add_cell_annotation",
+        )
 
     def _resolve_universe_annotation(self, annotation: str | None = None) -> str:
         """Return the name of the cell annotation that defines the cell universe.
 
-        If ``annotation`` is given, validate that it's registered and has
-        ``is_universe=True``. Otherwise: find the unique cell annotation
-        marked universe; error on zero matches or ambiguity.
+        Delegates to :func:`trajan._base.resolve_universe_annotation`; see
+        there for the auto-resolution contract.
         """
-        if annotation is not None:
-            if annotation not in self._cell_annotations:
-                raise KeyError(
-                    f"No cell annotation named {annotation!r}. "
-                    f"Registered: {list(self._cell_annotations)}"
-                )
-            if not self._cell_annotations[annotation].is_universe:
-                raise ValueError(
-                    f"Cell annotation {annotation!r} is not marked "
-                    f"is_universe=True. Re-register with add_cell_annotation"
-                    f"(..., is_universe=True)."
-                )
-            return annotation
-
-        universes = [
-            n for n, spec in self._cell_annotations.items() if spec.is_universe
-        ]
-        if not universes:
-            raise ValueError(
-                "No cell annotation is marked is_universe=True. Pass "
-                "is_universe=True to add_cell_annotation on the annotation "
-                "whose cell-id set defines the authoritative universe."
-            )
-        if len(universes) > 1:
-            raise ValueError(
-                f"Multiple cell annotations are marked is_universe=True "
-                f"({universes}); pass annotation=<name> to disambiguate."
-            )
-        return universes[0]
+        return resolve_universe_annotation(
+            self._cell_annotations,
+            annotation,
+            noun="cell annotation",
+            register_method="add_cell_annotation",
+        )
 
     def cell_annotation_data_cols(self) -> dict[str, list[str]]:
         """Data columns (non-key) for each registered cell annotation.
@@ -496,16 +504,6 @@ class SynapseTable:
 
     # ── internal helpers ───────────────────────────────────────────────────
 
-    def _validate_join_key_unique(self, lf: pl.LazyFrame, key_col: str) -> None:
-        """Raise ValueError if key_col has duplicate values in lf."""
-        n_total = lf.select(pl.len()).collect().item()
-        n_unique = lf.select(pl.col(key_col).n_unique()).collect().item()
-        if n_total != n_unique:
-            raise ValueError(
-                f"Annotation join key {key_col!r} has {n_total - n_unique} duplicate "
-                f"value(s); each id must appear at most once to avoid expanding synapse rows."
-            )
-
     # ── synapse annotations ────────────────────────────────────────────────
 
     def add_synapse_annotation(
@@ -532,7 +530,7 @@ class SynapseTable:
         lf = _to_lazy(df)
         for col in position_cols or []:
             lf = _auto_pack(lf, col)
-        self._validate_join_key_unique(lf, self._id_col)
+        validate_unique_key(lf, self._id_col)
         data_cols = [c for c in lf.collect_schema().names() if c != self._id_col]
         collisions = set(data_cols) & self._current_columns()
         if collisions:
@@ -558,7 +556,6 @@ class SynapseTable:
         join_on_alias: str | None = None,
         alias_col: str | None = None,
         alias_name: str | None = None,
-        position_cols: list[str] | str | None = None,
         position_col: str | None = None,
         is_universe: bool = False,
     ) -> SynapseTable:
@@ -587,16 +584,16 @@ class SynapseTable:
         alias_name : str or None, optional
             Name under which to register the alias. Defaults to the annotation
             name. Only used when alias_col is also provided.
-        position_cols : list[str] or str or None, optional
-            Column name prefix(es) to auto-pack from split x/y/z format into a
-            position struct. E.g. "soma_pt_position" or ["soma_pt_position"] will
-            pack soma_pt_position_x/y/z into a struct named soma_pt_position.
         position_col : str or None, optional
             Name of a data column in this annotation that carries the cell's
-            position as a struct with x/y/z fields. Declaring this role lets
-            ``filter_by_soma_distance`` and ``add_spatial_features`` find it
-            without further configuration. The column must be packed (use
-            ``position_cols=`` above or call ``pack_position`` ahead of time).
+            position. May be either a struct with ``x`` / ``y`` / ``z`` fields
+            or a column name whose ``_x`` / ``_y`` / ``_z`` triplet is present
+            — in the latter case the triplet is auto-packed into a struct
+            named ``position_col``. Declaring this role lets spatial filters
+            (``filter_by_soma_distance``, ``add_spatial_features``) find the
+            position without further configuration. For more exotic packing
+            needs (multiple split columns in one annotation), pre-pack the
+            DataFrame with ``trajan.spatial.pack_position`` before passing.
         is_universe : bool, optional
             If True, this annotation's cell-id set is treated as the
             authoritative cell universe — the set of cells that *exist* for
@@ -617,12 +614,13 @@ class SynapseTable:
                 f"add_cell_annotation call. Registered aliases: "
                 f"{list(self._cell_aliases)}"
             )
-        if isinstance(position_cols, str):
-            position_cols = [position_cols]
         lf = _to_lazy(df)
-        for col in position_cols or []:
-            lf = _auto_pack(lf, col)
-        self._validate_join_key_unique(lf, cell_id_col)
+        # position_col auto-packs: if the named column isn't a struct yet but
+        # the split <name>_x/y/z triplet is present, pack it. Callers can then
+        # pass position_col=<name> regardless of how the input stores positions.
+        if position_col is not None:
+            lf = _auto_pack(lf, position_col)
+        validate_unique_key(lf, cell_id_col)
         data_cols = [c for c in lf.collect_schema().names() if c != cell_id_col]
         if position_col is not None and position_col not in data_cols:
             raise ValueError(
@@ -736,7 +734,6 @@ class SynapseTable:
         name: str,
         df,
         on: str,
-        position_cols: list[str] | str | None = None,
         position_col: str | None = None,
         is_universe: bool | None = None,
     ) -> SynapseTable:
@@ -755,14 +752,13 @@ class SynapseTable:
         on : str
             Column name to join on. Must exist in the already-registered annotation
             and must be unique in df.
-        position_cols : list[str] or str or None, optional
-            Column name prefix(es) to auto-pack from split x/y/z into a position
-            struct before registering.
         position_col : str or None, optional
             Declare a column being added by this extension as the annotation's
             position role. Overrides any previously declared ``position_col``
-            on this annotation. The column must be among the extension's data
-            columns (use ``position_cols=`` above to pack it if needed).
+            on this annotation. May be either a struct with ``x`` / ``y`` / ``z``
+            fields or a column whose ``_x`` / ``_y`` / ``_z`` triplet is present
+            in ``df`` (auto-packed into a struct named ``position_col``). For
+            exotic packing needs, pre-pack with ``trajan.spatial.pack_position``.
         is_universe : bool or None, optional
             If given, set the annotation's ``is_universe`` flag (True or
             False). ``None`` (default) leaves the existing flag unchanged.
@@ -774,8 +770,6 @@ class SynapseTable:
         """
         if name not in self._cell_annotations:
             raise KeyError(f"No cell annotation named {name!r}")
-        if isinstance(position_cols, str):
-            position_cols = [position_cols]
 
         existing = self._cell_annotations[name]
 
@@ -787,10 +781,10 @@ class SynapseTable:
             )
 
         new_lf = _to_lazy(df)
-        for col in position_cols or []:
-            new_lf = _auto_pack(new_lf, col)
+        if position_col is not None:
+            new_lf = _auto_pack(new_lf, position_col)
 
-        self._validate_join_key_unique(new_lf, on)
+        validate_unique_key(new_lf, on)
 
         extra_cols = [c for c in new_lf.collect_schema().names() if c != on]
         new_pre_post = {f"{c}_pre" for c in extra_cols} | {
@@ -873,7 +867,7 @@ class SynapseTable:
         lf = _to_lazy(df)
         for col in position_cols or []:
             lf = _auto_pack(lf, col)
-        self._validate_join_key_unique(lf, vertex_id_col)
+        validate_unique_key(lf, vertex_id_col)
         data_cols = [c for c in lf.collect_schema().names() if c != vertex_id_col]
         new_cols = set()
         if pre_vertex_col is not None:
@@ -905,54 +899,13 @@ class SynapseTable:
     def _classify_expression(self, expr: pl.Expr) -> str | None:
         """Classify an expression as 'pre', 'post', 'both', or None.
 
-        Inspects the root column names the expression references and checks
-        whether they are all pre-side cell annotation columns, all post-side,
-        a mix of both (but still exclusively cell annotation columns), or
-        contain any synapse/vertex-level columns.
-
-        Returns
-        -------
-        str or None
-            'pre', 'post', 'both', or None.
+        Thin wrapper over :func:`trajan._base.classify_by_cell_sides` that
+        threads in this table's currently registered cell annotations and
+        previously classified expressions.
         """
-        cell_pre: set[str] = set()
-        cell_post: set[str] = set()
-        for spec in self._cell_annotations.values():
-            cell_pre |= {f"{c}_pre" for c in spec.data_cols}
-            cell_post |= {f"{c}_post" for c in spec.data_cols}
-
-        root_names = expr.meta.root_names()
-        if not root_names:
-            return None
-
-        has_pre = False
-        has_post = False
-        for col_name in root_names:
-            if col_name in cell_pre:
-                has_pre = True
-            elif col_name in cell_post:
-                has_post = True
-            elif col_name in self._expression_sides:
-                side = self._expression_sides[col_name]
-                if side == "pre":
-                    has_pre = True
-                elif side == "post":
-                    has_post = True
-                elif side == "both":
-                    has_pre = True
-                    has_post = True
-                else:
-                    return None  # references a non-cell-level expression
-            else:
-                return None  # synapse or vertex column
-
-        if has_pre and not has_post:
-            return "pre"
-        if has_post and not has_pre:
-            return "post"
-        if has_pre and has_post:
-            return "both"
-        return None
+        return classify_by_cell_sides(
+            expr, self._cell_annotations, self._expression_sides
+        )
 
     def add_expression(self, name: str, expr: pl.Expr) -> SynapseTable:
         """Register a named computed column expression.
@@ -1134,20 +1087,13 @@ class SynapseTable:
         for spec in self._synapse_annotations.values():
             lf = lf.join(spec.lf, on=self._id_col, how="left")
 
-        for spec in self._cell_annotations.values():
-            if spec.join_on_alias is not None:
-                alias_col = self._cell_aliases[spec.join_on_alias][1]
-                pre_key = f"{alias_col}_pre"
-                post_key = f"{alias_col}_post"
-            else:
-                pre_key = self._pre_col
-                post_key = self._post_col
-            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
-            lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
-            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
-            lf = lf.join(
-                post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
-            )
+        lf = join_cell_annotations_symmetric(
+            lf,
+            self._cell_annotations,
+            pre_col=self._pre_col,
+            post_col=self._post_col,
+            aliases=self._cell_aliases,
+        )
 
         for spec in self._vertex_annotations.values():
             if spec.pre_vertex_col is not None:
@@ -1167,13 +1113,7 @@ class SynapseTable:
                     how="left",
                 )
 
-        for expr in self._expressions.values():
-            lf = lf.with_columns(expr)
-
-        for f in self._filters:
-            lf = lf.filter(f)
-
-        return lf
+        return apply_plan_tail(lf, self._expressions, self._filters)
 
     # ── df property (cached) ───────────────────────────────────────────────
 
@@ -1202,6 +1142,7 @@ class SynapseTable:
         new._weights = self._weights.copy()
         new._cell_aliases = self._cell_aliases.copy()
         new._filters = self._filters.copy()
+        new._filter_sides = self._filter_sides.copy()
         new.metadata = self.metadata.copy()
         new._cache = None
         new._n_syn_base = self._n_syn_base
@@ -1275,6 +1216,7 @@ class SynapseTable:
         new._weights = self._weights.copy()
         new.metadata = self.metadata.copy()
         new._filters = self._filters.copy() if keep_filters else []
+        new._filter_sides = self._filter_sides.copy() if keep_filters else []
         # carry only aliases whose source annotation is still present in the view
         new._cell_aliases = {
             alias_name: (ann_name, col)
@@ -1353,6 +1295,7 @@ class SynapseTable:
         """
         new = self._copy()
         new._filters = self._filters + [expr]
+        new._filter_sides = self._filter_sides + [self._classify_expression(expr)]
         return new
 
     def filter_by_soma_distance(
@@ -1543,14 +1486,7 @@ class SynapseTable:
 
         >>> st.filter_by_ids(pre_ids=excitatory_ids, post_ids=inhibitory_ids)
         """
-        if pre_ids is None and post_ids is None:
-            return self._copy()
-        new = self
-        if pre_ids is not None:
-            new = new.filter(pl.col(self._pre_col).is_in(list(pre_ids)))
-        if post_ids is not None:
-            new = new.filter(pl.col(self._post_col).is_in(list(post_ids)))
-        return new
+        return filter_by_id_sets(self, pre_ids, post_ids)
 
     def filter_by_min_synapses(
         self,
@@ -1639,18 +1575,35 @@ class SynapseTable:
         """
         if self._synapse_position_col is None:
             raise ValueError("synapse_position_col not set on this SynapseTable")
-        (xmin, ymin, zmin), (xmax, ymax, zmax) = bbox
-        col = pl.col(self._synapse_position_col)
-        return self.filter(
-            (col.struct.field("x") >= xmin)
-            & (col.struct.field("x") <= xmax)
-            & (col.struct.field("y") >= ymin)
-            & (col.struct.field("y") <= ymax)
-            & (col.struct.field("z") >= zmin)
-            & (col.struct.field("z") <= zmax)
-        )
+        return self.filter(bbox_predicate(self._synapse_position_col, bbox))
 
     # ── edgelist ───────────────────────────────────────────────────────────
+
+    def _build_agg_exprs(self, agg: dict[str, pl.Expr] | None) -> list[pl.Expr]:
+        """Build the aggregation expr list shared by edgelist / type_edgelist.
+
+        Prepends the auto ``n_syn`` count and the per-weight sums, then appends
+        the caller's ``agg`` entries. Guards against name collisions: a user
+        ``agg`` key (or a weight) that shadows ``n_syn`` or another weight would
+        otherwise raise a cryptic polars DuplicateError or silently overwrite a
+        column — here it raises a clear, actionable error instead.
+        """
+        if "n_syn" in self._weights:
+            raise ValueError(
+                "A weight column named 'n_syn' conflicts with the synapse count "
+                "that edgelist()/type_edgelist() generate. Rename the weight."
+            )
+        if agg:
+            reject_reserved_names(
+                agg.keys(),
+                {"n_syn", *self._weights},
+                context="edgelist()/type_edgelist() agg",
+            )
+        agg_exprs = [pl.len().alias("n_syn")]
+        agg_exprs.extend(pl.sum(w).alias(w) for w in self._weights)
+        if agg:
+            agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
+        return agg_exprs
 
     def edgelist(
         self,
@@ -1686,10 +1639,7 @@ class SynapseTable:
             cell annotations (with their roles and aliases) registered for
             symmetric join via ``el.df``.
         """
-        agg_exprs = [pl.len().alias("n_syn")]
-        agg_exprs.extend(pl.sum(w).alias(w) for w in self._weights)
-        if agg:
-            agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
+        agg_exprs = self._build_agg_exprs(agg)
 
         pair_df = (
             self.build_lazy()
@@ -1713,7 +1663,7 @@ class SynapseTable:
             el.add_annotation(
                 ann_name,
                 spec.lf,
-                entity_id_col=spec.cell_id_col,
+                cell_id_col=spec.cell_id_col,
                 position_col=spec.position_col,
                 is_universe=spec.is_universe,
                 join_on_alias=spec.join_on_alias,
@@ -1763,10 +1713,7 @@ class SynapseTable:
             else:
                 post_col = pre_col
 
-        agg_exprs = [pl.len().alias("n_syn")]
-        agg_exprs.extend(pl.sum(w).alias(w) for w in self._weights)
-        if agg:
-            agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
+        agg_exprs = self._build_agg_exprs(agg)
 
         pair_df = (
             self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
@@ -1803,6 +1750,7 @@ class SynapseTable:
             "synapse_position_col": self._synapse_position_col,
             "weights": self._weights,
             "filters": [f.meta.serialize(format="json") for f in self._filters],
+            "filter_sides": list(self._filter_sides),
             "expressions": {
                 name: base64.b64encode(expr.meta.serialize(format="binary")).decode(
                     "ascii"
@@ -1928,8 +1876,14 @@ class SynapseTable:
             st.add_expression(name, expr)
         for col in config.get("weights", []):
             st.add_weight(col)
-        for f_json in config["filters"]:
+        # Use saved filter_sides when present (post-Universe+Scope refactor);
+        # fall back to live reclassification for older folios. Both paths yield
+        # the same classification given the order annotations are restored above.
+        saved_sides = config.get("filter_sides")
+        for i, f_json in enumerate(config["filters"]):
             st = st.filter(pl.Expr.deserialize(f_json.encode(), format="json"))
+            if saved_sides is not None and i < len(saved_sides):
+                st._filter_sides[-1] = saved_sides[i]
         _internal = {"created_at", "updated_at", "_datafolio"}
         st.metadata = {k: v for k, v in folio.metadata.items() if k not in _internal}
         return st

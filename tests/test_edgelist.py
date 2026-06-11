@@ -114,7 +114,7 @@ def el_with_positions(pair_frame):
     )
     pos_packed = pack_position(pos, "soma", x="soma_x", y="soma_y", z="soma_z")
     el = EdgeList(pair_frame, pre_col="pre", post_col="post")
-    el.add_annotation("pos", pos_packed, entity_id_col="cid", position_col="soma")
+    el.add_annotation("pos", pos_packed, cell_id_col="cid", position_col="soma")
     return el
 
 
@@ -146,8 +146,8 @@ def test_filter_by_soma_distance_ambiguous_raises(pair_frame):
     a_packed = pack_position(pos1, "a", x="a_x", y="a_y", z="a_z")
     b_packed = pack_position(pos2, "b", x="b_x", y="b_y", z="b_z")
     el = EdgeList(pair_frame, pre_col="pre", post_col="post")
-    el.add_annotation("a", a_packed, entity_id_col="cid", position_col="a")
-    el.add_annotation("b", b_packed, entity_id_col="cid", position_col="b")
+    el.add_annotation("a", a_packed, cell_id_col="cid", position_col="a")
+    el.add_annotation("b", b_packed, cell_id_col="cid", position_col="b")
     with pytest.raises(ValueError, match="Multiple annotations carry positions"):
         el.filter_by_soma_distance(100.0)
     # disambiguating works
@@ -185,7 +185,7 @@ def test_aggregate_to_type_both_sides(el):
             "type": ["exc", "exc", "inh", "exc", "inh"],
         }
     )
-    el.add_annotation("types", types, entity_id_col="cid")
+    el.add_annotation("types", types, cell_id_col="cid")
     ct = el.aggregate_to_type(pre="type_pre", post="type_post")
     assert isinstance(ct, ConnectivityTable)
     assert not isinstance(ct, EdgeList)
@@ -214,7 +214,7 @@ def test_aggregate_to_type_requires_weight(pair_frame):
     df = pl.DataFrame({"pre": [1], "post": [2], "strength": [0.5]})
     el = EdgeList(df, pre_col="pre", post_col="post")  # no n_syn → no auto weight
     types = pl.DataFrame({"cid": [1, 2], "t": ["a", "b"]})
-    el.add_annotation("types", types, entity_id_col="cid")
+    el.add_annotation("types", types, cell_id_col="cid")
     with pytest.raises(ValueError, match="weight"):
         el.aggregate_to_type(pre="t_pre", post="t_post")
 
@@ -265,7 +265,7 @@ def test_edgelist_save_load_preserves_annotations_and_filter(el, tmp_path):
     types = pl.DataFrame(
         {"cid": [1, 2, 3, 10, 11], "cell_type": ["a", "b", "c", "d", "e"]}
     )
-    el.add_annotation("types", types, entity_id_col="cid")
+    el.add_annotation("types", types, cell_id_col="cid")
     filtered = el.filter(pl.col("n_syn") >= 3)
 
     folio = datafolio.DataFolio(str(tmp_path / "folio"))
@@ -291,3 +291,26 @@ def test_edgelist_cell_specific_ops_after_load(el, tmp_path):
     out = loaded.filter_by_ids(pre_ids=[1])
     assert isinstance(out, EdgeList)
     assert set(out.df["pre"].to_list()) == {1}
+
+
+# ── filter side-classification (Liskov: behavior inherited from CT) ──────────
+
+
+def test_filter_sides_on_edgelist(el):
+    """EdgeList inherits filter side-classification from ConnectivityTable;
+    cell-side filters are tracked, weight filters classify as None."""
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "kind": list("abcde")})
+    el.add_annotation("types", types, cell_id_col="cid")
+    f = el.filter(pl.col("kind_pre") == "a").filter(pl.col("n_syn") >= 2)
+    assert f.filter_sides == ["pre", None]
+
+
+def test_filter_sides_round_trip_edgelist(el, tmp_path):
+    """Saved EdgeList preserves filter_sides through load."""
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "kind": list("abcde")})
+    el.add_annotation("types", types, cell_id_col="cid")
+    filtered = el.filter(pl.col("kind_post") == "b").filter(pl.col("n_syn") > 0)
+    folio = tmp_path / "folio"
+    filtered.save(str(folio))
+    loaded = EdgeList.load(str(folio))
+    assert loaded.filter_sides == filtered.filter_sides == ["post", None]

@@ -14,3 +14,21 @@
   --md-default-bg-color--lightest: #fefcff;
   --md-code-bg-color: #ede8f5;
 }
+
+/* Mermaid in dark mode: the node boxes carry their own (light) fills via
+   classDef, but the connector lines and edge labels inherit from the theme.
+   Material's defaults leave them low-contrast on the slate background, so
+   drive them from the dark scheme's own fg/bg variables. */
+[data-md-color-scheme="slate"] {
+  --md-mermaid-edge-color: #b39ddb;
+  --md-mermaid-label-bg-color: var(--md-default-bg-color);
+  --md-mermaid-label-fg-color: var(--md-default-fg-color);
+}
+
+/* Edge labels and node labels share --md-mermaid-label-fg-color, but the nodes
+   keep their own light fills (via classDef) in both schemes — so their text
+   must stay dark. The extra scheme selector outranks Material's .nodeLabel rule
+   without !important; color cascades to the <b>/<small> children. */
+[data-md-color-scheme="slate"] .mermaid .nodeLabel {
+  color: #21163a;
+}

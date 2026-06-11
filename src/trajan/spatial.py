@@ -203,6 +203,41 @@ def pack_all_positions(
     return df
 
 
+def bbox_predicate(col: str, bbox) -> pl.Expr:
+    """Boolean expression: position struct ``col`` lies within ``bbox``.
+
+    ``bbox`` is ``((xmin, ymin, zmin), (xmax, ymax, zmax))``; ``col`` must be a
+    struct column with ``x`` / ``y`` / ``z`` fields (see :func:`pack_position`).
+
+    Single source of truth for bounding-box containment, shared by the
+    ``filter_by_bbox`` methods on ``SynapseTable`` (one synapse position) and
+    ``EdgeList`` / ``PairUniverse`` (applied to each soma position and ANDed).
+
+    Parameters
+    ----------
+    col : str
+        Name of the position struct column to test.
+    bbox : Sequence
+        ``((xmin, ymin, zmin), (xmax, ymax, zmax))``.
+
+    Returns
+    -------
+    pl.Expr
+        Element-wise boolean: True where the point is inside the box
+        (inclusive on all faces).
+    """
+    (xmin, ymin, zmin), (xmax, ymax, zmax) = bbox
+    p = pl.col(col)
+    return (
+        (p.struct.field("x") >= xmin)
+        & (p.struct.field("x") <= xmax)
+        & (p.struct.field("y") >= ymin)
+        & (p.struct.field("y") <= ymax)
+        & (p.struct.field("z") >= zmin)
+        & (p.struct.field("z") <= zmax)
+    )
+
+
 def _sq_distance_expr(col_a: str, col_b: str, axes: tuple[str, ...]) -> pl.Expr:
     a, b = pl.col(col_a), pl.col(col_b)
     terms = [(a.struct.field(ax) - b.struct.field(ax)).pow(2) for ax in axes]

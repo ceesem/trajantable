@@ -28,7 +28,18 @@ from typing import Union
 
 import polars as pl
 
-from ._base import CellAnnotationSpec, _as_folio, _to_lazy
+from ._base import (
+    CellAnnotationSpec,
+    _AnnotationProxy,
+    _as_folio,
+    _to_lazy,
+    build_cell_annotation_spec,
+    build_pair_plan,
+    classify_by_cell_sides,
+    resolve_position_annotation,
+    resolve_universe_annotation,
+    unique_name,
+)
 
 
 class ConnectivityTable:
@@ -54,6 +65,23 @@ class ConnectivityTable:
     ``add_annotation`` takes a per-entity table and joins it symmetrically on
     both pre and post entity columns, producing ``{col}_pre`` / ``{col}_post``
     outputs analogous to ``SynapseTable.add_cell_annotation``.
+
+    How ``.df`` is assembled
+    ------------------------
+    ``.df`` is built lazily by ``build_lazy()`` and cached:
+
+    1. Start from the base pair table (``pairs`` / ``pairs_lazy``).
+    2. Join each registered annotation symmetrically on ``pre_col`` /
+       ``post_col`` — each data column ``c`` produces ``c_pre`` and ``c_post``.
+       (``EdgeList`` additionally supports alias-keyed joins; see its docs.)
+    3. Apply each registered expression via ``with_columns`` (in order).
+    4. Apply each accumulated filter via ``filter`` (in order).
+
+    To inspect any single piece:
+
+    - ``ct.pairs`` — base pair DataFrame (step 1 only)
+    - ``ct.annotations[name]`` — a specific annotation frame
+    - ``ct.build_lazy()`` — full plan as a ``pl.LazyFrame`` (no collect)
     """
 
     # ``__type__`` marker written into saved config so ``load`` can dispatch
@@ -96,10 +124,19 @@ class ConnectivityTable:
         # ConnectivityTable is a cell or a label, indistinguishable from the
         # table's perspective. join_on_alias is always None here (aliasing is a
         # SynapseTable-level feature).
-        self._annotations: dict[str, CellAnnotationSpec] = {}
+        self._cell_annotations: dict[str, CellAnnotationSpec] = {}
 
         self._filters: list[pl.Expr] = []
+        # Parallel to _filters: cell-side classification ('pre' / 'post' /
+        # 'both' / None) captured at filter() time. Drives cells() and
+        # possible_pairs() side-decomposed projection.
+        self._filter_sides: list[str | None] = []
         self._expressions: dict[str, pl.Expr] = {}
+        # Parallel to _expressions: cell-side classification of each named
+        # expression, so a filter referencing an expression column inherits the
+        # expression's side (matching SynapseTable). Drives the same
+        # side-decomposed projection in cells() / possible_pairs().
+        self._expression_sides: dict[str, str | None] = {}
         self._cache: pl.DataFrame | None = None
 
     # ── read-only accessors ────────────────────────────────────────────────
@@ -119,7 +156,76 @@ class ConnectivityTable:
 
     @property
     def annotation_names(self) -> list[str]:
-        return list(self._annotations)
+        return list(self._cell_annotations)
+
+    def annotation_data_cols(self) -> dict[str, list[str]]:
+        """Data columns (non-key) for each registered annotation.
+
+        Returns a fresh dict mapping annotation name to a fresh list of data
+        column names. Mirrors ``SynapseTable.cell_annotation_data_cols`` so
+        free-function consumers (stats, viz, exporters) can enumerate
+        annotation columns without reaching into private storage.
+        """
+        return {
+            name: list(spec.data_cols) for name, spec in self._cell_annotations.items()
+        }
+
+    def info(self) -> str:
+        """Summarize the table structure: core columns, annotations, weights.
+
+        Mirrors ``SynapseTable.info()`` for the pair-level tier. Prints and
+        returns a human-readable string showing pre/post id columns, every
+        registered annotation (with the universe / position role tags), any
+        named expressions, weight columns, and the number of accumulated
+        filters.
+        """
+        lines: list[str] = []
+        if self._cache is not None:
+            n = len(self._cache)
+        elif not self._filters:
+            n = self._pair_lf.select(pl.len()).collect().item()
+        else:
+            n = self.build_lazy().select(pl.len()).collect().item()
+        lines.append(
+            f"{type(self).__name__}  ({n:,} pairs, {len(self._filters)} filter(s))"
+        )
+        lines.append("")
+        lines.append("Core columns")
+        lines.append(f"  pre_col            : {self._pre_col}")
+        lines.append(f"  post_col           : {self._post_col}")
+        if self._cell_annotations:
+            lines.append("")
+            lines.append(f"Annotations ({len(self._cell_annotations)})")
+            for name, spec in self._cell_annotations.items():
+                role_tags = []
+                if spec.is_universe:
+                    role_tags.append("universe")
+                if spec.position_col is not None:
+                    role_tags.append(f"position={spec.position_col!r}")
+                join_info = (
+                    f"join on alias {spec.join_on_alias!r}"
+                    if spec.join_on_alias
+                    else f"join on {spec.cell_id_col!r}"
+                )
+                role_str = f"  [{', '.join(role_tags)}]" if role_tags else ""
+                lines.append(
+                    f"  {name!r} ({len(spec.data_cols)} col(s), {join_info}){role_str}"
+                )
+                for c in spec.data_cols:
+                    lines.append(f"    {c}  ->  {c}_pre, {c}_post")
+        if self._expressions:
+            lines.append("")
+            lines.append(f"Expressions ({len(self._expressions)})")
+            for name in self._expressions:
+                lines.append(f"  {name}")
+        if self._weights:
+            lines.append("")
+            lines.append(f"Weights ({len(self._weights)})")
+            for w in self._weights:
+                lines.append(f"  {w}")
+        result = "\n".join(lines)
+        print(result)
+        return result
 
     def __repr__(self) -> str:
         if self._cache is not None:
@@ -129,11 +235,24 @@ class ConnectivityTable:
         else:
             n = "uncached"
         return (
-            f"ConnectivityTable(n_pairs={n}, "
+            f"{type(self).__name__}(n_pairs={n}, "
             f"pre_col={self._pre_col!r}, post_col={self._post_col!r}, "
             f"weights={self._weights}, "
-            f"annotations={list(self._annotations)})"
+            f"annotations={list(self._cell_annotations)})"
         )
+
+    def __len__(self) -> int:
+        """Number of pairs after filters; collects lazily if needed."""
+        if self._cache is not None:
+            return len(self._cache)
+        if not self._filters:
+            return self._pair_lf.select(pl.len()).collect().item()
+        return self.build_lazy().select(pl.len()).collect().item()
+
+    def __bool__(self) -> bool:
+        # Always truthy: prevents `if ct:` from implicitly forcing a collect
+        # via __len__. Use `len(ct) > 0` for the row-count check.
+        return True
 
     # ── registration: annotation / weight / expression / filter ────────────
 
@@ -141,7 +260,7 @@ class ConnectivityTable:
         self,
         name: str,
         df,
-        entity_id_col: str,
+        cell_id_col: str,
         position_col: str | None = None,
         is_universe: bool = False,
     ) -> ConnectivityTable:
@@ -156,11 +275,15 @@ class ConnectivityTable:
         name : str
             Identifier for this annotation.
         df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
-            Annotation frame. Must contain ``entity_id_col`` plus one or more
-            data columns. Each ``entity_id_col`` value must be unique.
-        entity_id_col : str
+            Annotation frame. Must contain ``cell_id_col`` plus one or more
+            data columns. Each ``cell_id_col`` value must be unique.
+        cell_id_col : str
             Column in ``df`` whose values are joined against both ``pre_col``
-            and ``post_col``.
+            and ``post_col``. Named ``cell_id_col`` rather than
+            ``entity_id_col`` for consistency with ``SynapseTable`` and
+            ``EdgeList`` — even on a plain ``ConnectivityTable`` where rows
+            could be cell-type labels rather than cells, the kwarg name stays
+            the same so user code is portable across tiers.
         position_col : str or None, optional
             Name of a data column carrying the entity's position as a struct
             with ``x`` / ``y`` / ``z`` fields. Declaring this role lets
@@ -174,39 +297,13 @@ class ConnectivityTable:
             exactly one annotation is marked universe; pass the annotation
             name explicitly otherwise. See ``CellAnnotationSpec.is_universe``.
         """
-        lf = _to_lazy(df)
-        schema = lf.collect_schema().names()
-        if entity_id_col not in schema:
-            raise ValueError(
-                f"entity_id_col {entity_id_col!r} not found in annotation. "
-                f"Available: {schema}"
-            )
-        n_total = lf.select(pl.len()).collect().item()
-        n_unique = lf.select(pl.col(entity_id_col).n_unique()).collect().item()
-        if n_total != n_unique:
-            raise ValueError(
-                f"Annotation key {entity_id_col!r} has {n_total - n_unique} "
-                "duplicate value(s); each entity id must appear at most once."
-            )
-
-        data_cols = [c for c in schema if c != entity_id_col]
-        if position_col is not None and position_col not in data_cols:
-            raise ValueError(
-                f"position_col {position_col!r} not found in annotation data "
-                f"columns. Available: {data_cols}"
-            )
-        new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
-        collisions = new_cols & self._current_columns()
-        if collisions:
-            raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-
-        self._annotations[name] = CellAnnotationSpec(
-            lf=lf,
-            cell_id_col=entity_id_col,
-            join_on_alias=None,
-            data_cols=data_cols,
+        self._cell_annotations[name] = build_cell_annotation_spec(
+            df,
+            cell_id_col=cell_id_col,
             position_col=position_col,
             is_universe=is_universe,
+            join_on_alias=None,
+            current_columns=self._current_columns(),
         )
         self._cache = None
         return self
@@ -214,79 +311,25 @@ class ConnectivityTable:
     # ── role resolvers (used by spatial filters and universe-aware stats) ──
 
     def _resolve_position_annotation(self, annotation: str | None = None) -> str:
-        """Return the name of the annotation whose ``position_col`` we should use.
+        """Return the name of the annotation whose ``position_col`` to use.
 
-        If ``annotation`` is given, validate that it's registered and has a
-        ``position_col`` set. Otherwise: find the unique annotation with a
-        ``position_col``; error on zero matches or ambiguity.
+        Delegates to :func:`trajan._base.resolve_position_annotation`; see
+        there for the auto-resolution contract.
         """
-        if annotation is not None:
-            if annotation not in self._annotations:
-                raise KeyError(
-                    f"No annotation named {annotation!r}. "
-                    f"Registered: {list(self._annotations)}"
-                )
-            if self._annotations[annotation].position_col is None:
-                raise ValueError(
-                    f"Annotation {annotation!r} has no position_col declared. "
-                    f"Re-register with add_annotation(..., position_col=<col>)."
-                )
-            return annotation
-
-        with_pos = [
-            n for n, spec in self._annotations.items() if spec.position_col is not None
-        ]
-        if not with_pos:
-            raise ValueError(
-                "No annotation with a position_col is registered. "
-                "Pass position_col=<col> to add_annotation when registering "
-                "the annotation that carries positions."
-            )
-        if len(with_pos) > 1:
-            raise ValueError(
-                f"Multiple annotations carry positions ({with_pos}); "
-                "pass annotation=<name> to disambiguate."
-            )
-        return with_pos[0]
+        return resolve_position_annotation(self._cell_annotations, annotation)
 
     def _resolve_universe_annotation(self, annotation: str | None = None) -> str:
-        """Return the name of the annotation that defines the cell universe.
+        """Return the name of the annotation that defines the entity universe.
 
-        If ``annotation`` is given, validate that it's registered and has
-        ``is_universe=True``. Otherwise: find the unique annotation marked
-        universe; error on zero matches or ambiguity.
+        Delegates to :func:`trajan._base.resolve_universe_annotation`; see
+        there for the auto-resolution contract.
         """
-        if annotation is not None:
-            if annotation not in self._annotations:
-                raise KeyError(
-                    f"No annotation named {annotation!r}. "
-                    f"Registered: {list(self._annotations)}"
-                )
-            if not self._annotations[annotation].is_universe:
-                raise ValueError(
-                    f"Annotation {annotation!r} is not marked is_universe=True. "
-                    f"Re-register with add_annotation(..., is_universe=True)."
-                )
-            return annotation
-
-        universes = [n for n, spec in self._annotations.items() if spec.is_universe]
-        if not universes:
-            raise ValueError(
-                "No annotation is marked is_universe=True. Pass is_universe=True "
-                "to add_annotation on the annotation whose entity-id set defines "
-                "the authoritative universe."
-            )
-        if len(universes) > 1:
-            raise ValueError(
-                f"Multiple annotations are marked is_universe=True ({universes}); "
-                "pass annotation=<name> to disambiguate."
-            )
-        return universes[0]
+        return resolve_universe_annotation(self._cell_annotations, annotation)
 
     def remove_annotation(self, name: str) -> ConnectivityTable:
-        if name not in self._annotations:
+        if name not in self._cell_annotations:
             raise KeyError(f"No annotation named {name!r}")
-        del self._annotations[name]
+        del self._cell_annotations[name]
         self._cache = None
         return self
 
@@ -327,6 +370,7 @@ class ConnectivityTable:
         if name in self._current_columns():
             raise ValueError(f"Column {name!r} already exists in the table")
         self._expressions[name] = expr.alias(name)
+        self._expression_sides[name] = self._classify_expression(expr)
         self._cache = None
         return self
 
@@ -334,13 +378,37 @@ class ConnectivityTable:
         """Return a new ConnectivityTable with ``expr`` applied to the lazy plan."""
         new = self._copy()
         new._filters = self._filters + [expr]
+        new._filter_sides = self._filter_sides + [self._classify_expression(expr)]
         return new
+
+    def _classify_expression(self, expr: pl.Expr) -> str | None:
+        """Classify ``expr`` as 'pre', 'post', 'both', or None.
+
+        Thin wrapper over :func:`trajan._base.classify_by_cell_sides` that
+        threads in this table's currently registered cell annotations and
+        previously classified expressions, so a filter referencing an
+        expression-derived cell column classifies on the same side it would on
+        a ``SynapseTable``.
+        """
+        return classify_by_cell_sides(
+            expr, self._cell_annotations, self._expression_sides
+        )
+
+    @property
+    def filter_sides(self) -> list[str | None]:
+        """Cell-side classification of each accumulated filter.
+
+        See :attr:`SynapseTable.filter_sides`; same contract — one entry per
+        filter in ``_filters``, captured at ``filter()`` time, and used by
+        ``cells()`` / ``possible_pairs()`` for side-decomposed projection.
+        """
+        return list(self._filter_sides)
 
     # ── plan construction ──────────────────────────────────────────────────
 
     def _current_columns(self) -> set[str]:
         cols = set(self._pair_col_names)
-        for spec in self._annotations.values():
+        for spec in self._cell_annotations.values():
             cols |= {f"{c}_pre" for c in spec.data_cols}
             cols |= {f"{c}_post" for c in spec.data_cols}
         cols |= set(self._expressions)
@@ -348,27 +416,14 @@ class ConnectivityTable:
 
     def build_lazy(self) -> pl.LazyFrame:
         """Construct (without collecting) the annotated + filtered lazy plan."""
-        lf = self._pair_lf
-        for spec in self._annotations.values():
-            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
-            lf = lf.join(
-                pre_lf,
-                left_on=self._pre_col,
-                right_on=spec.cell_id_col,
-                how="left",
-            )
-            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
-            lf = lf.join(
-                post_lf,
-                left_on=self._post_col,
-                right_on=spec.cell_id_col,
-                how="left",
-            )
-        for expr in self._expressions.values():
-            lf = lf.with_columns(expr)
-        for f in self._filters:
-            lf = lf.filter(f)
-        return lf
+        return build_pair_plan(
+            self._pair_lf,
+            self._cell_annotations,
+            pre_col=self._pre_col,
+            post_col=self._post_col,
+            expressions=self._expressions,
+            filters=self._filters,
+        )
 
     @property
     def df(self) -> pl.DataFrame:
@@ -376,6 +431,29 @@ class ConnectivityTable:
         if self._cache is None:
             self._cache = self.build_lazy().collect()
         return self._cache
+
+    @property
+    def pairs(self) -> pl.DataFrame:
+        """Base pair table — no annotations joined, no filters, no expressions.
+
+        For the fully merged + filtered + computed table use ``.df``. To
+        inspect an individual annotation, use ``annotations[name]``.
+        """
+        return self._pair_lf.collect()
+
+    @property
+    def pairs_lazy(self) -> pl.LazyFrame:
+        """Lazy view of the base pair table — for building custom plans."""
+        return self._pair_lf
+
+    @property
+    def annotations(self) -> _AnnotationProxy:
+        """Read-only view over registered per-entity annotations.
+
+        ``ct.annotations["name"]`` returns the annotation as a collected
+        ``pl.DataFrame``. Supports ``in``, iteration, and ``len``.
+        """
+        return _AnnotationProxy(self._cell_annotations)
 
     # ── copy ───────────────────────────────────────────────────────────────
 
@@ -386,9 +464,11 @@ class ConnectivityTable:
         new._pre_col = self._pre_col
         new._post_col = self._post_col
         new._weights = self._weights.copy()
-        new._annotations = self._annotations.copy()
+        new._cell_annotations = self._cell_annotations.copy()
         new._filters = self._filters.copy()
+        new._filter_sides = self._filter_sides.copy()
         new._expressions = self._expressions.copy()
+        new._expression_sides = self._expression_sides.copy()
         new._cache = None
         return new
 
@@ -458,15 +538,24 @@ class ConnectivityTable:
             raise ValueError(f"values={values!r} not found in table.")
         if total_col is not None and total_col not in self._current_columns():
             raise ValueError(f"total_col={total_col!r} not found in table.")
+        if "fraction" in self._current_columns() and values != "fraction":
+            raise ValueError(
+                "normalize() writes a 'fraction' column, but one already exists. "
+                "Rename the existing column first."
+            )
 
         lf = self.build_lazy()
 
         if total_col is None:
-            totals = lf.group_by(group_col).agg(pl.sum(values).alias("__total__"))
+            # Unique internal name so a user column literally named __total__
+            # can't shadow the computed per-axis sum (which would silently
+            # produce wrong fractions).
+            total_name = unique_name("__total__", self._current_columns())
+            totals = lf.group_by(group_col).agg(pl.sum(values).alias(total_name))
             normalized = (
                 lf.join(totals, on=group_col, how="left")
-                .with_columns((pl.col(values) / pl.col("__total__")).alias("fraction"))
-                .drop(["__total__", values])
+                .with_columns((pl.col(values) / pl.col(total_name)).alias("fraction"))
+                .drop([total_name, values])
             )
         else:
             normalized = lf.with_columns(
@@ -521,8 +610,9 @@ class ConnectivityTable:
         new._post_col = self._post_col
         new._weights = [w for w in self._weights if w != drop_weight]
         # Annotations and expressions are baked into new_lf; start empty.
-        new._annotations = {}
+        new._cell_annotations = {}
         new._filters = []
+        new._filter_sides = []
         new._expressions = {}
         new._cache = None
         return new
@@ -530,7 +620,11 @@ class ConnectivityTable:
     # ── materialization ────────────────────────────────────────────────────
 
     def to_dense(
-        self, values: str | None = None, fill_value: float = 0
+        self,
+        values: str | None = None,
+        fill_value: float = 0,
+        *,
+        aggregate: str = "error",
     ) -> pl.DataFrame:
         """Pivot into a dense pre × post matrix DataFrame.
 
@@ -541,6 +635,15 @@ class ConnectivityTable:
             weight.
         fill_value : float, optional
             Value for (pre, post) pairs absent from the plan.
+        aggregate : str, optional
+            How to collapse duplicate ``(pre, post)`` entries. ``"error"``
+            (default) raises if any duplicate pair exists — a well-formed
+            ConnectivityTable has one row per entity pair (``type_edgelist`` /
+            ``aggregate_to_type`` guarantee it), so a duplicate usually signals
+            a malformed hand-built table. Any other value is passed through to
+            polars as the pivot ``aggregate_function`` to combine duplicates
+            with that reducer — ``"sum"`` (natural for additive weights),
+            ``"mean"``, ``"max"``, ``"first"``, etc.
 
         Returns
         -------
@@ -550,17 +653,28 @@ class ConnectivityTable:
         values = self._resolve_values(values)
         if values not in self._current_columns():
             raise ValueError(f"values={values!r} not found in table.")
-        lf = self.build_lazy().select([self._pre_col, self._post_col, values])
-        return (
-            lf.collect()
-            .pivot(
-                on=self._post_col,
-                index=self._pre_col,
-                values=values,
-                aggregate_function="first",
-            )
-            .fill_null(fill_value)
-        )
+        df = self.build_lazy().select([self._pre_col, self._post_col, values]).collect()
+        # By default, refuse duplicate (pre, post) rows: the pivot would
+        # otherwise silently collapse them, producing a wrong matrix entry.
+        # Pass aggregate="sum" (or another reducer) to combine them on purpose.
+        if aggregate == "error":
+            n_dup = df.height - df.select([self._pre_col, self._post_col]).n_unique()
+            if n_dup:
+                raise ValueError(
+                    f"to_dense found {n_dup} duplicate (pre, post) pair(s); the "
+                    f"matrix entry would be ambiguous. Pass aggregate='sum' (or "
+                    f"'mean', 'max', ...) to combine them, or aggregate to one row "
+                    f"per pair first (e.g. .aggregate_to_type(...))."
+                )
+            agg_fn = "first"  # no duplicates reach the pivot
+        else:
+            agg_fn = aggregate
+        return df.pivot(
+            on=self._post_col,
+            index=self._pre_col,
+            values=values,
+            aggregate_function=agg_fn,
+        ).fill_null(fill_value)
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -587,6 +701,7 @@ class ConnectivityTable:
             "post_col": self._post_col,
             "weights": list(self._weights),
             "filters": [f.meta.serialize(format="json") for f in self._filters],
+            "filter_sides": list(self._filter_sides),
             "expressions": {
                 name: base64.b64encode(expr.meta.serialize(format="binary")).decode(
                     "ascii"
@@ -595,13 +710,13 @@ class ConnectivityTable:
             },
             "annotations": {
                 name: self._spec_to_config(spec)
-                for name, spec in self._annotations.items()
+                for name, spec in self._cell_annotations.items()
             },
             **self._extra_save_config(),
         }
         folio.add_json("config", config, overwrite=overwrite)
         folio.add_table("pairs", self._pair_lf.collect(), overwrite=overwrite)
-        for name, spec in self._annotations.items():
+        for name, spec in self._cell_annotations.items():
             folio.add_table(f"ann_{name}", spec.lf.collect(), overwrite=overwrite)
 
     def _spec_to_config(self, spec: CellAnnotationSpec) -> dict:
@@ -611,7 +726,7 @@ class ConnectivityTable:
         spec fields like ``join_on_alias``.
         """
         return {
-            "entity_id_col": spec.cell_id_col,
+            "cell_id_col": spec.cell_id_col,
             "data_cols": list(spec.data_cols),
             "position_col": spec.position_col,
             "is_universe": spec.is_universe,
@@ -670,7 +785,7 @@ class ConnectivityTable:
             instance.add_annotation(
                 name,
                 _lf(f"ann_{name}"),
-                entity_id_col=ann_meta["entity_id_col"],
+                cell_id_col=ann_meta["cell_id_col"],
                 position_col=ann_meta.get("position_col"),
                 is_universe=ann_meta.get("is_universe", False),
             )
@@ -696,9 +811,15 @@ class ConnectivityTable:
             instance.add_expression(name, expr)
 
         # Filters accumulate via .filter() which returns a new instance.
-        for f_json in config.get("filters", []):
+        # Use saved filter_sides when present; fall back to live reclassification
+        # for older folios. Both paths agree because annotations are restored
+        # before filters above.
+        saved_sides = config.get("filter_sides")
+        for i, f_json in enumerate(config.get("filters", [])):
             instance = instance.filter(
                 pl.Expr.deserialize(f_json.encode(), format="json")
             )
+            if saved_sides is not None and i < len(saved_sides):
+                instance._filter_sides[-1] = saved_sides[i]
 
         return instance

@@ -92,7 +92,7 @@ def test_add_annotation_symmetric_join(ct):
             "cell_type": ["exc", "exc", "inh", "exc", "inh"],
         }
     )
-    ct.add_annotation("types", ann, entity_id_col="entity_id")
+    ct.add_annotation("types", ann, cell_id_col="entity_id")
     result = ct.df
     assert "cell_type_pre" in result.columns
     assert "cell_type_post" in result.columns
@@ -103,13 +103,13 @@ def test_add_annotation_symmetric_join(ct):
 def test_add_annotation_duplicate_key_raises(ct):
     ann = pl.DataFrame({"eid": [1, 1, 2], "x": ["a", "b", "c"]})
     with pytest.raises(ValueError, match="duplicate"):
-        ct.add_annotation("bad", ann, entity_id_col="eid")
+        ct.add_annotation("bad", ann, cell_id_col="eid")
 
 
 def test_add_annotation_bad_entity_col_raises(ct):
     ann = pl.DataFrame({"eid": [1, 2], "x": ["a", "b"]})
-    with pytest.raises(ValueError, match="entity_id_col"):
-        ct.add_annotation("bad", ann, entity_id_col="nonexistent")
+    with pytest.raises(ValueError, match="cell_id_col"):
+        ct.add_annotation("bad", ann, cell_id_col="nonexistent")
 
 
 def test_add_annotation_column_collision_raises(ct):
@@ -117,9 +117,9 @@ def test_add_annotation_column_collision_raises(ct):
     column name raises on the second registration."""
     ann_first = pl.DataFrame({"eid": [1, 2, 3], "cell_type": ["a", "b", "c"]})
     ann_second = pl.DataFrame({"eid": [1, 2, 3], "cell_type": ["x", "y", "z"]})
-    ct.add_annotation("first", ann_first, entity_id_col="eid")
+    ct.add_annotation("first", ann_first, cell_id_col="eid")
     with pytest.raises(ValueError, match="already exist"):
-        ct.add_annotation("second", ann_second, entity_id_col="eid")
+        ct.add_annotation("second", ann_second, cell_id_col="eid")
 
 
 def test_reject_synapse_annotation(ct):
@@ -134,7 +134,7 @@ def test_reject_vertex_annotation(ct):
 
 def test_remove_annotation(ct):
     ann = pl.DataFrame({"eid": [1, 2, 3, 10, 11], "t": ["a", "b", "c", "d", "e"]})
-    ct.add_annotation("foo", ann, entity_id_col="eid")
+    ct.add_annotation("foo", ann, cell_id_col="eid")
     assert "foo" in ct.annotation_names
     ct.remove_annotation("foo")
     assert "foo" not in ct.annotation_names
@@ -320,7 +320,7 @@ def test_save_load_with_annotations(ct, tmp_path):
             "cell_type": ["exc", "exc", "inh", "exc", "inh"],
         }
     )
-    ct.add_annotation("types", ann, entity_id_col="entity_id")
+    ct.add_annotation("types", ann, cell_id_col="entity_id")
 
     folio = datafolio.DataFolio(str(tmp_path / "folio"))
     ct.save(folio)
@@ -386,13 +386,13 @@ def test_save_load_overwrite(ct, tmp_path):
 
 def test_is_universe_default_false(ct):
     types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
-    ct.add_annotation("types", types, entity_id_col="cid")
-    assert ct._annotations["types"].is_universe is False
+    ct.add_annotation("types", types, cell_id_col="cid")
+    assert ct._cell_annotations["types"].is_universe is False
 
 
 def test_resolve_universe_annotation_single(ct):
     cells = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
-    ct.add_annotation("cells", cells, entity_id_col="cid", is_universe=True)
+    ct.add_annotation("cells", cells, cell_id_col="cid", is_universe=True)
     assert ct._resolve_universe_annotation() == "cells"
 
 
@@ -404,8 +404,8 @@ def test_resolve_universe_annotation_zero_raises(ct):
 def test_resolve_universe_annotation_ambiguous_raises(ct):
     a = pl.DataFrame({"cid": [1, 2, 3], "ta": ["x"] * 3})
     b = pl.DataFrame({"cid": [10, 11], "tb": ["y"] * 2})
-    ct.add_annotation("a", a, entity_id_col="cid", is_universe=True)
-    ct.add_annotation("b", b, entity_id_col="cid", is_universe=True)
+    ct.add_annotation("a", a, cell_id_col="cid", is_universe=True)
+    ct.add_annotation("b", b, cell_id_col="cid", is_universe=True)
     with pytest.raises(ValueError, match="Multiple annotations are marked is_universe"):
         ct._resolve_universe_annotation()
     assert ct._resolve_universe_annotation("a") == "a"
@@ -413,16 +413,68 @@ def test_resolve_universe_annotation_ambiguous_raises(ct):
 
 def test_resolve_universe_annotation_named_not_universe_raises(ct):
     cells = pl.DataFrame({"cid": [1, 2], "t": ["x"] * 2})
-    ct.add_annotation("cells", cells, entity_id_col="cid")  # is_universe=False
+    ct.add_annotation("cells", cells, cell_id_col="cid")  # is_universe=False
     with pytest.raises(ValueError, match="not marked is_universe=True"):
         ct._resolve_universe_annotation("cells")
 
 
 def test_is_universe_persists_through_save_load(ct, tmp_path):
     cells = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a"] * 5})
-    ct.add_annotation("cells", cells, entity_id_col="cid", is_universe=True)
+    ct.add_annotation("cells", cells, cell_id_col="cid", is_universe=True)
     folio_path = tmp_path / "folio"
     ct.save(str(folio_path))
     loaded = ConnectivityTable.load(str(folio_path))
-    assert loaded._annotations["cells"].is_universe is True
+    assert loaded._cell_annotations["cells"].is_universe is True
     assert loaded._resolve_universe_annotation() == "cells"
+
+
+# ── filter side-classification (cross-tier consistency with SynapseTable) ────
+
+
+def test_filter_sides_classify_at_filter_time(ct):
+    """ConnectivityTable.filter() classifies each filter via the shared
+    classify_by_cell_sides helper, mirroring SynapseTable's behavior."""
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "kind": list("abcde")})
+    ct.add_annotation("types", types, cell_id_col="cid")
+    pre = ct.filter(pl.col("kind_pre") == "a")
+    assert pre.filter_sides == ["pre"]
+    both = pre.filter((pl.col("kind_pre") == "a") & (pl.col("kind_post") == "b"))
+    assert both.filter_sides == ["pre", "both"]
+    pair = both.filter(pl.col("n_syn") > 2)  # non-cell-level → None
+    assert pair.filter_sides == ["pre", "both", None]
+
+
+def test_filter_sides_persist_through_save_load(ct, tmp_path):
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "kind": list("abcde")})
+    ct.add_annotation("types", types, cell_id_col="cid")
+    filtered = ct.filter(pl.col("kind_pre") == "a").filter(pl.col("n_syn") >= 1)
+    folio = tmp_path / "folio"
+    filtered.save(str(folio))
+    loaded = ConnectivityTable.load(str(folio))
+    assert loaded.filter_sides == filtered.filter_sides == ["pre", None]
+
+
+# ── info() smoke test ────────────────────────────────────────────────────────
+
+
+def test_info_returns_summary_string(ct):
+    """info() mirrors SynapseTable.info(): runs without error, returns the
+    summary string, and includes the core column names."""
+    cells = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["A"] * 5})
+    ct.add_annotation("cells", cells, cell_id_col="cid", is_universe=True)
+    out = ct.info()
+    assert "pre_col" in out
+    assert "post_col" in out
+    assert "cells" in out
+    assert "universe" in out
+
+
+def test_annotation_data_cols_returns_dict(ct):
+    """annotation_data_cols() returns {name: [data_cols]} parallel to
+    SynapseTable.cell_annotation_data_cols()."""
+    cells = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "type": ["A"] * 5, "layer": [2] * 5}
+    )
+    ct.add_annotation("cells", cells, cell_id_col="cid")
+    data_cols = ct.annotation_data_cols()
+    assert data_cols == {"cells": ["type", "layer"]}
