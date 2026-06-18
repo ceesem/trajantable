@@ -24,6 +24,7 @@ import polars as pl
 
 from ._base import (
     CellAnnotationSpec,
+    _LazyBacked,
     build_cell_annotation_spec,
     build_pair_plan,
     classify_by_cell_sides,
@@ -38,7 +39,7 @@ if TYPE_CHECKING:
     from .synapse_table import SynapseTable
 
 
-class PairUniverse:
+class PairUniverse(_LazyBacked):
     """Lazy ``universe × universe`` pair frame with observed counts overlaid.
 
     Carries the same kinds of state as ``EdgeList`` — blessed pre / post id
@@ -303,30 +304,10 @@ class PairUniverse:
             )
         return df
 
-    def preview(self, n: int = 10) -> pl.DataFrame:
-        """Collect the first ``n`` rows of the pair frame without warning.
-
-        Pushes a ``head(n)`` limit into the lazy plan so only ``n`` rows are
-        materialized — the safe way to peek at a ``PairUniverse``'s schema or a
-        few rows without risking the full-cross-product collect that ``collect``
-        guards against. ``PairUniverse`` has no ``.df`` / cache, so nothing is
-        retained either way.
-
-        Parameters
-        ----------
-        n : int, optional
-            Number of rows to collect. Defaults to 10.
-        """
-        return self.build_lazy().head(n).collect()
-
-    def group_by(self, *args, **kwargs):
-        """Pass-through to ``self.build_lazy().group_by(*args, **kwargs)``.
-
-        Returns a ``pl.LazyGroupBy``; call ``.agg(...)`` to follow up. This
-        is the canonical way to materialize aggregates without ever
-        collecting the cross-product itself.
-        """
-        return self.build_lazy().group_by(*args, **kwargs)
+    # .lazy / .select / .group_by / .preview / .count / __len__ / __bool__ come
+    # from _LazyBacked (_base.py). PairUniverse intentionally has no .df cache
+    # (the cross-product can be enormous), so it overrides collect() above with
+    # a row-count warning instead of inheriting the caching _CachedTable surface.
 
     def to_edgelist(self) -> "EdgeList":
         """Collect the observed sub-frame as an ``EdgeList``.

@@ -60,6 +60,29 @@ def test_inherits_to_dense(el):
     assert mat.shape == (3, 3)  # 3 pre, 1 pre_col + 2 post columns
 
 
+# ── shared lazy/query surface (from _CachedTable / _LazyBacked) ────────────────
+
+
+def test_inherits_lazy_surface(el):
+    """The lazy escape hatches added to the base are available on EdgeList."""
+    assert isinstance(el.lazy, pl.LazyFrame)
+    assert isinstance(el.select(["pre"]), pl.LazyFrame)
+    from polars.lazyframe.group_by import LazyGroupBy
+
+    assert isinstance(el.group_by("pre"), LazyGroupBy)
+
+
+def test_inherits_count_and_len(el):
+    assert el.count() == len(el) == 5
+    assert el.filter(pl.col("pre") == 1).count() == 2
+
+
+def test_lazy_group_by_does_not_cache(el):
+    out = el.group_by("pre").agg(pl.col("n_syn").sum()).sort("pre").collect()
+    assert out["n_syn"].to_list() == [4, 6, 5]
+    assert el._cache is None  # escape hatch never materialized .df
+
+
 # ── filter preserves EdgeList type ───────────────────────────────────────────
 
 

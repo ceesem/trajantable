@@ -241,6 +241,22 @@ def test_group_by_aggregates_without_materializing(st):
     assert len(by_pre) == 5  # one row per pre cell
 
 
+def test_inherits_lazy_surface_from_base(st):
+    """PairUniverse gains .lazy / .select / .count / len() from _LazyBacked."""
+    pu = possible_pairs(st)
+    assert isinstance(pu.lazy, pl.LazyFrame)
+    assert isinstance(pu.select(["pre_pt_root_id"]), pl.LazyFrame)
+    # 5 cells, 5² − 5 = 20 ordered non-self pairs
+    assert pu.count() == len(pu) == 20
+
+
+def test_pair_universe_has_no_df_cache(st):
+    """PairUniverse extends _LazyBacked only — no caching .df surface."""
+    pu = possible_pairs(st)
+    assert not hasattr(pu, "df")
+    assert not hasattr(pu, "clear_cache")
+
+
 def test_to_edgelist_returns_observed_only(st):
     """to_edgelist() honors the EdgeList contract (observed connections only).
 

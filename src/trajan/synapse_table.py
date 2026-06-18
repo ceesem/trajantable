@@ -15,6 +15,7 @@ from ._base import (
     _AnnotationProxy,
     _as_folio,
     _auto_pack,
+    _CachedTable,
     _to_lazy,
     apply_plan_tail,
     classify_by_cell_sides,
@@ -84,7 +85,7 @@ def _bin_count_fields(
     return fields
 
 
-class SynapseTable:
+class SynapseTable(_CachedTable):
     """Synapse list with automatic pre/post cell annotation merging.
 
     Owns the synapse list → edgelist → connectivity matrix → normalized
@@ -363,11 +364,6 @@ class SynapseTable:
         if not self._filters:
             return self._n_syn_base
         return self.build_lazy().select(pl.len()).collect().item()
-
-    def __bool__(self) -> bool:
-        # Always truthy: prevents `if st:` from implicitly forcing a collect
-        # via __len__. Use `len(st) > 0` for the row-count check.
-        return True
 
     # ── annotation name lists and accessors ───────────────────────────────
 
@@ -1184,133 +1180,10 @@ class SynapseTable:
 
         return apply_plan_tail(lf, self._expressions, self._filters)
 
-    # ── df property (cached) ───────────────────────────────────────────────
-
-    @property
-    def lazy(self) -> pl.LazyFrame:
-        """The full annotated + filtered plan as a ``pl.LazyFrame`` (alias for
-        ``build_lazy()``).
-
-        Property form of :meth:`build_lazy`, mirroring Polars' own
-        ``DataFrame.lazy()`` hop. Use it to keep a chain lazy past the trajan
-        API and finish with your own Polars ops — only the final ``.collect()``
-        materializes, and projection/predicate pushdown avoids building the full
-        wide ``.df``::
-
-            st.filter(...).lazy.group_by("pss").len().collect()
-        """
-        return self.build_lazy()
-
-    def select(self, *args, **kwargs) -> pl.LazyFrame:
-        """Project columns from the plan, returning a **polars** ``LazyFrame``.
-
-        Pass-through to ``self.lazy.select(...)``. Unlike :meth:`filter` — which
-        keeps every column and so stays a ``SynapseTable`` — selecting changes
-        the column set, which would break the annotation / role / weight
-        contracts this object maintains. So this deliberately leaves trajan-land
-        and hands back a native polars ``LazyFrame``; finish with ``.collect()``.
-        Projection pushdown means only the chosen columns are ever materialized::
-
-            st.filter(...).select(["pss", "size"]).collect()
-        """
-        return self.lazy.select(*args, **kwargs)
-
-    def group_by(self, *args, **kwargs) -> pl.LazyGroupBy:
-        """Group the plan, returning a **polars** ``LazyGroupBy``.
-
-        Pass-through to ``self.lazy.group_by(...)`` — an escape into native
-        polars (grouping dissolves the per-synapse row contract). Finish with an
-        aggregation and ``.collect()``; only the referenced columns materialize::
-
-            st.filter(...).group_by("pss").len().collect()
-        """
-        return self.lazy.group_by(*args, **kwargs)
-
-    def count(self) -> int:
-        """Number of synapses after filters (equivalent to ``len(self)``).
-
-        Memory-cheap: returns the cached base count when unfiltered, otherwise a
-        bare ``select(pl.len())`` on the plan — it never materializes the merged
-        frame.
-        """
-        return len(self)
-
-    @property
-    def df(self) -> pl.DataFrame:
-        """Full merged synapse table with all registered annotations. Cached."""
-        if self._cache is None:
-            self._cache = self.build_lazy().collect()
-        return self._cache
-
-    def clear_cache(self) -> SynapseTable:
-        """Drop the materialized ``.df`` cache, releasing its memory.
-
-        The merged synapse frame can be large (millions of rows × every joined
-        annotation column), and ``.df`` pins it for the object's lifetime once
-        touched. Call this when you are done with a table you intend to keep a
-        reference to but no longer need materialized — the next ``.df`` access
-        rebuilds it lazily. A no-op when nothing is cached.
-
-        Returns
-        -------
-        SynapseTable
-            Returns self to allow method chaining.
-        """
-        self._cache = None
-        return self
-
-    def preview(self, n: int = 10) -> pl.DataFrame:
-        """Collect the first ``n`` rows of the merged table without caching.
-
-        Unlike ``.df.head(n)`` — which forces a full collect of every row and
-        pins it on ``self._cache`` — this pushes a ``head(n)`` limit into the
-        lazy plan, so only ``n`` rows are materialized and nothing is cached.
-        Use it to peek at the schema / a few rows of a large table cheaply.
-
-        Parameters
-        ----------
-        n : int, optional
-            Number of rows to collect. Defaults to 10.
-        """
-        return self.build_lazy().head(n).collect()
-
-    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
-        """Materialize the merged table, optionally projecting to ``cols``.
-
-        With ``cols=None`` this is just the cached ``.df``. With an explicit
-        column list, it selects those columns *before* collecting, so Polars'
-        projection pushdown skips materializing (and often skips joining) every
-        other annotation column. This is the memory-cheap path for plotting:
-        pull only the handful of columns a figure needs instead of the whole
-        wide frame. The narrow result is returned fresh and is **not** cached.
-
-        Parameters
-        ----------
-        cols : list[str] or str or None, optional
-            Columns to project. ``None`` (default) returns the full cached
-            ``.df``. A single string is treated as a one-element list.
-
-        Returns
-        -------
-        pl.DataFrame
-            The full cached frame (``cols=None``) or a fresh narrow projection.
-
-        Raises
-        ------
-        ValueError
-            If any requested column is not present in the merged table.
-        """
-        if cols is None:
-            return self.df
-        if isinstance(cols, str):
-            cols = [cols]
-        schema = self.build_lazy().collect_schema().names()
-        missing = [c for c in cols if c not in schema]
-        if missing:
-            raise ValueError(
-                f"Column(s) {missing} not found in table. Available: {schema}"
-            )
-        return self.build_lazy().select(cols).collect()
+    # The lazy/query surface (.lazy, .select, .group_by, .count, .df,
+    # .clear_cache, .preview, .collect, __len__ cache check, __bool__) lives on
+    # _CachedTable in _base.py. SynapseTable overrides only __len__ (above) for
+    # its unfiltered fast path.
 
     # ── copy helper ────────────────────────────────────────────────────────
 

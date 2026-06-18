@@ -14,19 +14,186 @@ compose them rather than reimplement them:
 - Low-level input-coercion helpers (``_to_lazy``, ``_auto_pack``) that every
   tier needs when accepting user frames / positions.
 
-This file intentionally stays small and free-standing. The real base class
-(``_TrajanTable`` with filter / expression / cache machinery) is deferred
-until the second and third tiers are implemented, so the shared surface can
-be factored from observed duplication rather than speculated in advance.
+The shared base classes — ``_LazyBacked`` (the lazy-plan query surface:
+``lazy`` / ``select`` / ``group_by`` / ``preview`` / ``count`` / ``__len__``)
+and ``_CachedTable`` (adds the ``.df`` materialization cache) — live here too.
+Every tier defines ``build_lazy()`` and inherits the rest, so the memory-cheap
+access patterns are written once. ``SynapseTable`` / ``ConnectivityTable`` /
+``EdgeList`` extend ``_CachedTable``; ``PairUniverse`` extends ``_LazyBacked``
+only (its cross-product must never be cached). These were factored from
+observed duplication across the tiers rather than speculated in advance.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Union
+from typing import Literal, TypeVar, Union
 
 import polars as pl
+
+_T = TypeVar("_T", bound="_LazyBacked")
+
+
+class _LazyBacked:
+    """Shared lazy-plan query surface for every trajan table tier.
+
+    The one thing each tier (``SynapseTable``, ``ConnectivityTable``,
+    ``EdgeList``, ``PairUniverse``) has in common is a ``build_lazy()`` method
+    returning its fully annotated + filtered ``pl.LazyFrame``. Everything here
+    is a thin, memory-conscious accessor over that plan, so it lives in one
+    place rather than being re-implemented per tier.
+
+    Subclasses must implement :meth:`build_lazy`. The escape-into-polars helpers
+    (``lazy`` / ``select`` / ``group_by``) deliberately hand back native polars
+    objects: those operations reshape the column set and so leave trajan-land,
+    where the annotation / role / weight contracts no longer hold. ``filter``,
+    by contrast, preserves the columns and stays a trajan table — so it is *not*
+    defined here; each tier owns it.
+    """
+
+    def build_lazy(self) -> pl.LazyFrame:  # pragma: no cover - abstract
+        raise NotImplementedError(f"{type(self).__name__} must implement build_lazy()")
+
+    @property
+    def lazy(self) -> pl.LazyFrame:
+        """The annotated + filtered plan as a ``pl.LazyFrame`` (alias for
+        :meth:`build_lazy`).
+
+        Mirrors Polars' own ``DataFrame.lazy()`` hop. Use it to keep a chain
+        lazy past the trajan API and finish with your own Polars ops — only the
+        final ``.collect()`` materializes, and projection/predicate pushdown
+        avoids building the full wide ``.df``::
+
+            tbl.filter(...).lazy.group_by("col").len().collect()
+        """
+        return self.build_lazy()
+
+    def select(self, *args, **kwargs) -> pl.LazyFrame:
+        """Project columns from the plan, returning a **polars** ``LazyFrame``.
+
+        Pass-through to ``self.lazy.select(...)``. Selecting changes the column
+        set, which would break the annotation / role / weight contracts a trajan
+        table maintains, so this hands back a native polars ``LazyFrame``; finish
+        with ``.collect()``. Projection pushdown means only the chosen columns
+        are ever materialized.
+        """
+        return self.lazy.select(*args, **kwargs)
+
+    def group_by(self, *args, **kwargs) -> pl.LazyGroupBy:
+        """Group the plan, returning a **polars** ``LazyGroupBy``.
+
+        Pass-through to ``self.lazy.group_by(...)`` — an escape into native
+        polars (grouping dissolves the per-row contract). Finish with an
+        aggregation and ``.collect()``; only the referenced columns materialize::
+
+            tbl.filter(...).group_by("col").len().collect()
+        """
+        return self.lazy.group_by(*args, **kwargs)
+
+    def preview(self, n: int = 10) -> pl.DataFrame:
+        """Collect the first ``n`` rows of the plan without caching.
+
+        Pushes a ``head(n)`` limit into the lazy plan, so only ``n`` rows are
+        materialized and nothing is retained — the cheap way to peek at the
+        schema or a few rows of a large table.
+
+        Parameters
+        ----------
+        n : int, optional
+            Number of rows to collect. Defaults to 10.
+        """
+        return self.build_lazy().head(n).collect()
+
+    def __len__(self) -> int:
+        """Row count of the plan; uses the cached frame when present.
+
+        Memory-cheap: when no ``.df`` cache is populated this pushes a bare
+        ``select(pl.len())`` into the plan rather than materializing it. Tiers
+        with an unfiltered fast path override this.
+        """
+        cache = getattr(self, "_cache", None)
+        if cache is not None:
+            return len(cache)
+        return self.build_lazy().select(pl.len()).collect().item()
+
+    def count(self) -> int:
+        """Row count of the plan (alias for ``len(self)``)."""
+        return len(self)
+
+    def __bool__(self) -> bool:
+        # Always truthy: prevents `if tbl:` from implicitly forcing a collect
+        # via __len__. Use `len(tbl) > 0` for the row-count check.
+        return True
+
+
+class _CachedTable(_LazyBacked):
+    """A :class:`_LazyBacked` tier that caches its fully-collected ``.df``.
+
+    Adds the materialization-cache surface (``.df`` / :meth:`clear_cache` /
+    :meth:`collect`) shared by the pair- and synapse-level tables. Subclasses
+    must initialize ``self._cache = None`` in ``__init__``. Tiers that should
+    *never* cache a full collect (e.g. ``PairUniverse``, whose plan is a
+    cross-product) extend ``_LazyBacked`` directly instead.
+    """
+
+    _cache: pl.DataFrame | None
+
+    @property
+    def df(self) -> pl.DataFrame:
+        """Full merged table with all registered annotations joined. Cached."""
+        if self._cache is None:
+            self._cache = self.build_lazy().collect()
+        return self._cache
+
+    def clear_cache(self: _T) -> _T:
+        """Drop the materialized ``.df`` cache, releasing its memory.
+
+        ``.df`` pins the merged frame for the object's lifetime once touched.
+        Call this when you keep a reference to the table but no longer need it
+        materialized — the next ``.df`` access rebuilds it lazily. A no-op when
+        nothing is cached. Returns self for chaining.
+        """
+        self._cache = None
+        return self
+
+    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+        """Materialize the merged table, optionally projecting to ``cols``.
+
+        With ``cols=None`` this is just the cached ``.df``. With an explicit
+        column list, it selects those columns *before* collecting, so Polars'
+        projection pushdown skips materializing (and often skips joining) every
+        other annotation column — the memory-cheap path for plotting. The narrow
+        result is returned fresh and is **not** cached.
+
+        Parameters
+        ----------
+        cols : list[str] or str or None, optional
+            Columns to project. ``None`` (default) returns the full cached
+            ``.df``. A single string is treated as a one-element list.
+
+        Returns
+        -------
+        pl.DataFrame
+            The full cached frame (``cols=None``) or a fresh narrow projection.
+
+        Raises
+        ------
+        ValueError
+            If any requested column is not present in the merged table.
+        """
+        if cols is None:
+            return self.df
+        if isinstance(cols, str):
+            cols = [cols]
+        schema = self.build_lazy().collect_schema().names()
+        missing = [c for c in cols if c not in schema]
+        if missing:
+            raise ValueError(
+                f"Column(s) {missing} not found in table. Available: {schema}"
+            )
+        return self.build_lazy().select(cols).collect()
+
 
 from .spatial import pack_position
 
