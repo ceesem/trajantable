@@ -186,6 +186,26 @@ Carry extra per-pair aggregates through the aggregation:
 el = st.edgelist(agg={"mean_size": pl.mean("size"), "total_size": pl.sum("size")})
 ```
 
+Agglomerate a column into a per-pair **count struct** — one field per value
+(categorical) or bin (numeric), plus a `__null__` field. `count_by` gives raw
+counts; `fraction_by` gives fractions (each struct sums to 1.0):
+
+```python
+el = st.edgelist(count_by="syn_type")           # syn_type = {exc: 7, inh: 2, __null__: 0}
+el = st.edgelist(fraction_by="syn_type")         # {exc: 0.78, inh: 0.22, __null__: 0.0}
+el = st.edgelist(count_by={"size": [100, 500]})  # numeric → {"<= 100": .., "(100, 500]": .., "> 500": .., __null__: ..}
+```
+
+- Categorical columns: pass the bare name(s); distinct values become fields.
+- Numeric columns: pass `{name: bin_edges}` (strictly-ascending, ±inf-extended
+  so nothing is dropped). A numeric column without bins raises.
+- A column may appear in `count_by` *or* `fraction_by`, not both. Combine across
+  different columns freely: `count_by="syn_type", fraction_by={"size": [100, 500]}`.
+- `fraction_include_null=False` drops the `__null__` field and divides by the
+  non-null count instead (value fields then sum to 1.0).
+
+Both `count_by`/`fraction_by` also work on `type_edgelist(...)`.
+
 ---
 
 ## 2. A type-by-type connectivity matrix
@@ -286,13 +306,17 @@ vector is `target − center`; the default is pre→post soma.
 
 ```python
 st = st.add_spatial_features(prefix="soma")
-# adds: soma_euclidean, soma_depth_diff, soma_r, soma_theta, soma_phi, soma_rho, soma_dy
+# adds: soma_euclidean, soma_depth_diff, soma_r, soma_theta, soma_phi, soma_rho,
+#       soma_dy, soma_pre_depth, soma_post_depth
 ```
 
 - `soma_euclidean` / `soma_r` — 3-D distance
 - `soma_rho` — lateral (in-plane) distance, ignoring depth
 - `soma_depth_diff` / `soma_dy` — signed cortical-depth offset
 - `soma_theta`, `soma_phi` — spherical angles
+- `soma_pre_depth` / `soma_post_depth` — *absolute* signed depth of each soma
+  (toggle with `cell_depth=`). Unlike the vector features these don't depend on
+  `center`/`target`; `post_depth − pre_depth == depth_diff`.
 
 `depth_axis="y"` means +y is deeper; append `_r` (`"y_r"`) to flip. Call it twice
 with different `prefix=`/`center=` for both perspectives, or target the synapse:
@@ -307,6 +331,27 @@ For a single custom distance column, `with_distance` skips the per-side naming:
 from trajan import with_distance, radial_distance
 st = with_distance(st, "d_lateral", radial_distance)   # adds radial_distance(soma_pre, soma_post)
 ```
+
+**Transform a position struct** through a function, repacking the result as a
+new `{x, y, z}` position column. The default `func` is array-based
+(`(N,3) → (N,3)`) — the form `standard_transform` and affine maps speak:
+
+```python
+from trajan import transform_point
+tf = minnie_transform_nm()
+st = st.add_expression("soma_um", transform_point("soma", tf.apply))   # (N,3)->(N,3)
+
+# vectorized=True keeps it fully lazy when the transform is expressible in polars:
+st = st.add_expression(
+    "soma_um",
+    transform_point("soma", lambda x, y, z: (x / 1e3, y / 1e3, z / 1e3), vectorized=True),
+)
+```
+
+Array mode runs as one vectorized `map_batches` call at collect — fast, but
+opaque to the optimizer; prefer `vectorized=True` for transforms that are pure
+polars. A null (or any-axis-null) point maps to a null output struct in both
+modes. `depth_component(col, depth_axis=)` gives a single soma's signed depth.
 
 Spatial filters read the declared `position_col` directly — no feature column
 needed:
@@ -543,6 +588,23 @@ el.collect(["soma_depth_pre", "soma_depth_post", "size", "pre_post_distance"])
     small (≤10⁵ rows) — there the cached `.df` is already cheap and projecting buys
     little. The bigger levers for those are **binding** (above) and `preview()`.
 
+**Drop to lazy polars for ad-hoc queries.** When the result is small (a count, a
+group-by) don't go through `.df` — it collects and pins the whole wide frame.
+`.lazy` exposes the uncollected plan; `.select` / `.group_by` are pass-throughs
+that return native polars objects (they reshape columns, so they leave trajan —
+projection/predicate pushdown then materializes only what you ask for). Available
+on every tier (`SynapseTable`, `ConnectivityTable`, `EdgeList`, `PairUniverse`):
+
+```python
+st.filter(pl.col("is_pf_pre")).group_by("syn_type").len().collect()  # never builds .df
+st.select(["pss", "size"]).collect()                                  # narrow, lazy
+st.lazy.join(other_lf, on="id").group_by(...).agg(...).collect()      # mix with raw polars
+len(st)          # row count — cache-aware, cheap (st.count() is the same)
+```
+
+Rule of thumb: ends in a small result → `.lazy.…​.collect()` or `collect(cols=)`;
+genuinely need the full wide frame repeatedly → `.df` (then `clear_cache()`).
+
 ---
 
 ## Quick reference
@@ -550,18 +612,18 @@ el.collect(["soma_depth_pre", "soma_depth_post", "size", "pre_post_distance"])
 **Build & annotate** (`SynapseTable`)
 : `add_cell_annotation(name, df, cell_id_col, position_col=, is_universe=, join_on_alias=, alias_col=)`
   · `extend_cell_annotation(name, df, on=, position_col=, is_universe=)`
-  · `add_synapse_annotation(name, df, position_cols=)`
+  · `add_synapse_annotation(name, df, syn_id_col=, position_cols=)`
   · `add_vertex_annotation(name, df, vertex_id_col, pre_vertex_col=, post_vertex_col=)`
   · `set_cell_alias(annotation_name, col, alias_name=)`
   · `add_expression(name, expr)` · `add_weight(col)` · `add_weight_transform(name, source_col, transform="log1p")`
-  · `add_spatial_features(prefix=, center=, target=, depth_axis=)`
+  · `add_spatial_features(prefix=, center=, target=, depth_axis=, cell_depth=)`
 
 **Filter** (returns a new table)
 : `filter(expr)` · `filter_by_ids(pre_ids=, post_ids=)` · `filter_by_soma_distance(d, distance_fn=)`
   · `filter_by_bbox(bbox)` · `filter_by_min_synapses(n, weight_col=)` · `filter_to_annotated(name, pre=, post=)`
 
 **Reshape**
-: `st.edgelist(agg=)` → `EdgeList` · `st.type_edgelist(pre_col, post_col=)` → `ConnectivityTable`
+: `st.edgelist(agg=, count_by=, fraction_by=, fraction_include_null=)` → `EdgeList` · `st.type_edgelist(pre_col, post_col=, count_by=, fraction_by=)` → `ConnectivityTable`
   · `el.aggregate_to_type(pre=, post=)` · `ct.normalize(by=, total_col=)` · `binarize()` · `log1p()` · `to_dense(values=)`
 
 **Cell & pair views**
@@ -579,13 +641,15 @@ el.collect(["soma_depth_pre", "soma_depth_post", "size", "pre_post_distance"])
 
 **Spatial helpers**
 : `pack_position(df, col, x=, y=, z=)` · `unpack_position` · `pack_all_positions` · `unpack_all_positions`
-  · `euclidean_distance(a, b)` · `radial_distance(a, b)`
+  · `euclidean_distance(a, b)` · `radial_distance(a, b)` · `depth_component(col, depth_axis=)`
+  · `transform_point(col, func, vectorized=False)` *(repack a position struct through a transform)*
 
 **Export**
 : `to_graph(st, edge_agg=, cell_agg=, backend="networkx"|"igraph"|"csgraph")` · `to_dataframe(st, unpack_positions=)`
 
 **Inspect & materialize**
 : `st.info()` · `st.df` / `el.df` *(cached full)* · `preview(n=10)` *(uncached peek)* · `collect(cols=)` *(narrow projection)*
+  · `.lazy` *(uncollected plan)* · `.select(...)` / `.group_by(...)` *(→ native polars, lazy)* · `len(tbl)` / `.count()`
   · `clear_cache()` *(release `.df`)* · `st.cell_annotations[name]` · `st.weights` · `st.filter_sides`
 
 **`bin_by` recipes**

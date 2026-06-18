@@ -109,6 +109,20 @@ an output method directly:
 el = st.view(cell_annotations=["cell_type"]).edgelist()
 ```
 
+For ad-hoc queries whose result is small, stay lazy instead of going through
+`.df` (which collects and pins the whole wide frame). `.lazy` returns the
+uncollected `pl.LazyFrame`; `.select(...)` and `.group_by(...)` are pass-throughs
+that hand back native polars objects, so projection/predicate pushdown
+materializes only what you ask for. `preview(n)` peeks without caching,
+`collect(cols=)` projects to a narrow uncached frame, and `len(st)` / `st.count()`
+give a cache-aware row count. These live on every tier (`SynapseTable`,
+`ConnectivityTable`, `EdgeList`, `PairUniverse`):
+
+```python
+st.filter(pl.col("cell_type_pre") == "23P").group_by("cell_type_post").len().collect()
+st.select(["pre_pt_root_id", "size"]).collect()
+```
+
 ## Spatial configuration
 
 Set `synapse_position_col` when you need `filter_by_bbox` or
