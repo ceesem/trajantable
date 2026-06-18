@@ -60,11 +60,23 @@ except ImportError:
 class SynapseAnnotationSpec:
     """Synapse-level annotation: keyed on synapse id.
 
-    Joined onto the base synapse lazy plan via the table's ``id_col``.
-    Contributes ``data_cols`` verbatim to ``.df``.
+    Joined onto the base synapse lazy plan, matching the annotation's
+    ``syn_id_col`` against the table's ``id_col``. Contributes ``data_cols``
+    verbatim to ``.df``.
+
+    Parameters
+    ----------
+    lf : pl.LazyFrame
+        The annotation table.
+    syn_id_col : str
+        Column in ``lf`` holding the synapse id to join on. Matched against the
+        table's ``id_col``; the two need not share a name.
+    data_cols : list[str]
+        Columns in ``lf`` (excluding the join key) contributed to ``.df``.
     """
 
     lf: pl.LazyFrame
+    syn_id_col: str
     data_cols: list[str]
 
 

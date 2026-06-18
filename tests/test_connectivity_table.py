@@ -478,3 +478,40 @@ def test_annotation_data_cols_returns_dict(ct):
     ct.add_annotation("cells", cells, cell_id_col="cid")
     data_cols = ct.annotation_data_cols()
     assert data_cols == {"cells": ["type", "layer"]}
+
+
+# ── clear_cache / preview / collect ──────────────────────────────────────────
+
+
+def test_clear_cache_drops_and_repopulates(ct):
+    _ = ct.df
+    assert ct._cache is not None
+    assert ct.clear_cache() is ct
+    assert ct._cache is None
+    assert len(ct.df) == 5
+    assert ct._cache is not None
+
+
+def test_preview_limits_rows_without_caching(ct):
+    out = ct.preview(2)
+    assert len(out) == 2
+    assert ct._cache is None
+
+
+def test_collect_none_returns_cached_df(ct):
+    assert ct.collect().equals(ct.df)
+
+
+def test_collect_narrow_projects_without_caching(ct):
+    out = ct.collect(["pre", "n_syn"])
+    assert out.columns == ["pre", "n_syn"]
+    assert ct._cache is None
+
+
+def test_collect_accepts_single_string(ct):
+    assert ct.collect("pre").columns == ["pre"]
+
+
+def test_collect_unknown_column_raises(ct):
+    with pytest.raises(ValueError, match="not found in table"):
+        ct.collect(["bogus"])

@@ -337,3 +337,38 @@ def test_asymmetric_pre_proofread_density(st):
     # Cell 40 is proofread but has no observed outgoing synapses → p=0.
     p40 = prob.filter(pl.col("pre_pt_root_id") == 40)["p"].item()
     assert p40 == 0
+
+
+# ── collect(cols) / preview ──────────────────────────────────────────────────
+
+
+def test_collect_narrow_projects_columns(st):
+    pu = possible_pairs(st)
+    out = pu.collect(cols=[pu.pre_col, pu.post_col])
+    assert out.columns == [pu.pre_col, pu.post_col]
+
+
+def test_collect_accepts_single_string(st):
+    pu = possible_pairs(st)
+    out = pu.collect(cols=pu.pre_col)
+    assert out.columns == [pu.pre_col]
+
+
+def test_collect_unknown_column_raises(st):
+    pu = possible_pairs(st)
+    with pytest.raises(ValueError, match="not found in pair universe"):
+        pu.collect(cols=["bogus"])
+
+
+def test_collect_none_returns_full_frame(st):
+    pu = possible_pairs(st)
+    full = pu.collect()
+    # universe has 5 cells → 5*5 - 5 self-pairs = 20 rows
+    assert len(full) == 20
+
+
+def test_preview_limits_rows(st):
+    pu = possible_pairs(st)
+    out = pu.preview(3)
+    assert len(out) == 3
+    assert pu.pre_col in out.columns

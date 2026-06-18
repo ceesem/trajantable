@@ -9,6 +9,7 @@ from .export import to_dataframe, to_graph
 from .pair_universe import PairUniverse, possible_pairs
 from .scope import cells
 from .spatial import (
+    depth_component,
     euclidean_distance,
     pack_all_positions,
     pack_position,
@@ -43,6 +44,7 @@ __all__ = [
     "connection_density",
     "connection_probability",
     "counts",
+    "depth_component",
     "euclidean_distance",
     "pack_all_positions",
     "pack_position",

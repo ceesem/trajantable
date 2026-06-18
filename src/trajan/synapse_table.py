@@ -27,7 +27,12 @@ from ._base import (
 )
 from .connectivity_table import ConnectivityTable
 from .edgelist import EdgeList
-from .spatial import bbox_predicate, euclidean_distance, spatial_feature_exprs
+from .spatial import (
+    bbox_predicate,
+    depth_component,
+    euclidean_distance,
+    spatial_feature_exprs,
+)
 
 try:
     import pandas as pd  # noqa: F401  (still used elsewhere for duck-typing)
@@ -39,6 +44,44 @@ except ImportError:
 
 def _spatial_col_name(prefix: str, feature: str) -> str:
     return f"{prefix}_{feature}" if prefix else feature
+
+
+def _tally(
+    predicate: pl.Expr, normalize: bool, denom: pl.Expr | None = None
+) -> pl.Expr:
+    """Count rows matching ``predicate`` within a group, or their fraction.
+
+    With ``normalize=True`` the count is divided by ``denom`` (defaulting to the
+    full group length, ``pl.len()``), so the struct fields sum to 1.0 per group.
+    Pass a non-null count as ``denom`` to normalize over non-null rows instead.
+    """
+    count = predicate.sum()
+    if not normalize:
+        return count
+    return count / (denom if denom is not None else pl.len())
+
+
+def _bin_count_fields(
+    col: str,
+    edges: list[float],
+    normalize: bool = False,
+    denom: pl.Expr | None = None,
+) -> list[pl.Expr]:
+    """Per-bin tally expressions counting values of ``col`` (or their fraction).
+
+    ``edges`` are strictly-ascending interior cut points. Bins are left-open /
+    right-closed and extended to ±inf so every non-null value lands in exactly
+    one bin (none are silently dropped): ``(-inf, e0]``, ``(e0, e1]``, …,
+    ``(e_last, inf)``. Field names are human-readable interval labels.
+    """
+    c = pl.col(col)
+    fields = [_tally(c <= edges[0], normalize, denom).alias(f"<= {edges[0]}")]
+    for lo, hi in zip(edges, edges[1:]):
+        fields.append(
+            _tally((c > lo) & (c <= hi), normalize, denom).alias(f"({lo}, {hi}]")
+        )
+    fields.append(_tally(c > edges[-1], normalize, denom).alias(f"> {edges[-1]}"))
+    return fields
 
 
 class SynapseTable:
@@ -209,7 +252,12 @@ class SynapseTable:
             lines.append("")
             lines.append(f"Synapse annotations ({len(self._synapse_annotations)})")
             for name, spec in self._synapse_annotations.items():
-                lines.append(f"  {name!r} ({len(spec.data_cols)} col(s))")
+                join_info = (
+                    ""
+                    if spec.syn_id_col == self._id_col
+                    else f" — join on {spec.syn_id_col!r}"
+                )
+                lines.append(f"  {name!r} ({len(spec.data_cols)} col(s)){join_info}")
                 for c in spec.data_cols:
                     tag = "  [position]" if self._is_position_col(spec.lf, c) else ""
                     lines.append(f"    {c}{tag}")
@@ -507,9 +555,13 @@ class SynapseTable:
     # ── synapse annotations ────────────────────────────────────────────────
 
     def add_synapse_annotation(
-        self, name: str, df, position_cols: list[str] | str | None = None
+        self,
+        name: str,
+        df,
+        syn_id_col: str | None = None,
+        position_cols: list[str] | str | None = None,
     ) -> None:
-        """Register a synapse-level annotation, joined on id_col.
+        """Register a synapse-level annotation, joined on the synapse id.
 
         Raises ValueError if any column already exists in the table.
 
@@ -519,23 +571,32 @@ class SynapseTable:
             Identifier for this annotation; used to remove it later via
             remove_synapse_annotation.
         df : pl.DataFrame or pl.LazyFrame or pd.DataFrame
-            Annotation table. Must contain id_col plus data columns.
+            Annotation table. Must contain syn_id_col plus data columns.
+        syn_id_col : str or None, optional
+            The column in df holding synapse ids to join on. It is matched
+            against the table's ``id_col``; the two need not share a name. If
+            None (default), the table's ``id_col`` name is assumed to be present
+            in df.
         position_cols : list[str] or str or None, optional
             Column name prefix(es) to auto-pack from split x/y/z format into a
             position struct. E.g. "ctr_pt_position" or ["ctr_pt_position"] will
             pack ctr_pt_position_x/y/z into a struct named ctr_pt_position.
         """
+        if syn_id_col is None:
+            syn_id_col = self._id_col
         if isinstance(position_cols, str):
             position_cols = [position_cols]
         lf = _to_lazy(df)
         for col in position_cols or []:
             lf = _auto_pack(lf, col)
-        validate_unique_key(lf, self._id_col)
-        data_cols = [c for c in lf.collect_schema().names() if c != self._id_col]
+        validate_unique_key(lf, syn_id_col)
+        data_cols = [c for c in lf.collect_schema().names() if c != syn_id_col]
         collisions = set(data_cols) & self._current_columns()
         if collisions:
             raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
-        self._synapse_annotations[name] = SynapseAnnotationSpec(lf, data_cols)
+        self._synapse_annotations[name] = SynapseAnnotationSpec(
+            lf, syn_id_col, data_cols
+        )
         self._cache = None
         return self
 
@@ -1085,7 +1146,15 @@ class SynapseTable:
         lf = self._syn_lf
 
         for spec in self._synapse_annotations.values():
-            lf = lf.join(spec.lf, on=self._id_col, how="left")
+            if spec.syn_id_col == self._id_col:
+                lf = lf.join(spec.lf, on=self._id_col, how="left")
+            else:
+                lf = lf.join(
+                    spec.lf,
+                    left_on=self._id_col,
+                    right_on=spec.syn_id_col,
+                    how="left",
+                )
 
         lf = join_cell_annotations_symmetric(
             lf,
@@ -1118,11 +1187,130 @@ class SynapseTable:
     # ── df property (cached) ───────────────────────────────────────────────
 
     @property
+    def lazy(self) -> pl.LazyFrame:
+        """The full annotated + filtered plan as a ``pl.LazyFrame`` (alias for
+        ``build_lazy()``).
+
+        Property form of :meth:`build_lazy`, mirroring Polars' own
+        ``DataFrame.lazy()`` hop. Use it to keep a chain lazy past the trajan
+        API and finish with your own Polars ops — only the final ``.collect()``
+        materializes, and projection/predicate pushdown avoids building the full
+        wide ``.df``::
+
+            st.filter(...).lazy.group_by("pss").len().collect()
+        """
+        return self.build_lazy()
+
+    def select(self, *args, **kwargs) -> pl.LazyFrame:
+        """Project columns from the plan, returning a **polars** ``LazyFrame``.
+
+        Pass-through to ``self.lazy.select(...)``. Unlike :meth:`filter` — which
+        keeps every column and so stays a ``SynapseTable`` — selecting changes
+        the column set, which would break the annotation / role / weight
+        contracts this object maintains. So this deliberately leaves trajan-land
+        and hands back a native polars ``LazyFrame``; finish with ``.collect()``.
+        Projection pushdown means only the chosen columns are ever materialized::
+
+            st.filter(...).select(["pss", "size"]).collect()
+        """
+        return self.lazy.select(*args, **kwargs)
+
+    def group_by(self, *args, **kwargs) -> pl.LazyGroupBy:
+        """Group the plan, returning a **polars** ``LazyGroupBy``.
+
+        Pass-through to ``self.lazy.group_by(...)`` — an escape into native
+        polars (grouping dissolves the per-synapse row contract). Finish with an
+        aggregation and ``.collect()``; only the referenced columns materialize::
+
+            st.filter(...).group_by("pss").len().collect()
+        """
+        return self.lazy.group_by(*args, **kwargs)
+
+    def count(self) -> int:
+        """Number of synapses after filters (equivalent to ``len(self)``).
+
+        Memory-cheap: returns the cached base count when unfiltered, otherwise a
+        bare ``select(pl.len())`` on the plan — it never materializes the merged
+        frame.
+        """
+        return len(self)
+
+    @property
     def df(self) -> pl.DataFrame:
         """Full merged synapse table with all registered annotations. Cached."""
         if self._cache is None:
             self._cache = self.build_lazy().collect()
         return self._cache
+
+    def clear_cache(self) -> SynapseTable:
+        """Drop the materialized ``.df`` cache, releasing its memory.
+
+        The merged synapse frame can be large (millions of rows × every joined
+        annotation column), and ``.df`` pins it for the object's lifetime once
+        touched. Call this when you are done with a table you intend to keep a
+        reference to but no longer need materialized — the next ``.df`` access
+        rebuilds it lazily. A no-op when nothing is cached.
+
+        Returns
+        -------
+        SynapseTable
+            Returns self to allow method chaining.
+        """
+        self._cache = None
+        return self
+
+    def preview(self, n: int = 10) -> pl.DataFrame:
+        """Collect the first ``n`` rows of the merged table without caching.
+
+        Unlike ``.df.head(n)`` — which forces a full collect of every row and
+        pins it on ``self._cache`` — this pushes a ``head(n)`` limit into the
+        lazy plan, so only ``n`` rows are materialized and nothing is cached.
+        Use it to peek at the schema / a few rows of a large table cheaply.
+
+        Parameters
+        ----------
+        n : int, optional
+            Number of rows to collect. Defaults to 10.
+        """
+        return self.build_lazy().head(n).collect()
+
+    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+        """Materialize the merged table, optionally projecting to ``cols``.
+
+        With ``cols=None`` this is just the cached ``.df``. With an explicit
+        column list, it selects those columns *before* collecting, so Polars'
+        projection pushdown skips materializing (and often skips joining) every
+        other annotation column. This is the memory-cheap path for plotting:
+        pull only the handful of columns a figure needs instead of the whole
+        wide frame. The narrow result is returned fresh and is **not** cached.
+
+        Parameters
+        ----------
+        cols : list[str] or str or None, optional
+            Columns to project. ``None`` (default) returns the full cached
+            ``.df``. A single string is treated as a one-element list.
+
+        Returns
+        -------
+        pl.DataFrame
+            The full cached frame (``cols=None``) or a fresh narrow projection.
+
+        Raises
+        ------
+        ValueError
+            If any requested column is not present in the merged table.
+        """
+        if cols is None:
+            return self.df
+        if isinstance(cols, str):
+            cols = [cols]
+        schema = self.build_lazy().collect_schema().names()
+        missing = [c for c in cols if c not in schema]
+        if missing:
+            raise ValueError(
+                f"Column(s) {missing} not found in table. Available: {schema}"
+            )
+        return self.build_lazy().select(cols).collect()
 
     # ── copy helper ────────────────────────────────────────────────────────
 
@@ -1348,6 +1536,7 @@ class SynapseTable:
         depth_diff: bool = True,
         spherical: bool = True,
         cylindrical: bool = True,
+        cell_depth: bool = True,
         *,
         annotation: str | None = None,
     ) -> SynapseTable:
@@ -1383,6 +1572,13 @@ class SynapseTable:
         cylindrical : bool, optional
             Include ``rho`` (lateral distance), ``phi`` (shared with spherical),
             and ``dy`` (= depth_diff).
+        cell_depth : bool, optional
+            Include ``pre_depth`` and ``post_depth`` — the signed depth-axis
+            coordinate of the pre and post cell somas (per :func:`depth_component`,
+            so larger = deeper). Unlike the vector features these are absolute
+            per-side cell positions and so do not depend on ``center`` / ``target``.
+            Requires the resolved cell annotation to carry a position; emitted for
+            both sides regardless of ``target``.
         annotation : str or None, optional
             Cell annotation whose ``position_col`` to use for soma positions.
             Auto-resolved when exactly one position-bearing annotation is
@@ -1405,7 +1601,8 @@ class SynapseTable:
         Default pre→post soma features:
 
         >>> st.add_spatial_features(prefix="soma")
-        # adds soma_euclidean, soma_depth_diff, soma_r, soma_theta, soma_phi, soma_rho, soma_dy
+        # adds soma_euclidean, soma_depth_diff, soma_r, soma_theta, soma_phi,
+        # soma_rho, soma_dy, soma_pre_depth, soma_post_depth
 
         Both centering perspectives (call twice):
 
@@ -1451,6 +1648,18 @@ class SynapseTable:
             cylindrical=cylindrical,
         ).items():
             self.add_expression(_spatial_col_name(prefix, feat), expr)
+
+        if cell_depth:
+            # Absolute per-side soma depths — independent of center/target, so
+            # always pre and post (not from/to).
+            self.add_expression(
+                _spatial_col_name(prefix, "pre_depth"),
+                depth_component(soma_cols["pre"], depth_axis),
+            )
+            self.add_expression(
+                _spatial_col_name(prefix, "post_depth"),
+                depth_component(soma_cols["post"], depth_axis),
+            )
 
         return self
 
@@ -1605,9 +1814,162 @@ class SynapseTable:
             agg_exprs.extend(expr.alias(name) for name, expr in agg.items())
         return agg_exprs
 
+    def _build_count_by_exprs(
+        self,
+        count_by: str | list[str] | dict[str, list[float] | None] | None,
+        normalize: bool = False,
+        include_null: bool = True,
+    ) -> list[pl.Expr]:
+        """Build per-pair count-struct expressions for ``edgelist(count_by=...)``.
+
+        Each requested column becomes one struct column (named after the source
+        column) whose fields tally how many synapses in the pair carry each
+        value (categorical) or fall in each bin (numeric), plus a ``__null__``
+        field counting missing values. Returns one ``pl.struct(...).alias(col)``
+        expression per requested column, ready to extend the group_by agg list.
+
+        Categorical columns (passed bare) are scanned once up-front to discover
+        their distinct values, so the struct has a fixed, sorted set of fields.
+        Numeric columns require explicit bin edges; their absence is an error.
+
+        With ``normalize=True`` each field carries the *fraction* of the group
+        instead of the raw count. ``include_null=True`` (the default) divides by
+        the full group length and keeps the ``__null__`` field, so all fields
+        sum to 1.0. ``include_null=False`` divides by the non-null count and
+        drops the ``__null__`` field, so the value/bin fields sum to 1.0 on
+        their own (a pair with only nulls yields NaN). This backs
+        ``fraction_by`` / ``fraction_include_null``.
+        """
+        if count_by is None:
+            return []
+        if isinstance(count_by, str):
+            count_by = {count_by: None}
+        elif isinstance(count_by, (list, tuple)):
+            count_by = {c: None for c in count_by}
+        elif isinstance(count_by, dict):
+            count_by = dict(count_by)
+        else:
+            raise TypeError(
+                "count_by must be a column name, a list of names, or a "
+                f"{{name: bins}} dict; got {type(count_by).__name__}."
+            )
+
+        schema = self.build_lazy().collect_schema()
+        names = schema.names()
+        cat_cols: list[str] = []
+        for col, bins in count_by.items():
+            if col not in names:
+                raise ValueError(
+                    f"count_by column {col!r} not found in table. Available: {names}"
+                )
+            dtype = schema[col]
+            if bins is None:
+                if dtype.is_numeric():
+                    raise ValueError(
+                        f"count_by column {col!r} is numeric ({dtype}); provide "
+                        f"explicit bin edges, e.g. count_by={{{col!r}: [0, 100, 500]}}."
+                    )
+                cat_cols.append(col)
+            else:
+                if not dtype.is_numeric():
+                    raise ValueError(
+                        f"count_by bins given for column {col!r} but its dtype is "
+                        f"{dtype}; bins are only valid for numeric columns."
+                    )
+                edges = list(bins)
+                if not edges:
+                    raise ValueError(
+                        f"count_by bins for {col!r} must contain at least one edge."
+                    )
+                if any(b <= a for a, b in zip(edges, edges[1:])):
+                    raise ValueError(
+                        f"count_by bins for {col!r} must be strictly ascending: {edges}."
+                    )
+
+        # One scan to gather distinct non-null values for every categorical
+        # column (imploded to a single-row list per column).
+        uniques: dict[str, list] = {}
+        if cat_cols:
+            uniq_row = (
+                self.build_lazy()
+                .select(
+                    pl.col(c).drop_nulls().unique().sort().implode().alias(c)
+                    for c in cat_cols
+                )
+                .collect()
+            )
+            uniques = {c: uniq_row[c][0].to_list() for c in cat_cols}
+
+        exprs: list[pl.Expr] = []
+        for col, bins in count_by.items():
+            # Denominator for fractions: full group (incl. nulls) by default, or
+            # the non-null count when nulls are excluded from normalization.
+            denom = None if include_null else pl.col(col).is_not_null().sum()
+            if bins is None:
+                fields = [
+                    _tally(pl.col(col) == v, normalize, denom).alias(str(v))
+                    for v in uniques[col]
+                ]
+            else:
+                fields = _bin_count_fields(col, list(bins), normalize, denom)
+            if include_null:
+                fields.append(
+                    _tally(pl.col(col).is_null(), normalize, denom).alias("__null__")
+                )
+            if not fields:
+                # Only reachable for an all-null categorical column with
+                # include_null=False: no distinct values and no __null__ field.
+                raise ValueError(
+                    f"count_by column {col!r} has no non-null values to normalize "
+                    "over; use fraction_include_null=True or count_by instead."
+                )
+            exprs.append(pl.struct(fields).alias(col))
+        return exprs
+
+    def _extend_with_count_by(
+        self,
+        agg_exprs: list[pl.Expr],
+        agg: dict[str, pl.Expr] | None,
+        count_by,
+        fraction_by,
+        *,
+        context: str,
+        fraction_include_null: bool = True,
+    ) -> list[pl.Expr]:
+        """Append count_by / fraction_by struct exprs to ``agg_exprs``.
+
+        Shared by ``edgelist`` and ``type_edgelist``. Guards against a column
+        appearing in both (which would emit two structs of the same name) and
+        against shadowing ``n_syn``, a weight, or an ``agg`` output.
+        """
+        extra = self._build_count_by_exprs(count_by) + self._build_count_by_exprs(
+            fraction_by,
+            normalize=True,
+            include_null=fraction_include_null,
+        )
+        if not extra:
+            return agg_exprs
+        out_names = [e.meta.output_name() for e in extra]
+        dupes = sorted({n for n in out_names if out_names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"{context}: column(s) {dupes} appear in both count_by and "
+                "fraction_by. A column may be used in only one."
+            )
+        reject_reserved_names(
+            out_names,
+            {"n_syn", *self._weights, *(agg or {})},
+            context=context,
+        )
+        agg_exprs.extend(extra)
+        return agg_exprs
+
     def edgelist(
         self,
         agg: dict[str, pl.Expr] | None = None,
+        count_by: str | list[str] | dict[str, list[float] | None] | None = None,
+        fraction_by: str | list[str] | dict[str, list[float] | None] | None = None,
+        fraction_include_null: bool = True,
     ) -> EdgeList:
         """Aggregate synapses into a cell-pair EdgeList.
 
@@ -1630,16 +1992,56 @@ class SynapseTable:
             {output_column_name: polars_expression} for additional per-pair
             aggregations. Example:
             ``{"mean_size": pl.mean("size"), "total_area": pl.sum("area")}``.
+        count_by : str, list[str], or dict[str, list[float] | None], optional
+            Columns to agglomerate into a per-pair count *struct*. Each named
+            column produces one struct column (same name) whose fields tally how
+            many synapses in the pair carry each value, plus a ``__null__`` field
+            counting missing values.
+
+            - Categorical/string columns: pass the bare name(s). Distinct values
+              are discovered automatically and become struct fields, e.g.
+              ``count_by="cell_type"`` →
+              ``cell_type = {type_a: 2, type_b: 1, __null__: 0}``.
+            - Numeric columns: pass ``{name: bin_edges}`` with strictly-ascending
+              interior edges. Bins are left-open/right-closed and span ±inf, so
+              no value is dropped. ``count_by={"size": [100, 500]}`` →
+              ``size = {"<= 100": .., "(100, 500]": .., "> 500": .., __null__: ..}``.
+            - Lists and dicts may be combined as a dict, e.g.
+              ``count_by={"cell_type": None, "size": [100, 500]}``.
+
+            Passing a numeric column without bins (or bins for a non-numeric
+            column) raises ``ValueError``.
+        fraction_by : str, list[str], or dict[str, list[float] | None], optional
+            Same as ``count_by``, but each struct field carries the *fraction*
+            of the pair's synapses instead of the raw count. A given column may
+            appear in ``count_by`` or ``fraction_by`` but not both.
+        fraction_include_null : bool, optional
+            Controls the denominator for ``fraction_by``. ``True`` (the
+            default) divides by all synapses in the pair and keeps the
+            ``__null__`` field, so every field — including ``__null__`` — sums to
+            1.0. ``False`` divides by the *non-null* synapses and drops the
+            ``__null__`` field, so the value/bin fields sum to 1.0 on their own
+            (a pair whose values are all null yields NaN). No effect on
+            ``count_by`` raw counts.
 
         Returns
         -------
         EdgeList
             Pair-level table with pre/post cell id columns, ``n_syn``, any
-            registered weights, and ``agg`` outputs in the base pair frame;
-            cell annotations (with their roles and aliases) registered for
-            symmetric join via ``el.df``.
+            registered weights, ``agg`` outputs, and ``count_by`` /
+            ``fraction_by`` structs in the base pair frame; cell
+            annotations (with their roles and aliases) registered for symmetric
+            join via ``el.df``.
         """
         agg_exprs = self._build_agg_exprs(agg)
+        agg_exprs = self._extend_with_count_by(
+            agg_exprs,
+            agg,
+            count_by,
+            fraction_by,
+            context="edgelist()",
+            fraction_include_null=fraction_include_null,
+        )
 
         pair_df = (
             self.build_lazy()
@@ -1685,6 +2087,9 @@ class SynapseTable:
         pre_col: str,
         post_col: str | None = None,
         agg: dict[str, pl.Expr] | None = None,
+        count_by: str | list[str] | dict[str, list[float] | None] | None = None,
+        fraction_by: str | list[str] | dict[str, list[float] | None] | None = None,
+        fraction_include_null: bool = True,
     ) -> ConnectivityTable:
         """Aggregate synapses into a type-to-type ConnectivityTable.
 
@@ -1702,6 +2107,18 @@ class SynapseTable:
             with any trailing ``_pre`` replaced by ``_post``.
         agg : dict[str, pl.Expr] or None, optional
             Per-pair aggregations applied after the type grouping.
+        count_by : str, list[str], or dict[str, list[float] | None], optional
+            Columns to agglomerate into a per-type-pair count *struct*. See
+            ``edgelist`` for the full semantics (categorical vs binned numeric,
+            ``__null__`` field). Here the counts are tallied per type pair.
+        fraction_by : str, list[str], or dict[str, list[float] | None], optional
+            Like ``count_by`` but each field is the fraction of the type pair's
+            synapses. A column may appear in only one of the two.
+        fraction_include_null : bool, optional
+            Denominator for ``fraction_by``: ``True`` (default) divides
+            by all synapses and keeps ``__null__`` (fields sum to 1.0); ``False``
+            divides by the non-null synapses and drops ``__null__``. See
+            ``edgelist`` for details.
 
         Returns
         -------
@@ -1714,6 +2131,14 @@ class SynapseTable:
                 post_col = pre_col
 
         agg_exprs = self._build_agg_exprs(agg)
+        agg_exprs = self._extend_with_count_by(
+            agg_exprs,
+            agg,
+            count_by,
+            fraction_by,
+            context="type_edgelist()",
+            fraction_include_null=fraction_include_null,
+        )
 
         pair_df = (
             self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
@@ -1758,7 +2183,7 @@ class SynapseTable:
                 for name, expr in self._expressions.items()
             },
             "synapse_annotations": {
-                name: {"data_cols": spec.data_cols}
+                name: {"syn_id_col": spec.syn_id_col, "data_cols": spec.data_cols}
                 for name, spec in self._synapse_annotations.items()
             },
             "cell_aliases": {
@@ -1829,8 +2254,12 @@ class SynapseTable:
             id_col=config["id_col"],
             synapse_position_col=config["synapse_position_col"],
         )
-        for name in config["synapse_annotations"]:
-            st.add_synapse_annotation(name, _lf(f"synapse_ann_{name}"))
+        for name, meta in config["synapse_annotations"].items():
+            st.add_synapse_annotation(
+                name,
+                _lf(f"synapse_ann_{name}"),
+                syn_id_col=meta.get("syn_id_col"),
+            )
         for name, meta in config["cell_annotations"].items():
             st.add_cell_annotation(
                 name,

@@ -258,14 +258,42 @@ class PairUniverse:
 
     # ── materialization ──────────────────────────────────────────────────
 
-    def collect(self) -> pl.DataFrame:
-        """Materialize the lazy plan into a DataFrame.
+    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+        """Materialize the lazy plan into a DataFrame, optionally projecting.
+
+        With ``cols=None`` the full pair frame is collected. With an explicit
+        column list, those columns are selected *before* collecting, so Polars'
+        projection pushdown avoids materializing every annotation column — the
+        memory-cheap path when you only need a few columns of the cross-product.
 
         Warns when the result row count exceeds ~10M — at that point you
         almost certainly want to compose more filters / aggregations
         upstream rather than realize the cross-product in memory.
+
+        Parameters
+        ----------
+        cols : list[str] or str or None, optional
+            Columns to project. ``None`` (default) collects the full frame.
+            A single string is treated as a one-element list.
+
+        Raises
+        ------
+        ValueError
+            If any requested column is not present in the pair frame.
         """
-        df = self.build_lazy().collect()
+        lf = self.build_lazy()
+        if cols is not None:
+            if isinstance(cols, str):
+                cols = [cols]
+            schema = lf.collect_schema().names()
+            missing = [c for c in cols if c not in schema]
+            if missing:
+                raise ValueError(
+                    f"Column(s) {missing} not found in pair universe. "
+                    f"Available: {schema}"
+                )
+            lf = lf.select(cols)
+        df = lf.collect()
         if len(df) > 10_000_000:
             warnings.warn(
                 f"PairUniverse.collect() materialized {len(df):,} rows. "
@@ -274,6 +302,22 @@ class PairUniverse:
                 stacklevel=2,
             )
         return df
+
+    def preview(self, n: int = 10) -> pl.DataFrame:
+        """Collect the first ``n`` rows of the pair frame without warning.
+
+        Pushes a ``head(n)`` limit into the lazy plan so only ``n`` rows are
+        materialized — the safe way to peek at a ``PairUniverse``'s schema or a
+        few rows without risking the full-cross-product collect that ``collect``
+        guards against. ``PairUniverse`` has no ``.df`` / cache, so nothing is
+        retained either way.
+
+        Parameters
+        ----------
+        n : int, optional
+            Number of rows to collect. Defaults to 10.
+        """
+        return self.build_lazy().head(n).collect()
 
     def group_by(self, *args, **kwargs):
         """Pass-through to ``self.build_lazy().group_by(*args, **kwargs)``.

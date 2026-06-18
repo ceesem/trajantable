@@ -97,6 +97,28 @@ def test_synapse_annotation_does_not_expand_rows(st):
     assert len(st.df) == 5
 
 
+def test_synapse_annotation_custom_syn_id_col(st):
+    """syn_id_col lets the annotation key column differ from the table id_col."""
+    ann = pl.DataFrame({"syn_id": [1, 2, 3, 4, 5], "score": [0.1, 0.2, 0.3, 0.4, 0.5]})
+    st.add_synapse_annotation("scores", ann, syn_id_col="syn_id")
+    df = st.df
+    assert len(df) == 5
+    # data column is joined; the differently-named key column is consumed
+    assert "score" in df.columns
+    assert "syn_id" not in df.columns
+    assert df.sort("id")["score"].to_list() == [0.1, 0.2, 0.3, 0.4, 0.5]
+
+
+def test_synapse_annotation_custom_syn_id_col_roundtrips(st, tmp_path):
+    """A custom syn_id_col survives save/load."""
+    ann = pl.DataFrame({"syn_id": [1, 2, 3, 4, 5], "score": [0.1, 0.2, 0.3, 0.4, 0.5]})
+    st.add_synapse_annotation("scores", ann, syn_id_col="syn_id")
+    st.save(tmp_path / "folio")
+    loaded = SynapseTable.load(tmp_path / "folio")
+    assert loaded._synapse_annotations["scores"].syn_id_col == "syn_id"
+    assert loaded.df.sort("id")["score"].to_list() == [0.1, 0.2, 0.3, 0.4, 0.5]
+
+
 def test_cell_annotation_does_not_expand_rows(st):
     """A valid cell annotation must not change the synapse count."""
     cell_ann = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["A", "B", "C"]})
@@ -232,6 +254,189 @@ def test_edgelist_no_cell_annotations(st):
     el = st.edgelist().df
     assert "n_syn" in el.columns
     assert len(el.columns) == 3  # pre_col, post_col, n_syn
+
+
+# ── edgelist(count_by=...) agglomeration ────────────────────────────────────
+
+
+@pytest.fixture
+def st_count_by():
+    """Two pairs (10->20 with 3 syns, 20->30 with 3 syns) carrying a
+    categorical column with nulls and a numeric size column. Type columns map
+    each pair to a single (pre_type, post_type) cell so type_edgelist groups
+    one-to-one with the cell pairs."""
+    syn = pl.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 5, 6],
+            "pre_pt_root_id": [10, 10, 10, 20, 20, 20],
+            "post_pt_root_id": [20, 20, 20, 30, 30, 30],
+            "my_column": ["type_a", "type_a", "type_b", None, "type_a", None],
+            "size": [50, 150, 600, 90, 250, 700],
+            "pre_type": ["E", "E", "E", "I", "I", "I"],
+            "post_type": ["I", "I", "I", "E", "E", "E"],
+        }
+    )
+    return SynapseTable(syn)
+
+
+def _pair(el, pre, post, col):
+    """Pull the struct value of `col` for the (pre, post) pair as a dict."""
+    row = el.df.filter(
+        (pl.col("pre_pt_root_id") == pre) & (pl.col("post_pt_root_id") == post)
+    )
+    return row[col][0]
+
+
+def test_count_by_categorical_struct(st_count_by):
+    """A bare categorical column becomes a struct counting each value + nulls."""
+    el = st_count_by.edgelist(count_by="my_column")
+    assert el.df["my_column"].dtype == pl.Struct
+    assert _pair(el, 10, 20, "my_column") == {
+        "type_a": 2,
+        "type_b": 1,
+        "__null__": 0,
+    }
+    assert _pair(el, 20, 30, "my_column") == {
+        "type_a": 1,
+        "type_b": 0,
+        "__null__": 2,
+    }
+
+
+def test_count_by_numeric_bins_struct(st_count_by):
+    """Numeric bins span ±inf (left-open/right-closed) and count nulls."""
+    el = st_count_by.edgelist(count_by={"size": [100, 500]})
+    assert _pair(el, 10, 20, "size") == {
+        "<= 100": 1,  # 50
+        "(100, 500]": 1,  # 150
+        "> 500": 1,  # 600
+        "__null__": 0,
+    }
+
+
+def test_count_by_list_and_dict_combined(st_count_by):
+    """count_by accepts a {name: bins|None} dict mixing categorical and numeric."""
+    el = st_count_by.edgelist(count_by={"my_column": None, "size": [100, 500]})
+    assert el.df["my_column"].dtype == pl.Struct
+    assert el.df["size"].dtype == pl.Struct
+    # n_syn still produced alongside
+    assert "n_syn" in el.df.columns
+
+
+def test_count_by_list_form(st_count_by):
+    """A list of names is treated as all-categorical."""
+    el = st_count_by.edgelist(count_by=["my_column"])
+    assert el.df["my_column"].dtype == pl.Struct
+
+
+def test_count_by_numeric_without_bins_raises(st_count_by):
+    with pytest.raises(ValueError, match="numeric.*provide explicit bin edges"):
+        st_count_by.edgelist(count_by="size")
+
+
+def test_count_by_bins_on_non_numeric_raises(st_count_by):
+    with pytest.raises(ValueError, match="bins are only valid for numeric"):
+        st_count_by.edgelist(count_by={"my_column": [1, 2]})
+
+
+def test_count_by_non_ascending_bins_raises(st_count_by):
+    with pytest.raises(ValueError, match="strictly ascending"):
+        st_count_by.edgelist(count_by={"size": [500, 100]})
+
+
+def test_count_by_missing_column_raises(st_count_by):
+    with pytest.raises(ValueError, match="not found in table"):
+        st_count_by.edgelist(count_by="nope")
+
+
+def test_count_by_collision_with_agg_raises(st_count_by):
+    """A count_by struct name that shadows an agg output is rejected."""
+    with pytest.raises(ValueError, match="reserved|collide"):
+        st_count_by.edgelist(agg={"my_column": pl.first("size")}, count_by="my_column")
+
+
+def test_fraction_by_categorical(st_count_by):
+    """fraction_by yields fractions that sum to 1.0 (incl. __null__)."""
+    el = st_count_by.edgelist(fraction_by="my_column")
+    s = _pair(el, 10, 20, "my_column")
+    assert s == pytest.approx({"type_a": 2 / 3, "type_b": 1 / 3, "__null__": 0.0})
+    s2 = _pair(el, 20, 30, "my_column")
+    assert sum(s2.values()) == pytest.approx(1.0)
+    assert s2["__null__"] == pytest.approx(2 / 3)
+
+
+def test_fraction_by_numeric_bins(st_count_by):
+    """fraction_by numeric bins also sum to 1.0 per pair."""
+    el = st_count_by.edgelist(fraction_by={"size": [100, 500]})
+    s = _pair(el, 10, 20, "size")
+    assert sum(s.values()) == pytest.approx(1.0)
+    assert s["(100, 500]"] == pytest.approx(1 / 3)
+
+
+def test_count_by_and_fraction_by_different_columns(st_count_by):
+    """Raw counts and fractions can be requested for different columns at once."""
+    el = st_count_by.edgelist(count_by="my_column", fraction_by={"size": [100, 500]})
+    assert _pair(el, 10, 20, "my_column")["type_a"] == 2  # raw count
+    assert sum(_pair(el, 10, 20, "size").values()) == pytest.approx(1.0)  # fraction
+
+
+def test_count_by_same_column_in_both_raises(st_count_by):
+    """A column may appear in count_by or fraction_by, not both."""
+    with pytest.raises(ValueError, match="both count_by and fraction_by"):
+        st_count_by.edgelist(count_by="my_column", fraction_by="my_column")
+
+
+def test_fraction_exclude_null_drops_field_and_renorms(st_count_by):
+    """fraction_include_null=False omits __null__ and divides by non-null."""
+    el = st_count_by.edgelist(fraction_by="my_column", fraction_include_null=False)
+    s = _pair(el, 10, 20, "my_column")
+    assert "__null__" not in s
+    assert s == pytest.approx({"type_a": 2 / 3, "type_b": 1 / 3})
+    # pair 20->30 has 1 non-null (type_a) of 3 synapses -> type_a is 1.0 of non-null
+    s2 = _pair(el, 20, 30, "my_column")
+    assert s2 == pytest.approx({"type_a": 1.0, "type_b": 0.0})
+
+
+def test_fraction_include_null_true_keeps_field(st_count_by):
+    """The default keeps __null__ and divides over all synapses."""
+    el = st_count_by.edgelist(fraction_by="my_column", fraction_include_null=True)
+    assert "__null__" in _pair(el, 10, 20, "my_column")
+
+
+def test_fraction_include_null_does_not_affect_raw_count(st_count_by):
+    """fraction_include_null is irrelevant to count_by raw counts."""
+    el = st_count_by.edgelist(count_by="my_column", fraction_include_null=False)
+    # raw counts always keep __null__
+    assert _pair(el, 20, 30, "my_column") == {
+        "type_a": 1,
+        "type_b": 0,
+        "__null__": 2,
+    }
+
+
+def test_fraction_exclude_null_all_null_column_raises(st):
+    """An all-null column cannot be fractioned excluding nulls."""
+    ann = pl.DataFrame({"id": [1, 2, 3, 4, 5], "c": [None] * 5})
+    st.add_synapse_annotation("a", ann)
+    with pytest.raises(ValueError, match="no non-null values to normalize"):
+        st.edgelist(fraction_by="c", fraction_include_null=False)
+
+
+def test_type_edgelist_count_by(st_count_by):
+    """type_edgelist supports count_by, tallying per type pair."""
+    ct = st_count_by.type_edgelist("pre_type", "post_type", count_by="my_column")
+    assert ct.df["my_column"].dtype == pl.Struct
+    row = ct.df.filter((pl.col("pre_type") == "E") & (pl.col("post_type") == "I"))
+    assert row["my_column"][0] == {"type_a": 2, "type_b": 1, "__null__": 0}
+
+
+def test_type_edgelist_fraction_by(st_count_by):
+    """type_edgelist supports fraction_by."""
+    ct = st_count_by.type_edgelist(
+        "pre_type", "post_type", fraction_by={"size": [100, 500]}
+    )
+    row = ct.df.filter((pl.col("pre_type") == "E") & (pl.col("post_type") == "I"))
+    assert sum(row["size"][0].values()) == pytest.approx(1.0)
 
 
 # ── edgelist() propagation (annotations + roles + aliases) ──────────────────
@@ -997,6 +1202,8 @@ def test_add_spatial_features_default_columns(st_spatial):
         "soma_phi",
         "soma_rho",
         "soma_dy",
+        "soma_pre_depth",
+        "soma_post_depth",
     ):
         assert feat in cols, f"missing {feat}"
 
@@ -1036,6 +1243,71 @@ def test_add_spatial_features_target_syn(st_spatial):
     cols = st_spatial.df.columns
     for feat in ("pre_syn_euclidean", "pre_syn_depth_diff"):
         assert feat in cols
+
+
+def test_cell_depth_values(st_spatial):
+    """pre_depth / post_depth are the per-side soma depths; their difference
+    equals depth_diff."""
+    import math
+
+    st_spatial.add_spatial_features(prefix="soma")
+    # Synapse 5: pre=cell30 (y=4), post=cell10 (y=0)
+    row = st_spatial.df.filter(pl.col("id") == 5).row(0, named=True)
+    assert math.isclose(row["soma_pre_depth"], 4.0)
+    assert math.isclose(row["soma_post_depth"], 0.0)
+    assert math.isclose(
+        row["soma_post_depth"] - row["soma_pre_depth"], row["soma_depth_diff"]
+    )
+
+
+def test_cell_depth_independent_of_direction(st_spatial):
+    """pre_depth / post_depth are absolute, so they don't flip with center/target."""
+    import math
+
+    st_spatial.add_spatial_features(prefix="fwd")
+    st_spatial.add_spatial_features(prefix="rev", center="post", target="pre")
+    row = st_spatial.df.filter(pl.col("id") == 5).row(0, named=True)
+    assert math.isclose(row["fwd_pre_depth"], row["rev_pre_depth"])
+    assert math.isclose(row["fwd_post_depth"], row["rev_post_depth"])
+
+
+def test_cell_depth_reversed_axis_negates(st_spatial):
+    """depth_axis='y_r' flips the sign of the absolute depth."""
+    import math
+
+    st_spatial.add_spatial_features(
+        prefix="r",
+        depth_axis="y_r",
+        euclidean=False,
+        depth_diff=False,
+        spherical=False,
+        cylindrical=False,
+    )
+    row = st_spatial.df.filter(pl.col("id") == 5).row(0, named=True)
+    assert math.isclose(row["r_pre_depth"], -4.0)  # cell30 y=4 reversed
+
+
+def test_cell_depth_off(st_spatial):
+    st_spatial.add_spatial_features(prefix="x", cell_depth=False)
+    cols = st_spatial.df.columns
+    assert "x_pre_depth" not in cols
+    assert "x_post_depth" not in cols
+
+
+def test_cell_depth_classified_pre_post_and_survives_edgelist(st_spatial):
+    """pre_depth/post_depth classify per side and ride through edgelist()."""
+    st_spatial.add_spatial_features(
+        prefix="soma",
+        euclidean=False,
+        depth_diff=False,
+        spherical=False,
+        cylindrical=False,
+    )
+    assert st_spatial.expression_sides["soma_pre_depth"] == "pre"
+    assert st_spatial.expression_sides["soma_post_depth"] == "post"
+    el = st_spatial.edgelist()
+    assert "soma_pre_depth" in el.df.columns
+    assert "soma_post_depth" in el.df.columns
 
 
 def test_add_spatial_features_soma_soma_in_edgelist(st_spatial):
@@ -1476,6 +1748,51 @@ def test_build_lazy_is_public(st):
     assert lf.collect().equals(st.df)
 
 
+def test_lazy_property_aliases_build_lazy(st):
+    """.lazy returns the uncollected plan and does not populate the cache."""
+    assert st._cache is None
+    lf = st.lazy
+    assert isinstance(lf, pl.LazyFrame)
+    assert st._cache is None  # no side-effect collect, unlike .df
+    assert lf.collect().equals(st.build_lazy().collect())
+
+
+def test_lazy_property_reflects_filters(st):
+    """.lazy carries accumulated filters into the plan for downstream ops."""
+    out = (
+        st.filter(pl.col("pre_pt_root_id") == 10)
+        .lazy.group_by("pre_pt_root_id")
+        .len()
+        .collect()
+    )
+    assert out["pre_pt_root_id"].to_list() == [10]
+    assert out["len"][0] == 2  # ids 1,2 have pre 10 in the fixture
+
+
+def test_select_returns_lazyframe_no_cache(st):
+    """st.select() is a polars LazyFrame pass-through and does not cache."""
+    result = st.select(["pre_pt_root_id"])
+    assert isinstance(result, pl.LazyFrame)
+    assert st._cache is None
+    assert result.collect().columns == ["pre_pt_root_id"]
+
+
+def test_group_by_returns_lazy_groupby(st):
+    """st.group_by() is a polars LazyGroupBy pass-through and carries filters."""
+    from polars.lazyframe.group_by import LazyGroupBy
+
+    gb = st.filter(pl.col("pre_pt_root_id") == 10).group_by("pre_pt_root_id")
+    assert isinstance(gb, LazyGroupBy)
+    out = gb.len().collect()
+    assert out["len"][0] == 2
+    assert st._cache is None
+
+
+def test_count_matches_len(st):
+    assert st.count() == len(st) == 5
+    assert st.filter(pl.col("pre_pt_root_id") == 10).count() == 2
+
+
 def test_cell_annotation_data_cols(st):
     assert st.cell_annotation_data_cols() == {}
     ann = pl.DataFrame({"root_id": [10, 20, 30], "cell_type": ["a", "b", "c"]})
@@ -1486,3 +1803,54 @@ def test_cell_annotation_data_cols(st):
     d["types"].append("bogus")
     d["other"] = ["nope"]
     assert st.cell_annotation_data_cols() == {"types": ["cell_type"]}
+
+
+# ── clear_cache / preview / collect ──────────────────────────────────────────
+
+
+def test_clear_cache_drops_and_repopulates(st_with_cell_ann):
+    """clear_cache() releases the materialized .df; next access rebuilds it."""
+    st = st_with_cell_ann
+    _ = st.df  # force materialization
+    assert st._cache is not None
+    ret = st.clear_cache()
+    assert ret is st  # chainable
+    assert st._cache is None
+    # Rebuilds correctly and identically on next access.
+    assert "cell_type_pre" in st.df.columns
+    assert st._cache is not None
+
+
+def test_preview_limits_rows_and_does_not_cache(st_with_cell_ann):
+    """preview(n) returns at most n rows without populating the cache."""
+    st = st_with_cell_ann
+    out = st.preview(2)
+    assert len(out) == 2
+    assert "cell_type_pre" in out.columns  # full schema, just limited rows
+    assert st._cache is None  # no side-effect collect
+
+
+def test_collect_none_returns_cached_df(st_with_cell_ann):
+    """collect() with no cols is the cached .df."""
+    st = st_with_cell_ann
+    out = st.collect()
+    assert out.equals(st.df)
+    assert st._cache is not None
+
+
+def test_collect_narrow_projects_without_caching(st_with_cell_ann):
+    """collect(cols) returns only those columns and does not cache."""
+    st = st_with_cell_ann
+    out = st.collect(["pre_pt_root_id", "cell_type_pre"])
+    assert out.columns == ["pre_pt_root_id", "cell_type_pre"]
+    assert st._cache is None
+
+
+def test_collect_accepts_single_string(st_with_cell_ann):
+    out = st_with_cell_ann.collect("cell_type_pre")
+    assert out.columns == ["cell_type_pre"]
+
+
+def test_collect_unknown_column_raises(st_with_cell_ann):
+    with pytest.raises(ValueError, match="not found in table"):
+        st_with_cell_ann.collect(["nope"])

@@ -314,3 +314,25 @@ def test_filter_sides_round_trip_edgelist(el, tmp_path):
     filtered.save(str(folio))
     loaded = EdgeList.load(str(folio))
     assert loaded.filter_sides == filtered.filter_sides == ["post", None]
+
+
+# ── inherited clear_cache / preview / collect ─────────────────────────────────
+
+
+def test_inherits_clear_cache(el):
+    _ = el.df
+    assert el._cache is not None
+    assert el.clear_cache() is el
+    assert el._cache is None
+
+
+def test_inherits_preview_without_caching(el):
+    out = el.preview(2)
+    assert len(out) == 2
+    assert el._cache is None
+
+
+def test_inherits_narrow_collect(el):
+    out = el.collect(["pre", "n_syn"])
+    assert out.columns == ["pre", "n_syn"]
+    assert el._cache is None

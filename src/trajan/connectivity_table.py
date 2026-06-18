@@ -432,6 +432,70 @@ class ConnectivityTable:
             self._cache = self.build_lazy().collect()
         return self._cache
 
+    def clear_cache(self) -> ConnectivityTable:
+        """Drop the materialized ``.df`` cache, releasing its memory.
+
+        ``.df`` pins the merged pair-level frame for the object's lifetime once
+        touched. Call this when you keep a reference to the table but no longer
+        need it materialized — the next ``.df`` access rebuilds it lazily. A
+        no-op when nothing is cached. Returns self for chaining.
+        """
+        self._cache = None
+        return self
+
+    def preview(self, n: int = 10) -> pl.DataFrame:
+        """Collect the first ``n`` rows of the merged table without caching.
+
+        Unlike ``.df.head(n)`` — which forces a full collect and pins the result
+        on ``self._cache`` — this pushes a ``head(n)`` limit into the lazy plan,
+        so only ``n`` rows are materialized and nothing is cached. Use it to peek
+        at the schema / a few rows of a large table cheaply.
+
+        Parameters
+        ----------
+        n : int, optional
+            Number of rows to collect. Defaults to 10.
+        """
+        return self.build_lazy().head(n).collect()
+
+    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+        """Materialize the merged table, optionally projecting to ``cols``.
+
+        With ``cols=None`` this is just the cached ``.df``. With an explicit
+        column list, it selects those columns *before* collecting, so Polars'
+        projection pushdown skips materializing (and often skips joining) every
+        other annotation column. This is the memory-cheap path for plotting:
+        pull only the columns a figure needs instead of the whole frame. The
+        narrow result is returned fresh and is **not** cached.
+
+        Parameters
+        ----------
+        cols : list[str] or str or None, optional
+            Columns to project. ``None`` (default) returns the full cached
+            ``.df``. A single string is treated as a one-element list.
+
+        Returns
+        -------
+        pl.DataFrame
+            The full cached frame (``cols=None``) or a fresh narrow projection.
+
+        Raises
+        ------
+        ValueError
+            If any requested column is not present in the merged table.
+        """
+        if cols is None:
+            return self.df
+        if isinstance(cols, str):
+            cols = [cols]
+        schema = self.build_lazy().collect_schema().names()
+        missing = [c for c in cols if c not in schema]
+        if missing:
+            raise ValueError(
+                f"Column(s) {missing} not found in table. Available: {schema}"
+            )
+        return self.build_lazy().select(cols).collect()
+
     @property
     def pairs(self) -> pl.DataFrame:
         """Base pair table — no annotations joined, no filters, no expressions.

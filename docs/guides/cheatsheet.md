@@ -483,6 +483,68 @@ el2 = trajan.EdgeList.load("edges.folio")     # or ConnectivityTable.load(), whi
 
 ---
 
+## 11. Working with large tables: bind, peek, project
+
+> *"My synapse table is millions of rows. How do I keep notebooks fast and memory
+> sane — especially when I make a dozen plots off the same filtered data?"*
+
+**Bind the reduced object once, then reuse it.** Every `.filter()` / `.edgelist()`
+returns a *new* table with an empty cache, so re-typing the whole chain in each
+cell re-scans the source and re-runs every join and aggregation. Aggregating 8M
+synapses for *each* of five plots is the most common avoidable cost. Build the
+small object once and let its (cached) `.df` serve every plot:
+
+```python
+# ❌ each cell rebuilds the chain from raw synapses
+sns.scatterplot(data=st.filter(pl.col("is_pf_pre")).edgelist().df, ...)   # cell A
+sns.scatterplot(data=st.filter(pl.col("is_pf_pre")).edgelist().df, ...)   # cell B — recomputes everything
+
+# ✅ bind once; .df is cached on `el`, so later cells are free
+el = st.filter(pl.col("is_pf_pre")).edgelist()
+sns.scatterplot(data=el.df, ...)   # collects once
+sns.scatterplot(data=el.df, ...)   # cache hit
+```
+
+The same applies to `cells(participation=True)`: pass the **bound `EdgeList`**, not
+the `SynapseTable`, so participation counts don't re-aggregate the synapses each call:
+
+```python
+el = st.edgelist()
+cells(el, participation=True).filter(pl.col("in_pre"))   # reuses el, no re-aggregation
+```
+
+**Peek without materializing.** `st.df.head()` forces a *full* collect of every row
+and pins it on the cache just to show a few. Use `preview(n)` — it pushes a
+`head(n)` limit into the plan, collects only `n` rows, and caches nothing:
+
+```python
+st.preview()      # first 10 rows of the merged table; nothing pinned
+el.preview(20)
+pu.preview()      # safe peek at a PairUniverse without the full cross-product collect
+```
+
+**Release a cache** you no longer need (the merged synapse `.df` can be GBs):
+
+```python
+st.clear_cache()   # drops the materialized .df; next .df rebuilds lazily. chainable.
+```
+
+**Project to just the columns you need** with `collect(cols)`. It selects *before*
+collecting, so Polars' projection pushdown skips materializing — and can prune the
+joins for — unused annotation columns. The narrow result is fresh and uncached:
+
+```python
+el.collect(["soma_depth_pre", "soma_depth_post", "size", "pre_post_distance"])
+```
+
+!!! note "When does `collect(cols)` actually help?"
+    Mainly at **synapse scale** (millions of rows × wide) or on a **full unfiltered
+    edgelist**. The *filtered* edgelists and `cells()` frames you usually plot are
+    small (≤10⁵ rows) — there the cached `.df` is already cheap and projecting buys
+    little. The bigger levers for those are **binding** (above) and `preview()`.
+
+---
+
 ## Quick reference
 
 **Build & annotate** (`SynapseTable`)
@@ -522,11 +584,10 @@ el2 = trajan.EdgeList.load("edges.folio")     # or ConnectivityTable.load(), whi
 **Export**
 : `to_graph(st, edge_agg=, cell_agg=, backend="networkx"|"igraph"|"csgraph")` · `to_dataframe(st, unpack_positions=)`
 
-**Inspect**
-: `st.info()` · `st.df` · `el.df` · `st.cell_annotations[name]` · `st.weights` · `st.filter_sides`
+**Inspect & materialize**
+: `st.info()` · `st.df` / `el.df` *(cached full)* · `preview(n=10)` *(uncached peek)* · `collect(cols=)` *(narrow projection)*
+  · `clear_cache()` *(release `.df`)* · `st.cell_annotations[name]` · `st.weights` · `st.filter_sides`
 
 **`bin_by` recipes**
 : `{"d_rho": [0, 50, 100, 200]}` continuous → `d_rho_bin` · `{"cell_type_post": None}` categorical
   · `{"d_rho": [...], "d_y": [...]}` joint 2-D grid · mixing continuous + categorical is fine
-</content>
-</invoke>

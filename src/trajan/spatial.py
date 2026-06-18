@@ -238,6 +238,52 @@ def bbox_predicate(col: str, bbox) -> pl.Expr:
     )
 
 
+def _parse_depth_axis(depth_axis: str) -> tuple[str, int]:
+    """Split a depth-axis spec into ``(axis, sign)``.
+
+    A plain ``"x"`` / ``"y"`` / ``"z"`` means positive values go deeper
+    (``sign = 1``). A trailing ``"_r"`` reverses it (``sign = -1``), so positive
+    values point towards the surface. Shared by the depth-aware spatial helpers
+    so they parse the convention identically.
+    """
+    if depth_axis.endswith("_r"):
+        return depth_axis[:-2], -1
+    return depth_axis, 1
+
+
+def depth_component(col: str, depth_axis: str = "y") -> pl.Expr:
+    """Signed depth coordinate of a position struct along ``depth_axis``.
+
+    Returns the ``depth_axis`` field of the position struct, sign-adjusted so
+    that larger values are deeper (matching the ``depth_diff`` convention of
+    :func:`spatial_feature_exprs`). Evaluates to NaN where the column is null.
+
+    Parameters
+    ----------
+    col : str
+        Name of the position struct column (struct with x, y, z fields).
+    depth_axis : str, optional
+        Axis representing cortical depth, with optional ``"_r"`` direction
+        suffix. Defaults to ``"y"``.
+
+    Returns
+    -------
+    pl.Expr
+        Expression for the signed depth coordinate. NaN where ``col`` is null.
+
+    Examples
+    --------
+    >>> st.add_expression("pre_depth", depth_component("soma_pre"))
+    """
+    axis, sign = _parse_depth_axis(depth_axis)
+    c = pl.col(col)
+    return (
+        pl.when(c.is_not_null())
+        .then(sign * c.struct.field(axis))
+        .otherwise(pl.lit(float("nan")))
+    )
+
+
 def _sq_distance_expr(col_a: str, col_b: str, axes: tuple[str, ...]) -> pl.Expr:
     a, b = pl.col(col_a), pl.col(col_b)
     terms = [(a.struct.field(ax) - b.struct.field(ax)).pow(2) for ax in axes]
@@ -366,12 +412,7 @@ def spatial_feature_exprs(
     >>> feats = spatial_feature_exprs("soma_pre", "soma_post", depth_axis="y_r")
     """
     # Parse optional "_r" suffix — reverses the sign of the depth component
-    if depth_axis.endswith("_r"):
-        axis = depth_axis[:-2]
-        depth_sign = -1
-    else:
-        axis = depth_axis
-        depth_sign = 1
+    axis, depth_sign = _parse_depth_axis(depth_axis)
 
     fc, tc = pl.col(from_col), pl.col(to_col)
     null_cond = fc.is_not_null() & tc.is_not_null()

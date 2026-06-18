@@ -3,7 +3,12 @@ import math
 import polars as pl
 import pytest
 
-from trajan.spatial import euclidean_distance, radial_distance, spatial_feature_exprs
+from trajan.spatial import (
+    depth_component,
+    euclidean_distance,
+    radial_distance,
+    spatial_feature_exprs,
+)
 
 
 @pytest.fixture
@@ -44,6 +49,30 @@ def test_radial_distance_null_b(pos_df):
 def test_radial_distance_null_a(pos_df):
     result = pos_df.select(radial_distance("a", "b").alias("d"))["d"]
     assert math.isnan(result[2])
+
+
+# ── depth_component ────────────────────────────────────────────────────────────
+
+
+def test_depth_component_default_axis(pos_df):
+    result = pos_df.select(depth_component("a").alias("d"))["d"]
+    assert math.isclose(result[0], 0.0)  # a[0].y == 0
+    assert math.isclose(result[1], 2.0)  # a[1].y == 2
+
+
+def test_depth_component_reversed(pos_df):
+    result = pos_df.select(depth_component("a", depth_axis="y_r").alias("d"))["d"]
+    assert math.isclose(result[1], -2.0)  # a[1].y == 2, reversed
+
+
+def test_depth_component_other_axis(pos_df):
+    result = pos_df.select(depth_component("b", depth_axis="x").alias("d"))["d"]
+    assert math.isclose(result[0], 3.0)  # b[0].x == 3
+
+
+def test_depth_component_null_gives_nan(pos_df):
+    result = pos_df.select(depth_component("a").alias("d"))["d"]
+    assert math.isnan(result[2])  # a[2] is null
 
 
 # ── spatial_feature_exprs ──────────────────────────────────────────────────────
