@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -8,6 +9,7 @@ from trajan.spatial import (
     euclidean_distance,
     radial_distance,
     spatial_feature_exprs,
+    transform_point,
 )
 
 
@@ -73,6 +75,74 @@ def test_depth_component_other_axis(pos_df):
 def test_depth_component_null_gives_nan(pos_df):
     result = pos_df.select(depth_component("a").alias("d"))["d"]
     assert math.isnan(result[2])  # a[2] is null
+
+
+# ── transform_point ────────────────────────────────────────────────────────────
+
+
+def test_transform_point_array_mode(pos_df):
+    out = pos_df.select(transform_point("a", lambda p: p * 2).alias("o"))["o"]
+    assert out[0] == {"x": 0.0, "y": 0.0, "z": 0.0}
+    assert out[1] == {"x": 2.0, "y": 4.0, "z": 4.0}
+    assert out[2] is None  # null struct -> null output
+
+
+def test_transform_point_vectorized_mode(pos_df):
+    out = pos_df.select(
+        transform_point(
+            "a", lambda x, y, z: (x * 2, y * 2, z * 2), vectorized=True
+        ).alias("o")
+    )["o"]
+    assert out[1] == {"x": 2.0, "y": 4.0, "z": 4.0}
+    assert out[2] is None
+
+
+def test_transform_point_modes_agree(pos_df):
+    arr = pos_df.select(transform_point("a", lambda p: p + 1).alias("o"))["o"]
+    vec = pos_df.select(
+        transform_point(
+            "a", lambda x, y, z: (x + 1, y + 1, z + 1), vectorized=True
+        ).alias("o")
+    )["o"]
+    assert arr.to_list() == vec.to_list()
+
+
+def test_transform_point_output_is_xyz_struct(pos_df):
+    dtype = pos_df.select(transform_point("a", lambda p: p).alias("o")).schema["o"]
+    assert dtype == pl.Struct({"x": pl.Float64, "y": pl.Float64, "z": pl.Float64})
+
+
+def test_transform_point_field_null_maps_to_null():
+    """A non-null struct with a null axis is treated as missing."""
+    df = pl.DataFrame(
+        {"p": [{"x": 1.0, "y": 2.0, "z": None}, {"x": 1.0, "y": 2.0, "z": 3.0}]}
+    )
+    arr = df.select(transform_point("p", lambda p: p * 2).alias("o"))["o"]
+    vec = df.select(
+        transform_point("p", lambda x, y, z: (x, y, z), vectorized=True).alias("o")
+    )["o"]
+    assert arr[0] is None and vec[0] is None
+    assert arr[1] == {"x": 2.0, "y": 4.0, "z": 6.0}
+
+
+def test_transform_point_affine_array(pos_df):
+    """An affine map pts @ M.T + t works in array mode (the common case)."""
+    M = np.array([[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]])  # 90° about z
+    out = pos_df.select(transform_point("a", lambda p: p @ M.T).alias("o"))["o"]
+    # (1, 2, 2) -> (-2, 1, 2)
+    assert out[1] == {"x": -2.0, "y": 1.0, "z": 2.0}
+
+
+def test_transform_point_shape_mismatch_raises(pos_df):
+    with pytest.raises(ValueError, match="expected"):
+        pos_df.select(transform_point("a", lambda p: p[:, :2]).alias("o"))
+
+
+def test_transform_point_vectorized_wrong_arity_raises(pos_df):
+    with pytest.raises(ValueError, match="axes"):
+        pos_df.select(
+            transform_point("a", lambda x, y, z: (x, y), vectorized=True).alias("o")
+        )
 
 
 # ── spatial_feature_exprs ──────────────────────────────────────────────────────

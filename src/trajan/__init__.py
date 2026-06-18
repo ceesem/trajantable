@@ -14,6 +14,7 @@ from .spatial import (
     pack_all_positions,
     pack_position,
     radial_distance,
+    transform_point,
     unpack_all_positions,
     unpack_position,
 )
@@ -52,6 +53,7 @@ __all__ = [
     "radial_distance",
     "to_dataframe",
     "to_graph",
+    "transform_point",
     "unpack_all_positions",
     "unpack_position",
     "wilson_ci",

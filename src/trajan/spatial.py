@@ -203,6 +203,114 @@ def pack_all_positions(
     return df
 
 
+def transform_point(
+    col: str,
+    func,
+    *,
+    vectorized: bool = False,
+    axes: tuple[str, ...] = ("x", "y", "z"),
+) -> pl.Expr:
+    """Transform a position struct column through ``func``, repacking the result.
+
+    Reads the ``axes`` fields of the position struct ``col``, applies ``func``,
+    and returns a new struct expression with the same field names — i.e. another
+    position column in the same packed form as :func:`pack_position`, ready to
+    register via ``SynapseTable.add_expression`` / ``add_cell_annotation``.
+
+    Two function contracts are supported:
+
+    - **Array (default)** — ``func`` maps an ``(N, len(axes))`` numpy array to an
+      ``(N, len(axes))`` array. This is the form coordinate-transform libraries
+      use (e.g. ``standard_transform``) and what affine maps ``pts @ M.T + t``
+      produce. It runs as a single vectorized ``map_batches`` call at collect
+      time — fast, but opaque to the query optimizer and routed through Python.
+    - **Vectorized** (``vectorized=True``) — ``func(x, y, z)`` takes the per-axis
+      polars *expressions* and returns a tuple of new per-axis expressions. Fully
+      lazy and optimizer-visible; use it for scale / flip / hand-written affine.
+      It reads point-wise but runs columnar (no per-row Python).
+
+    A point is treated as missing when its struct is null *or* any axis field is
+    null; such rows map to a null output struct in both modes, so downstream
+    spatial helpers continue to treat them as missing. Array-mode output is
+    Float64.
+
+    Parameters
+    ----------
+    col : str
+        Name of the source position struct column (struct with ``axes`` fields).
+    func : callable
+        Array mode: ``(N, k) -> (N, k)``. Vectorized mode: ``(x, y, z) ->
+        (x', y', z')`` of polars expressions (one per axis).
+    vectorized : bool, optional
+        Select the vectorized-expression contract instead of the array one.
+        Defaults to False (array / Nx3).
+    axes : tuple of str, optional
+        Struct field names, in order. Defaults to ``("x", "y", "z")``.
+
+    Returns
+    -------
+    pl.Expr
+        A struct expression with fields ``axes``.
+
+    Examples
+    --------
+    Array transform from a coordinate-transform library:
+
+    >>> tf = minnie_transform_nm()
+    >>> st.add_expression("soma_um", transform_point("soma", tf.apply))
+
+    Vectorized scale (stays lazy):
+
+    >>> st.add_expression(
+    ...     "soma_um",
+    ...     transform_point("soma", lambda x, y, z: (x / 1e3, y / 1e3, z / 1e3),
+    ...                     vectorized=True),
+    ... )
+    """
+    c = pl.col(col)
+
+    # A point is missing if the struct is null or any axis field is null.
+    missing = c.is_null() | pl.any_horizontal(
+        [c.struct.field(a).is_null() for a in axes]
+    )
+
+    if vectorized:
+        out = list(func(*(c.struct.field(a) for a in axes)))
+        if len(out) != len(axes):
+            raise ValueError(
+                f"transform_point(vectorized=True): func returned {len(out)} "
+                f"expressions but {len(axes)} axes {axes} were expected."
+            )
+        packed = pl.struct([e.alias(a) for a, e in zip(axes, out)])
+        return pl.when(missing).then(pl.lit(None)).otherwise(packed)
+
+    def _batch(s: pl.Series) -> pl.Series:
+        import numpy as np
+
+        arr = s.struct.unnest().select(list(axes)).to_numpy().astype(float)
+        # Missing = struct null or any non-finite (null) coordinate.
+        miss = s.is_null().to_numpy() | ~np.isfinite(arr).all(axis=1)
+        # Zero the missing rows so func can't choke; they're nulled out after.
+        filled = np.where(np.isfinite(arr), arr, 0.0)
+        out = np.asarray(func(filled), dtype=float)
+        if out.shape != arr.shape:
+            raise ValueError(
+                f"transform_point: func returned shape {out.shape}, expected "
+                f"{arr.shape} (N x {len(axes)})."
+            )
+        res = pl.struct([pl.Series(a, out[:, i]) for i, a in enumerate(axes)]).alias(
+            s.name
+        )
+        if miss.any():
+            res = pl.when(pl.Series(~miss)).then(res).otherwise(pl.lit(None))
+        return pl.select(res).to_series()
+
+    return c.map_batches(
+        _batch,
+        return_dtype=pl.Struct([pl.Field(a, pl.Float64) for a in axes]),
+    )
+
+
 def bbox_predicate(col: str, bbox) -> pl.Expr:
     """Boolean expression: position struct ``col`` lies within ``bbox``.
 
