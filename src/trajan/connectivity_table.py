@@ -203,6 +203,8 @@ class ConnectivityTable(_CachedTable):
                     role_tags.append("universe")
                 if spec.position_col is not None:
                     role_tags.append(f"position={spec.position_col!r}")
+                if spec.side != "both":
+                    role_tags.append(f"side={spec.side!r}")
                 join_info = (
                     f"join on alias {spec.join_on_alias!r}"
                     if spec.join_on_alias
@@ -213,7 +215,9 @@ class ConnectivityTable(_CachedTable):
                     f"  {name!r} ({len(spec.data_cols)} col(s), {join_info}){role_str}"
                 )
                 for c in spec.data_cols:
-                    lines.append(f"    {c}  ->  {c}_pre, {c}_post")
+                    lines.append(
+                        f"    {c}  ->  " + ", ".join(f"{c}_{s}" for s in spec.sides())
+                    )
         if self._expressions:
             lines.append("")
             lines.append(f"Expressions ({len(self._expressions)})")
@@ -259,12 +263,17 @@ class ConnectivityTable(_CachedTable):
         cell_id_col: str,
         position_col: str | None = None,
         is_universe: bool = False,
+        side: str = "both",
     ) -> ConnectivityTable:
-        """Register a per-entity annotation joined symmetrically on pre and post.
+        """Register a per-entity annotation joined on pre and/or post.
 
-        Each data column in the annotation produces ``{col}_pre`` and
-        ``{col}_post`` on the merged frame. Whether the entities are cells or
-        labels (cell types) is up to the user — the join mechanics are the same.
+        With the default ``side="both"`` each data column produces both
+        ``{col}_pre`` and ``{col}_post`` on the merged frame — correct when both
+        axes are the same kind of entity. On an asymmetric table (e.g. a
+        cell × cell-type table from ``aggregate_to_type``) pass ``side="pre"``
+        or ``"post"`` to annotate only the matching axis; the other side would
+        join against labels and yield all-null columns. Whether the entities are
+        cells or labels is up to the user — the join mechanics are the same.
 
         Parameters
         ----------
@@ -292,6 +301,9 @@ class ConnectivityTable(_CachedTable):
             universe for denominator-bearing statistics. Auto-resolved when
             exactly one annotation is marked universe; pass the annotation
             name explicitly otherwise. See ``CellAnnotationSpec.is_universe``.
+        side : str, optional
+            Which axis to join onto: ``"pre"``, ``"post"``, or ``"both"``
+            (default). See the summary above.
         """
         self._cell_annotations[name] = build_cell_annotation_spec(
             df,
@@ -300,6 +312,7 @@ class ConnectivityTable(_CachedTable):
             is_universe=is_universe,
             join_on_alias=None,
             current_columns=self._current_columns(),
+            side=side,
         )
         self._cache = None
         return self
@@ -405,8 +418,7 @@ class ConnectivityTable(_CachedTable):
     def _current_columns(self) -> set[str]:
         cols = set(self._pair_col_names)
         for spec in self._cell_annotations.values():
-            cols |= {f"{c}_pre" for c in spec.data_cols}
-            cols |= {f"{c}_post" for c in spec.data_cols}
+            cols |= set(spec.produced_columns())
         cols |= set(self._expressions)
         return cols
 
@@ -719,6 +731,7 @@ class ConnectivityTable(_CachedTable):
             "data_cols": list(spec.data_cols),
             "position_col": spec.position_col,
             "is_universe": spec.is_universe,
+            "side": spec.side,
         }
 
     def _extra_save_config(self) -> dict:
@@ -777,6 +790,7 @@ class ConnectivityTable(_CachedTable):
                 cell_id_col=ann_meta["cell_id_col"],
                 position_col=ann_meta.get("position_col"),
                 is_universe=ann_meta.get("is_universe", False),
+                side=ann_meta.get("side", "both"),
             )
 
         # Named expressions — binary format first (round-trips literals

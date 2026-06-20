@@ -100,6 +100,55 @@ def test_add_annotation_symmetric_join(ct):
     assert result.filter(pl.col("post") == 11).head(1)["cell_type_post"].item() == "inh"
 
 
+def test_add_annotation_side_pre_only(ct):
+    """side='pre' joins only the pre axis: no _post column is produced, and
+    no collision arises if another annotation later claims the post side."""
+    ann = pl.DataFrame(
+        {
+            "entity_id": [1, 2, 3, 10, 11],
+            "cell_type": ["exc", "exc", "inh", "exc", "inh"],
+        }
+    )
+    ct.add_annotation("types", ann, cell_id_col="entity_id", side="pre")
+    result = ct.df
+    assert "cell_type_pre" in result.columns
+    assert "cell_type_post" not in result.columns
+    # _current_columns reflects only the produced side.
+    assert "cell_type_pre" in ct._current_columns()
+    assert "cell_type_post" not in ct._current_columns()
+
+
+def test_add_annotation_side_post_only(ct):
+    ann = pl.DataFrame(
+        {"entity_id": [1, 2, 3, 10, 11], "cell_type": ["a", "b", "c", "d", "e"]}
+    )
+    ct.add_annotation("types", ann, cell_id_col="entity_id", side="post")
+    cols = ct.df.columns
+    assert "cell_type_post" in cols
+    assert "cell_type_pre" not in cols
+
+
+def test_add_annotation_one_sided_avoids_collision(ct):
+    """Two pre/post-disjoint one-sided annotations on the same column name do
+    not collide (one owns _pre, the other _post)."""
+    ann_pre = pl.DataFrame(
+        {"eid": [1, 2, 3, 10, 11], "cell_type": ["a", "b", "c", "d", "e"]}
+    )
+    ann_post = pl.DataFrame(
+        {"eid": [1, 2, 3, 10, 11], "cell_type": ["v", "w", "x", "y", "z"]}
+    )
+    ct.add_annotation("pre_types", ann_pre, cell_id_col="eid", side="pre")
+    ct.add_annotation("post_types", ann_post, cell_id_col="eid", side="post")
+    cols = ct.df.columns
+    assert "cell_type_pre" in cols and "cell_type_post" in cols
+
+
+def test_add_annotation_invalid_side_raises(ct):
+    ann = pl.DataFrame({"eid": [1, 2, 3, 10, 11], "x": ["a", "b", "c", "d", "e"]})
+    with pytest.raises(ValueError, match="side must be"):
+        ct.add_annotation("bad", ann, cell_id_col="eid", side="left")
+
+
 def test_add_annotation_duplicate_key_raises(ct):
     ann = pl.DataFrame({"eid": [1, 1, 2], "x": ["a", "b", "c"]})
     with pytest.raises(ValueError, match="duplicate"):

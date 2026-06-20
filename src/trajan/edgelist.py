@@ -17,6 +17,7 @@ return a ConnectivityTable.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Callable, Iterable
 
 import polars as pl
@@ -26,6 +27,7 @@ from ._base import (
     build_cell_annotation_spec,
     build_pair_plan,
     filter_by_id_sets,
+    materialize_aliased_spec,
 )
 from .connectivity_table import ConnectivityTable
 from .spatial import bbox_predicate, euclidean_distance
@@ -135,6 +137,33 @@ class EdgeList(ConnectivityTable):
         self._cell_aliases[key] = (annotation_name, col)
         return self
 
+    def materialize_aliases(self) -> EdgeList:
+        """Bake every alias-keyed annotation into a root-keyed one.
+
+        Returns a new EdgeList in which each annotation that joined through a
+        cell alias is replaced by an equivalent annotation keyed directly on
+        the root pre/post ids (see
+        :func:`trajan._base.materialize_aliased_spec` for the composition), and
+        the alias registry is cleared. Annotations that already join on the
+        root id are carried over unchanged. The composition is lazy — no data
+        is collected — and the resulting ``.df`` is identical to the original's.
+
+        Useful before handing an EdgeList to code that does not understand
+        aliases. ``aggregate_to_type`` uses this internally so aliased
+        annotations on a surviving cell axis survive tier promotion rather than
+        being dropped. A no-op copy when no aliases are registered.
+        """
+        new = self._copy()
+        new._cell_annotations = {
+            name: materialize_aliased_spec(
+                spec, aliases=self._cell_aliases, specs=self._cell_annotations
+            )
+            for name, spec in self._cell_annotations.items()
+        }
+        new._cell_aliases = {}
+        new._cache = None
+        return new
+
     # ── annotation registration (overrides ConnectivityTable) ─────────────
 
     def add_annotation(
@@ -145,15 +174,19 @@ class EdgeList(ConnectivityTable):
         position_col: str | None = None,
         is_universe: bool = False,
         join_on_alias: str | None = None,
+        side: str = "both",
     ) -> EdgeList:
         """Register a per-cell annotation, optionally keyed on a cell alias.
 
         Extends :meth:`ConnectivityTable.add_annotation` with the
         ``join_on_alias`` kwarg. With ``join_on_alias=None`` (the default),
-        the annotation is joined symmetrically on the EdgeList's
-        ``pre_col`` / ``post_col``. With ``join_on_alias=<alias>``, the
-        annotation joins on the alias-source's ``{alias_col}_pre`` /
-        ``{alias_col}_post`` columns produced by the source annotation.
+        the annotation is joined on the EdgeList's ``pre_col`` / ``post_col``.
+        With ``join_on_alias=<alias>``, the annotation joins on the
+        alias-source's ``{alias_col}_pre`` / ``{alias_col}_post`` columns
+        produced by the source annotation. Both axes of an EdgeList are cells,
+        so ``side="both"`` (the default) is almost always right here; the
+        ``side`` kwarg exists mainly so one-sided specs survive a round trip
+        through ``save``/``load``.
 
         See :class:`ConnectivityTable` for the full parameter list.
         """
@@ -170,6 +203,7 @@ class EdgeList(ConnectivityTable):
             is_universe=is_universe,
             join_on_alias=join_on_alias,
             current_columns=self._current_columns(),
+            side=side,
         )
         self._cache = None
         return self
@@ -284,10 +318,16 @@ class EdgeList(ConnectivityTable):
         entity columns, and the registered weights summed per type pair
         (per the weight contract: sum of a weight is a weight).
 
-        Non-weight columns are NOT carried across — this is a semantic
+        Non-weight *data* columns are NOT carried across — this is a semantic
         reduction and arbitrary user columns don't have a canonical
-        aggregation. The resulting type-level table is a new object; the
-        source EdgeList is unchanged.
+        aggregation. Cell *annotations* on an axis that stays a cell axis
+        (i.e. the side you did not collapse) ARE carried forward, re-registered
+        one-sided on the result, because they remain 1:1 with the surviving
+        entity id. Alias-keyed annotations are materialized first (see
+        :meth:`materialize_aliases`) so they survive too, baked into root-keyed
+        annotations — a plain ConnectivityTable has no alias machinery of its
+        own. The resulting type-level table is a new object; the source EdgeList
+        is unchanged.
 
         Returns a ConnectivityTable (not an EdgeList) because at least one
         axis is now a label, violating the cell-axis invariant.
@@ -334,9 +374,36 @@ class EdgeList(ConnectivityTable):
             .agg([pl.sum(w).alias(w) for w in weight_cols])
             .collect()
         )
-        return ConnectivityTable(
+        ct = ConnectivityTable(
             agg, pre_col=new_pre, post_col=new_post, weight_cols=weight_cols
         )
+
+        # Carry forward annotations on whichever axis stayed a cell axis. An
+        # un-passed axis (pre/post is None) keeps its original cell id column,
+        # so an annotation that joined that side is still 1:1 with the surviving
+        # id and re-joins cleanly — now one-sided. Materialize aliases first so
+        # alias-keyed annotations come along too (baked into root-keyed specs);
+        # a plain ConnectivityTable has no alias machinery of its own.
+        keep_pre_axis = pre is None
+        keep_post_axis = post is None
+        source_annotations = (
+            self.materialize_aliases()._cell_annotations
+            if self._cell_aliases
+            else self._cell_annotations
+        )
+        for ann_name, spec in source_annotations.items():
+            spec_sides = spec.sides()
+            survives = []
+            if keep_pre_axis and "pre" in spec_sides:
+                survives.append("pre")
+            if keep_post_axis and "post" in spec_sides:
+                survives.append("post")
+            if not survives:
+                continue
+            new_side = "both" if len(survives) == 2 else survives[0]
+            ct._cell_annotations[ann_name] = replace(spec, side=new_side)
+        ct._cache = None
+        return ct
 
     # ── copy: preserve the EdgeList type through filter etc. ───────────────
 
@@ -431,6 +498,7 @@ class EdgeList(ConnectivityTable):
                     cell_id_col=ann_meta["cell_id_col"],
                     position_col=ann_meta.get("position_col"),
                     is_universe=ann_meta.get("is_universe", False),
+                    side=ann_meta.get("side", "both"),
                 )
         # Cell aliases must be set after their source annotations are present.
         for alias_name, alias_meta in config.get("cell_aliases", {}).items():
@@ -449,6 +517,7 @@ class EdgeList(ConnectivityTable):
                     position_col=ann_meta.get("position_col"),
                     is_universe=ann_meta.get("is_universe", False),
                     join_on_alias=ann_meta["join_on_alias"],
+                    side=ann_meta.get("side", "both"),
                 )
 
         for name, expr_val in config.get("expressions", {}).items():

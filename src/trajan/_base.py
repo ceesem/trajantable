@@ -26,7 +26,7 @@ observed duplication across the tiers rather than speculated in advance.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, TypeVar, Union
 
@@ -90,6 +90,16 @@ class _LazyBacked:
             tbl.filter(...).group_by("col").len().collect()
         """
         return self.lazy.group_by(*args, **kwargs)
+
+    @property
+    def columns(self) -> list[str]:
+        """Column names of the annotated + filtered plan, without collecting.
+
+        Pass-through to ``build_lazy().collect_schema().names()`` — resolves the
+        schema from the lazy plan, so it never materializes rows. Mirrors
+        Polars' ``DataFrame.columns``.
+        """
+        return self.build_lazy().collect_schema().names()
 
     def preview(self, n: int = 10) -> pl.DataFrame:
         """Collect the first ``n`` rows of the plan without caching.
@@ -251,8 +261,11 @@ class SynapseAnnotationSpec:
 class CellAnnotationSpec:
     """Cell-level annotation: keyed on cell id (or on an alias column).
 
-    Joined symmetrically for pre and post cells; each ``data_col`` produces
-    ``{col}_pre`` and ``{col}_post`` columns on ``.df``.
+    Joined per ``side``; each ``data_col`` produces ``{col}_pre`` and/or
+    ``{col}_post`` columns on ``.df``. The default ``side="both"`` joins
+    symmetrically (the cell-axis invariant case); ``"pre"`` / ``"post"`` join
+    only that side, which is what an asymmetric cell × label table needs after
+    ``aggregate_to_type`` collapses one axis.
 
     Parameters
     ----------
@@ -281,6 +294,13 @@ class CellAnnotationSpec:
 
         A future ``Universe`` class will subsume this role; the flag is the
         migration anchor.
+    side : str
+        Which axis the annotation joins onto: ``"pre"``, ``"post"``, or
+        ``"both"`` (default). ``"both"`` is correct whenever both axes are the
+        same kind of entity (the EdgeList cell-axis invariant). One-sided specs
+        arise when a table's axes differ — e.g. after ``aggregate_to_type``
+        collapses one cell axis to a label, the surviving cell axis keeps its
+        annotations as a one-sided spec.
     """
 
     lf: pl.LazyFrame
@@ -289,6 +309,16 @@ class CellAnnotationSpec:
     data_cols: list[str]
     position_col: str | None = None
     is_universe: bool = False
+    side: str = "both"
+
+    def sides(self) -> tuple[str, ...]:
+        """The concrete sides this spec joins onto: ``("pre",)``,
+        ``("post",)``, or ``("pre", "post")``."""
+        return ("pre", "post") if self.side == "both" else (self.side,)
+
+    def produced_columns(self) -> list[str]:
+        """The ``{col}_<side>`` column names this spec contributes to ``.df``."""
+        return [f"{c}_{s}" for s in self.sides() for c in self.data_cols]
 
 
 @dataclass
@@ -517,6 +547,7 @@ def build_cell_annotation_spec(
     is_universe: bool,
     join_on_alias: str | None,
     current_columns: set[str],
+    side: str = "both",
 ) -> CellAnnotationSpec:
     """Validate inputs and return a ``CellAnnotationSpec``.
 
@@ -533,9 +564,11 @@ def build_cell_annotation_spec(
     3. Verifies ``cell_id_col`` is in the annotation schema.
     4. Validates id uniqueness via :func:`validate_unique_key`.
     5. Verifies ``position_col`` (if given) is in the data columns.
-    6. Raises if any ``{col}_pre`` / ``{col}_post`` column would collide with
-       an existing column on the receiving table.
+    6. Raises if any ``{col}_pre`` / ``{col}_post`` column (for the sides this
+       spec joins) would collide with an existing column on the receiving table.
     """
+    if side not in ("pre", "post", "both"):
+        raise ValueError(f"side must be 'pre', 'post', or 'both', got {side!r}")
     lf = _to_lazy(df)
     if position_col is not None:
         lf = _auto_pack(lf, position_col)
@@ -551,7 +584,8 @@ def build_cell_annotation_spec(
             f"position_col {position_col!r} not found in annotation data "
             f"columns. Available: {data_cols}"
         )
-    new_cols = {f"{c}_pre" for c in data_cols} | {f"{c}_post" for c in data_cols}
+    sides = ("pre", "post") if side == "both" else (side,)
+    new_cols = {f"{c}_{s}" for s in sides for c in data_cols}
     collisions = new_cols & current_columns
     if collisions:
         raise ValueError(f"Columns already exist in table: {sorted(collisions)}")
@@ -562,7 +596,55 @@ def build_cell_annotation_spec(
         data_cols=data_cols,
         position_col=position_col,
         is_universe=is_universe,
+        side=side,
     )
+
+
+def materialize_aliased_spec(
+    spec: CellAnnotationSpec,
+    *,
+    aliases: dict[str, tuple[str, str]],
+    specs: dict[str, CellAnnotationSpec],
+) -> CellAnnotationSpec:
+    """Bake an alias-keyed annotation into an equivalent root-keyed one.
+
+    An aliased annotation joins on an alias column (``{alias_col}_pre`` /
+    ``{alias_col}_post``) contributed by a *source* annotation that is itself
+    keyed on the root cell id. Because aliases are depth-1 (``set_cell_alias``
+    requires the source to join on the root id) the chain
+    ``root_id -> alias_value -> data`` is a single well-defined mapping: the
+    source is 1:1 per root id and the aliased annotation is 1:1 per alias value.
+    Composing them yields a ``root_id -> data`` table joined directly on the
+    root id, with ``join_on_alias=None``.
+
+    The join is lazy — nothing materializes until ``.df``. ``side``,
+    ``position_col`` and ``is_universe`` are preserved; only the key and the
+    backing frame change.
+
+    Raises if a data column of the aliased annotation would clash with the
+    source's root-id column (the composed frame can't carry two columns of that
+    name); rename the offending column upstream.
+    """
+    if spec.join_on_alias is None:
+        return spec
+    source_name, alias_col = aliases[spec.join_on_alias]
+    source = specs[source_name]
+    if source.cell_id_col in spec.data_cols:
+        raise ValueError(
+            f"Cannot materialize aliased annotation: its data column "
+            f"{source.cell_id_col!r} clashes with the alias source's root-id "
+            f"column. Rename the column before materializing."
+        )
+    # Temp key name invisible to the caller; guarded against the aliased
+    # annotation's own columns so the join can't collide.
+    key = unique_name("__alias_key__", set(spec.data_cols) | {spec.cell_id_col})
+    mapping = source.lf.select(
+        [pl.col(source.cell_id_col), pl.col(alias_col).alias(key)]
+    )
+    flat = mapping.join(
+        spec.lf, left_on=key, right_on=spec.cell_id_col, how="left"
+    ).drop(key)
+    return replace(spec, lf=flat, cell_id_col=source.cell_id_col, join_on_alias=None)
 
 
 # ── pair-plan construction ────────────────────────────────────────────────────
@@ -576,16 +658,19 @@ def join_cell_annotations_symmetric(
     post_col: str,
     aliases: dict[str, tuple[str, str]] | None = None,
 ) -> pl.LazyFrame:
-    """Left-join each cell annotation onto ``lf`` once per side (pre and post).
+    """Left-join each cell annotation onto ``lf`` for each side it declares.
 
-    Each data column ``c`` of each spec becomes ``c_pre`` and ``c_post``. A spec
-    with ``join_on_alias=None`` joins on ``pre_col`` / ``post_col``; an
-    alias-keyed spec joins on ``{alias_col}_pre`` / ``{alias_col}_post`` where
-    ``alias_col`` is looked up in ``aliases`` (so the alias-source annotation
-    must be registered — and therefore iterated — before any spec that joins on
-    its alias). Specs are joined in iteration order.
+    Each data column ``c`` of each spec becomes ``c_pre`` and/or ``c_post``
+    according to ``spec.side`` (``"both"`` joins both; ``"pre"`` / ``"post"``
+    join only that side — the asymmetric cell × label case after
+    ``aggregate_to_type``). A spec with ``join_on_alias=None`` joins on
+    ``pre_col`` / ``post_col``; an alias-keyed spec joins on
+    ``{alias_col}_pre`` / ``{alias_col}_post`` where ``alias_col`` is looked up
+    in ``aliases`` (so the alias-source annotation must be registered — and
+    therefore iterated — before any spec that joins on its alias). Specs are
+    joined in iteration order.
 
-    Single source of truth for the symmetric cell-annotation join shared by
+    Single source of truth for the cell-annotation join shared by
     ``SynapseTable``, ``ConnectivityTable``, ``EdgeList``, and ``PairUniverse``.
     ``ConnectivityTable`` has no aliases and passes ``aliases=None``; the alias
     branch is then never taken.
@@ -599,10 +684,15 @@ def join_cell_annotations_symmetric(
         else:
             pre_key = pre_col
             post_key = post_col
-        pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
-        lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
-        post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
-        lf = lf.join(post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left")
+        joined_sides = spec.sides()
+        if "pre" in joined_sides:
+            pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
+            lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
+        if "post" in joined_sides:
+            post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
+            lf = lf.join(
+                post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
+            )
     return lf
 
 
@@ -766,8 +856,11 @@ def classify_by_cell_sides(
     cell_pre: set[str] = set()
     cell_post: set[str] = set()
     for spec in cell_annotations.values():
-        cell_pre |= {f"{c}_pre" for c in spec.data_cols}
-        cell_post |= {f"{c}_post" for c in spec.data_cols}
+        sides = spec.sides()
+        if "pre" in sides:
+            cell_pre |= {f"{c}_pre" for c in spec.data_cols}
+        if "post" in sides:
+            cell_post |= {f"{c}_post" for c in spec.data_cols}
 
     root_names = expr.meta.root_names()
     if not root_names:

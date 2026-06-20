@@ -227,6 +227,145 @@ def test_aggregate_to_type_both_sides(el):
     assert sums[("inh", "inh")] == 5
 
 
+def test_aggregate_to_type_keeps_surviving_pre_annotation(el):
+    """Collapsing only the post axis leaves pre as a cell axis, so a cell
+    annotation on the pre side survives — re-registered one-sided."""
+    props = pl.DataFrame(
+        {
+            "cid": [1, 2, 3, 10, 11],
+            "region": ["A", "B", "A", "X", "Y"],
+            "type": ["exc", "exc", "inh", "exc", "inh"],
+        }
+    )
+    el.add_annotation("props", props, cell_id_col="cid")
+    ct = el.aggregate_to_type(post="type_post")
+
+    # pre axis is still the cell id; post axis is now a type label.
+    assert ct.pre_col == "pre"
+    assert ct.post_col == "type_post"
+    # The surviving annotation came across, now one-sided on pre.
+    assert "props" in ct.annotations
+    assert ct._cell_annotations["props"].side == "pre"
+    cols = ct.df.columns
+    assert "region_pre" in cols and "type_pre" in cols
+    # No post-side annotation columns: the post axis is a label, not a cell.
+    assert "region_post" not in cols and "type_post_post" not in cols
+    # Values are correct: pre cell 1 is region A.
+    row = ct.df.filter(pl.col("pre") == 1).row(0, named=True)
+    assert row["region_pre"] == "A"
+
+
+def test_aggregate_to_type_keeps_surviving_post_annotation(el):
+    """Symmetric case: collapsing only the pre axis keeps post-side annotations.
+
+    ``region`` is used as the collapse axis; ``tag`` is the tracked payload —
+    kept distinct so we can tell the annotation's post column apart from the
+    new axis column itself.
+    """
+    props = pl.DataFrame(
+        {
+            "cid": [1, 2, 3, 10, 11],
+            "region": ["A", "B", "A", "X", "Y"],
+            "tag": ["p", "q", "r", "s", "t"],
+        }
+    )
+    el.add_annotation("props", props, cell_id_col="cid")
+    ct = el.aggregate_to_type(pre="region_pre")
+
+    assert ct.pre_col == "region_pre"
+    assert ct.post_col == "post"
+    assert ct._cell_annotations["props"].side == "post"
+    cols = ct.df.columns
+    assert "tag_post" in cols
+    assert "tag_pre" not in cols
+
+
+def test_aggregate_to_type_both_collapsed_drops_annotations(el):
+    """When both axes collapse to labels, no cell axis survives, so cell
+    annotations are dropped (the old behavior, now scoped to this case)."""
+    props = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "type": ["exc", "exc", "inh", "exc", "inh"]}
+    )
+    el.add_annotation("props", props, cell_id_col="cid")
+    ct = el.aggregate_to_type(pre="type_pre", post="type_post")
+    assert ct.annotations == {} or "props" not in ct._cell_annotations
+
+
+def test_aggregate_to_type_materializes_aliased_annotation(el):
+    """Aliased annotations on a surviving axis are materialized (baked into
+    root-keyed specs) rather than dropped, so their columns come across."""
+    types = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "type": ["exc", "exc", "inh", "exc", "inh"]}
+    )
+    el.add_annotation("types", types, cell_id_col="cid")
+    el.set_cell_alias("types", "type", alias_name="ct_alias")
+    extra = pl.DataFrame({"type": ["exc", "inh"], "score": [0.1, 0.9]})
+    el.add_annotation("scored", extra, cell_id_col="type", join_on_alias="ct_alias")
+
+    ct = el.aggregate_to_type(post="type_post")
+    # Both annotations survive on the pre axis; the aliased one is now root-keyed.
+    assert ct._cell_annotations["types"].side == "pre"
+    scored = ct._cell_annotations["scored"]
+    assert scored.side == "pre"
+    assert scored.join_on_alias is None
+    # The score rides through: pre cell 3 is 'inh' -> score 0.9.
+    row = ct.df.filter(pl.col("pre") == 3).row(0, named=True)
+    assert row["score_pre"] == 0.9
+    assert "score_post" not in ct.df.columns
+
+
+def test_materialize_aliases_equivalent_df(el):
+    """materialize_aliases() bakes aliases into root-keyed annotations while
+    leaving the materialized .df identical to the original."""
+    types = pl.DataFrame(
+        {"cid": [1, 2, 3, 10, 11], "type": ["exc", "exc", "inh", "exc", "inh"]}
+    )
+    el.add_annotation("types", types, cell_id_col="cid")
+    el.set_cell_alias("types", "type", alias_name="ct_alias")
+    extra = pl.DataFrame({"type": ["exc", "inh"], "score": [0.1, 0.9]})
+    el.add_annotation("scored", extra, cell_id_col="type", join_on_alias="ct_alias")
+
+    baked = el.materialize_aliases()
+    assert baked.cell_aliases == {}
+    assert baked._cell_annotations["scored"].join_on_alias is None
+    # Same data, both sides still present (default side="both").
+    before = el.df.sort("pre", "post")
+    after = baked.df.sort("pre", "post")
+    for col in ("score_pre", "score_post", "type_pre", "type_post"):
+        assert before[col].to_list() == after[col].to_list()
+
+
+def test_materialize_aliases_noop_without_aliases(el):
+    types = pl.DataFrame({"cid": [1, 2, 3, 10, 11], "type": ["a", "b", "c", "d", "e"]})
+    el.add_annotation("types", types, cell_id_col="cid")
+    baked = el.materialize_aliases()
+    assert baked._cell_annotations["types"].join_on_alias is None
+    assert (
+        baked.df.sort("pre", "post")["type_pre"].to_list()
+        == el.df.sort("pre", "post")["type_pre"].to_list()
+    )
+
+
+def test_aggregate_to_type_carry_forward_round_trips(el, tmp_path):
+    """A carried-forward one-sided annotation survives save/load with its side."""
+    props = pl.DataFrame(
+        {
+            "cid": [1, 2, 3, 10, 11],
+            "region": ["A", "B", "A", "X", "Y"],
+            "tag": ["p", "q", "r", "s", "t"],
+        }
+    )
+    el.add_annotation("props", props, cell_id_col="cid")
+    ct = el.aggregate_to_type(post="region_post")
+
+    folio = tmp_path / "ct_folio"
+    ct.save(folio)
+    loaded = ConnectivityTable.load(folio)
+    assert loaded._cell_annotations["props"].side == "pre"
+    assert "tag_pre" in loaded.df.columns
+    assert "tag_post" not in loaded.df.columns
+
+
 def test_aggregate_to_type_requires_axis(el):
     with pytest.raises(ValueError, match="at least one of pre/post"):
         el.aggregate_to_type()
