@@ -527,3 +527,85 @@ def test_categorical_passthrough_bin_not_enum(pu):
     the ordered-Enum treatment is only for numeric bins."""
     df = counts(pu, bin_by={"cell_type_post": None})
     assert not isinstance(df.schema["cell_type_post"], pl.Enum)
+
+
+# ── bootstrap progress flag ──────────────────────────────────────────────────
+
+
+def test_bootstrap_progress_runs(pu):
+    """progress=True produces the same result as progress=False (the bar is
+    cosmetic)."""
+    kw = dict(bin_by={"d_rho": [0, 100, 200]}, n_resamples=20, seed=0)
+    from trajan import bootstrap_over_cells
+
+    a = bootstrap_over_cells(pu, progress=False, **kw)
+    b = bootstrap_over_cells(pu, progress=True, **kw)
+    assert a.sort("d_rho_bin").equals(b.sort("d_rho_bin"))
+
+
+def test_bootstrap_progress_without_tqdm_warns(pu, monkeypatch):
+    """progress=True degrades gracefully (warns, no bar) when tqdm is absent."""
+    import builtins
+
+    real_import = builtins.__import__
+
+    def no_tqdm(name, *args, **kwargs):
+        if name.startswith("tqdm"):
+            raise ImportError("no tqdm")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", no_tqdm)
+    from trajan import bootstrap_over_cells
+
+    with pytest.warns(UserWarning, match="tqdm"):
+        out = bootstrap_over_cells(
+            pu, bin_by={"d_rho": [0, 100, 200]}, n_resamples=5, seed=0, progress=True
+        )
+    assert "p_lo" in out.columns
+
+
+def test_bootstrap_numpy_path_matches_manual_resample(pu):
+    """The vectorized bincount resample equals an independent join/group-by
+    recomputation of the same multinomial draw (pins the numpy rewrite)."""
+    import numpy as np
+
+    from trajan.stats import cell_bootstrap_iter
+
+    seed = 12345
+    frame = next(
+        iter(
+            cell_bootstrap_iter(pu, group_by="cell_type_post", n_resamples=1, seed=seed)
+        )
+    )
+
+    # Independent recomputation of the SAME (first) draw.
+    cell_ids = [10, 20, 30, 40, 50]  # universe annotation order
+    N = len(cell_ids)
+    idx = {c: i for i, c in enumerate(cell_ids)}
+    m = np.random.default_rng(seed).multinomial(N, [1.0 / N] * N)
+
+    pairs = pu.collect()
+    w = np.array(
+        [
+            m[idx[a]] * m[idx[b]]
+            for a, b in zip(
+                pairs["pre_pt_root_id"].to_list(), pairs["post_pt_root_id"].to_list()
+            )
+        ],
+        dtype=float,
+    )
+    manual = (
+        pairs.with_columns(pl.Series("w", w), (pl.col("n_syn") > 0).alias("c"))
+        .group_by("cell_type_post")
+        .agg(
+            pl.col("w").filter(pl.col("c")).sum().alias("k_observed"),
+            pl.col("w").sum().alias("n_possible"),
+        )
+        .filter(pl.col("n_possible") > 0)
+    )
+
+    a = frame.sort("cell_type_post")
+    b = manual.sort("cell_type_post")
+    assert a["cell_type_post"].to_list() == b["cell_type_post"].to_list()
+    assert np.allclose(a["k_observed"].to_numpy(), b["k_observed"].to_numpy())
+    assert np.allclose(a["n_possible"].to_numpy(), b["n_possible"].to_numpy())

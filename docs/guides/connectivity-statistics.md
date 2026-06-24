@@ -163,6 +163,18 @@ the *same* universe draw, the pre and post populations are resampled jointly —
 that is the whole point. Iterate with `cell_bootstrap_iter(...)` for custom
 summaries.
 
+Pass `progress=True` to show a tqdm bar over the resampling loop — handy when a
+large pair universe (e.g. spanning all pre cell types) makes the bootstrap slow:
+
+```python
+trajan.bootstrap_over_cells(pu, bin_by={"rho": [...]}, n_resamples=1000,
+                            seed=0, progress=True)
+```
+
+The bar covers the resamples only; the one-time collect of the denominator pair
+frame happens first and isn't tracked, so expect an upfront wait before the bar
+appears. (Requires tqdm; it no-ops with a warning if tqdm isn't installed.)
+
 !!! note "One pre cell? Don't cell-bootstrap"
     With a single pre cell, its multiplicity factors out of `p` and cancels, so
     the cell bootstrap degenerates to resampling partners (and wastes ~37% of

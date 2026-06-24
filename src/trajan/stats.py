@@ -39,6 +39,7 @@ and ``project_edgelist_abstraction.md``.
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, Callable, Iterator, Union
 
 import polars as pl
@@ -783,27 +784,35 @@ def connection_density(
 # ── cell-level bootstrap ─────────────────────────────────────────────────────
 
 
-def _bootstrap_setup(
-    pu: "PairUniverse",
-    bin_by: dict[str, BinSpec] | None,
-    group_by: list[str] | str | None,
-    universe: str | None,
-) -> tuple[pl.DataFrame, list[str], str, str, str, list, int, dict[str, str]]:
-    """Materialize the binned pair frame and the universe cell list once.
+def _bootstrap_setup(pu, bin_by, group_by, universe):
+    """Encode the binned pair frame into compact numpy arrays for resampling.
 
-    Returned tuple: ``(pair_df, keys, pre_col, post_col, cell_id_col,
-    cell_ids, N, names)``. ``names`` maps the internal multiplicity / weight
-    column roles (``m``, ``m_pre``, ``m_post``, ``w``) to collision-free
-    column names for this call. ``pair_df`` is *eagerly collected* — bootstrap loops
-    over it many times and re-collecting each iteration would dominate
-    runtime.
+    Returns ``(pre_idx, post_idx, connected, gid, key_table, N)``:
 
-    Requires the source ``PairUniverse`` to carry an ``n_syn`` weight; this
-    is the "is the pair observed?" predicate. ``possible_pairs`` always
-    provides it (the observed-counts overlay materializes ``n_syn`` from the
-    edgelist's pair counts). If you constructed a PairUniverse by hand with
-    a renamed weight, rename it back to ``n_syn`` first.
+    - ``pre_idx`` / ``post_idx`` — ``int32`` arrays mapping each pair's pre /
+      post cell to its index in the universe cell list (``0..N-1``), the index
+      space the per-resample multinomial multiplicities live in.
+    - ``connected`` — ``bool`` array (``n_syn > 0`` per pair).
+    - ``gid`` — ``int32`` array, the dense composite group id of each pair over
+      the full key set (bin columns + ``group_by`` columns).
+    - ``key_table`` — ``pl.DataFrame`` with one row per distinct key
+      combination, row ``i`` corresponding to ``gid == i`` so a length-``B``
+      count array reindexes straight back to labelled rows.
+    - ``N`` — universe size.
+
+    The cross-product is collected once into these arrays (two ``int32`` + a
+    ``bool`` + an ``int32`` group id ≈ 13 bytes/row) rather than held as a wide
+    polars frame for the whole run. Each resample is then a vectorised
+    ``m[pre_idx] * m[post_idx]`` weight and two ``np.bincount`` reductions —
+    no per-resample joins, and well under half the resident memory of the old
+    join-per-resample path for a large universe. The pre/post ids are encoded
+    in the lazy plan, so the wide ``UInt64`` root-id columns never materialise.
+
+    Requires the source ``PairUniverse`` to carry an ``n_syn`` weight (the
+    "is the pair observed?" predicate); ``possible_pairs`` always supplies it.
     """
+    import numpy as np
+
     _require_pair_universe(pu)
     universe_name = pu._resolve_universe_annotation(universe)
     cell_id_col = pu._cell_annotations[universe_name].cell_id_col
@@ -811,78 +820,99 @@ def _bootstrap_setup(
         pu._cell_annotations[universe_name]
         .lf.select(cell_id_col)
         .collect()[cell_id_col]
-    ).to_list()
+    )
     N = len(cell_ids)
 
     lf, keys = _apply_bins(pu.build_lazy(), bin_by, group_by)
-    pre_col = pu.pre_col
-    post_col = pu.post_col
-    # Only the columns we actually need downstream — keep the eagerly
-    # collected frame slim so the per-resample joins are cheap.
-    pair_df = lf.select([pre_col, post_col, "n_syn"] + keys).collect()
+    # Encode pre/post to universe indices in the lazy plan — order-preserving
+    # and elementwise (unlike a join), so the collected frame is already compact
+    # int32 and the UInt64 root ids never materialise. ``connected`` replaces
+    # n_syn (1 byte). replace_strict raises if a pair references a cell outside
+    # the universe, which by construction never happens.
+    cid_list = cell_ids.to_list()
+    idx_list = list(range(N))
+    slim = lf.select(
+        pl.col(pu.pre_col)
+        .replace_strict(cid_list, idx_list, return_dtype=pl.Int32)
+        .alias("__pre_idx__"),
+        pl.col(pu.post_col)
+        .replace_strict(cid_list, idx_list, return_dtype=pl.Int32)
+        .alias("__post_idx__"),
+        (pl.col("n_syn") > 0).alias("__connected__"),
+        *[pl.col(k) for k in keys],
+    ).collect()
 
-    # Derive internal column names that can't collide with a group_by/bin key
-    # (or the id/count columns) — e.g. a user grouping on a column literally
-    # named "m_pre".
-    taken = set(pair_df.columns) | {cell_id_col}
-    names = {
-        "m": unique_name("m", {cell_id_col}),
-        "m_pre": unique_name("m_pre", taken),
-    }
-    names["m_post"] = unique_name("m_post", taken | {names["m_pre"]})
-    names["w"] = unique_name("w", taken | {names["m_pre"], names["m_post"]})
-    return pair_df, keys, pre_col, post_col, cell_id_col, cell_ids, N, names
+    pre_idx = slim["__pre_idx__"].to_numpy()
+    post_idx = slim["__post_idx__"].to_numpy()
+    connected = slim["__connected__"].to_numpy()
+
+    # Dense composite group id over the full key set. Build the distinct-key
+    # table (row index == gid, sorted so numeric Enum bins stay ordered), then
+    # map each pair to its gid order-preservingly (row-index round-trip; a plain
+    # join may reorder). nulls_equal so a null key (e.g. cell_type=None) is its
+    # own group rather than dropping out.
+    key_table = slim.select(keys).unique().sort(keys).with_row_index("__gid__")
+    gid = (
+        slim.select(keys)
+        .with_row_index("__row__")
+        .join(key_table, on=keys, how="left", nulls_equal=True)
+        .sort("__row__")
+        .get_column("__gid__")
+        .to_numpy()
+        .astype(np.int32)
+    )
+    key_table = key_table.drop("__gid__")
+    return pre_idx, post_idx, connected, gid, key_table, N
 
 
-def _bootstrap_one(
-    pair_df: pl.DataFrame,
-    mult: pl.DataFrame,
-    keys: list[str],
-    pre_col: str,
-    post_col: str,
-    cell_id_col: str,
-    names: dict[str, str],
-) -> pl.DataFrame:
+def _bootstrap_one(pre_idx, post_idx, connected, gid, key_table, m):
     """One bootstrap resample → ``(*keys, k_observed, n_possible, p)`` DataFrame.
 
-    Column names match :func:`counts`. The dtype is ``Float64`` rather than
-    integer because each pair contributes weight ``m_pre * m_post`` (cell
-    multiplicities in the resample), not a single observation. The "weighted
-    counts" semantics is the only thing that differs from :func:`counts`'s
-    integer outputs.
-
-    Cells absent from the resample (``m == 0``) are inner-joined out, which
-    is semantically equivalent to keeping them with weight ``0`` and is
-    much faster. By construction every retained pair has ``m_pre, m_post >
-    0`` so ``n_possible = sum(_w) > 0`` per bin (no division-by-zero).
+    ``m`` is the per-cell multiplicity vector for this resample (length ``N``).
+    Each pair contributes weight ``m[pre] * m[post]`` to its group; ``np.bincount``
+    sums those weights per group id for the denominator (``n_possible``) and over
+    the connected subset for the numerator (``k_observed``). Counts are
+    ``Float64`` (weighted sums, matching :func:`counts`' column names). Groups
+    with no surviving weight (every pair has a zero-multiplicity endpoint) are
+    dropped, mirroring the old inner-join behaviour — so callers see only the
+    bins present in the resample.
     """
-    m, m_pre, m_post, w = names["m"], names["m_pre"], names["m_post"], names["w"]
+    import numpy as np
+
+    B = key_table.height
+    w = (m[pre_idx] * m[post_idx]).astype(np.float64)
+    n = np.bincount(gid, weights=w, minlength=B)
+    k = np.bincount(gid[connected], weights=w[connected], minlength=B)
     return (
-        pair_df.lazy()
-        .join(
-            mult.lazy().rename({m: m_pre}),
-            left_on=pre_col,
-            right_on=cell_id_col,
-            how="inner",
+        key_table.with_columns(
+            pl.Series("k_observed", k),
+            pl.Series("n_possible", n),
         )
-        .join(
-            mult.lazy().rename({m: m_post}),
-            left_on=post_col,
-            right_on=cell_id_col,
-            how="inner",
-        )
-        .with_columns((pl.col(m_pre) * pl.col(m_post)).alias(w))
-        .group_by(keys)
-        .agg(
-            (pl.col(w) * (pl.col("n_syn") > 0).cast(pl.UInt32))
-            .sum()
-            .cast(pl.Float64)
-            .alias("k_observed"),
-            pl.col(w).sum().cast(pl.Float64).alias("n_possible"),
-        )
+        .filter(pl.col("n_possible") > 0)
         .with_columns((pl.col("k_observed") / pl.col("n_possible")).alias("p"))
-        .collect()
     )
+
+
+def _progress_iter(iterable, *, total: int, enabled: bool, desc: str):
+    """Wrap ``iterable`` in a tqdm bar when ``enabled`` and tqdm is importable.
+
+    Returns ``iterable`` unchanged when ``enabled`` is False, or when tqdm is
+    not installed (warning once so ``progress=True`` degrades gracefully rather
+    than failing). Uses ``tqdm.auto`` so the bar renders correctly in both
+    notebooks and terminals.
+    """
+    if not enabled:
+        return iterable
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        warnings.warn(
+            "progress=True requires tqdm, which is not installed; proceeding "
+            "without a progress bar. Install with `pip install tqdm`.",
+            stacklevel=3,
+        )
+        return iterable
+    return tqdm(iterable, total=total, desc=desc)
 
 
 def cell_bootstrap_iter(
@@ -893,6 +923,7 @@ def cell_bootstrap_iter(
     n_resamples: int = 1000,
     seed: int | None = None,
     universe: str | None = None,
+    progress: bool = False,
 ) -> Iterator[pl.DataFrame]:
     """Yield ``n_resamples`` cell-bootstrap per-bin DataFrames.
 
@@ -922,6 +953,13 @@ def cell_bootstrap_iter(
         Number of resamples to draw. Default ``1000``.
     seed : int or None
         Numpy seed; pass an int for reproducibility.
+    progress : bool, optional
+        Show a tqdm progress bar over the resampling loop (default ``False``).
+        Covers the per-resample iterations only — the one-time collect of the
+        denominator pair frame happens before the loop and is not tracked, so
+        for a very large pair universe expect an untracked upfront wait before
+        the bar appears. Requires tqdm; degrades to no bar (with a warning) if
+        it is not installed.
 
     Yields
     ------
@@ -956,21 +994,22 @@ def cell_bootstrap_iter(
         )
 
     pu = _as_pair_universe(table, universe=universe)
-    pair_df, keys, pre_col, post_col, cell_id_col, cell_ids, N, names = (
-        _bootstrap_setup(pu, bin_by, group_by, universe)
+    pre_idx, post_idx, connected, gid, key_table, N = _bootstrap_setup(
+        pu, bin_by, group_by, universe
     )
     rng = np.random.default_rng(seed)
-    for _ in range(n_resamples):
-        m = rng.multinomial(N, [1.0 / N] * N)
-        # Drop zero-multiplicity cells from the join entirely. The inner
-        # join then guarantees m_pre > 0 and m_post > 0 on every kept row,
-        # so _w > 0 and per-bin n > 0. Without this filter, a bin where
-        # every pair has at least one m=0 endpoint would produce sum(_w)=0
-        # and a 0/0 NaN that poisons the percentile aggregation.
-        mult = pl.DataFrame({cell_id_col: cell_ids, names["m"]: m}).filter(
-            pl.col(names["m"]) > 0
-        )
-        yield _bootstrap_one(pair_df, mult, keys, pre_col, post_col, cell_id_col, names)
+    pvals = np.full(N, 1.0 / N)
+    iterations = _progress_iter(
+        range(n_resamples), total=n_resamples, enabled=progress, desc="cell bootstrap"
+    )
+    for _ in iterations:
+        # One multinomial draw of N cells with replacement → per-cell
+        # multiplicity vector. Weighting each pair by m[pre] * m[post] and
+        # bincount-summing per group is the vectorised equivalent of joining
+        # the multiplicities back onto every pair, but holds no per-resample
+        # intermediate frame.
+        m = rng.multinomial(N, pvals)
+        yield _bootstrap_one(pre_idx, post_idx, connected, gid, key_table, m)
 
 
 def bootstrap_over_cells(
@@ -982,6 +1021,7 @@ def bootstrap_over_cells(
     alpha: float = 0.05,
     seed: int | None = None,
     universe: str | None = None,
+    progress: bool = False,
 ) -> pl.DataFrame:
     """Cell-bootstrap percentile CI for per-bin connection density.
 
@@ -1015,6 +1055,11 @@ def bootstrap_over_cells(
         Two-sided significance level. Default ``0.05`` (95% CI).
     seed : int or None
         Numpy seed for reproducibility. ``None`` draws fresh randomness.
+    progress : bool, optional
+        Show a tqdm progress bar over the resampling loop (default ``False``);
+        useful when a large pair universe makes the bootstrap slow. Tracks the
+        resamples only, not the one-time denominator collect that precedes
+        them. Requires tqdm; no-ops with a warning if it is not installed.
 
     Returns
     -------
@@ -1049,6 +1094,7 @@ def bootstrap_over_cells(
             n_resamples=n_resamples,
             seed=seed,
             universe=universe,
+            progress=progress,
         )
     )
     stacked = pl.concat(per_resample)
