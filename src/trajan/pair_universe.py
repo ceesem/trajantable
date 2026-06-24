@@ -18,7 +18,7 @@ See ``DESIGN-universe.md`` §4 for the full design.
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Callable, Iterable, Union
+from typing import TYPE_CHECKING, Iterable, Union
 
 import polars as pl
 
@@ -29,10 +29,11 @@ from ._base import (
     build_pair_plan,
     classify_by_cell_sides,
     filter_by_id_sets,
+    filter_by_soma_distance_impl,
     resolve_position_annotation,
     resolve_universe_annotation,
 )
-from .spatial import bbox_predicate, euclidean_distance
+from .spatial import bbox_predicate, euclidean_distance, radial_distance
 
 if TYPE_CHECKING:
     from .edgelist import EdgeList
@@ -206,24 +207,34 @@ class PairUniverse(_LazyBacked):
         """Restrict pre / post id sets to the given iterables."""
         return filter_by_id_sets(self, pre_ids, post_ids)
 
-    def filter_by_soma_distance(
-        self,
-        max_distance: float,
-        *,
-        annotation: str | None = None,
-        distance_fn: Callable[[str, str], pl.Expr] = euclidean_distance,
+    def filter_by_radial_distance(
+        self, max_distance: float, *, annotation: str | None = None
     ) -> "PairUniverse":
-        """Keep pairs whose pre/post soma-soma distance is ``<= max_distance``.
+        """Keep pairs whose pre/post **lateral** soma distance is ``<= max_distance``.
 
+        Lateral (radial, depth-free) distance via :func:`trajan.radial_distance`
+        (``sqrt(dx² + dz²)``), ignoring the depth axis — the metric for cortical
+        column / lateral-reach analyses, and the one that matches ``rho`` bins.
         Reads the position column from the annotation declared with
-        ``position_col=`` (auto-resolved when unique). Use this BEFORE
-        materializing — pruning the cross-product is what keeps the pair
-        universe tractable on whole-brain scales.
+        ``position_col=`` (auto-resolved when unique). Prune BEFORE materializing
+        — this is what keeps the cross-product tractable on whole-brain scales.
         """
-        ann_name = self._resolve_position_annotation(annotation)
-        pos_col = self._cell_annotations[ann_name].position_col
-        return self.filter(
-            distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, radial_distance
+        )
+
+    def filter_by_euclidean_distance(
+        self, max_distance: float, *, annotation: str | None = None
+    ) -> "PairUniverse":
+        """Keep pairs whose pre/post **3-D euclidean** soma distance is ``<= max_distance``.
+
+        Full 3-D distance via :func:`trajan.euclidean_distance`
+        (``sqrt(dx² + dy² + dz²)``), depth included. Reads the position column
+        from the annotation declared with ``position_col=`` (auto-resolved when
+        unique). Prune BEFORE materializing.
+        """
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, euclidean_distance
         )
 
     def filter_by_bbox(self, bbox, *, annotation: str | None = None) -> "PairUniverse":
@@ -373,6 +384,121 @@ class PairUniverse(_LazyBacked):
             )
         return df
 
+    def sample_pairs(
+        self,
+        n: int,
+        *,
+        weights: str | pl.Expr | None = None,
+        replace: bool = True,
+        seed: int | None = None,
+    ) -> pl.DataFrame:
+        """Draw ``n`` random pairs from the filtered universe, with connectivity.
+
+        The pair-draw primitive: a uniform (or weight-biased) sample of pairs
+        from the universe of *possible* connections, each carrying its observed
+        connectivity. Where the cell bootstrap (:func:`cell_bootstrap_iter`)
+        re-draws whole cells — the right unit for dense reconstructions, where
+        pairs sharing an endpoint co-vary — this re-draws **pairs**, the right
+        unit for designs that probe individual pairs and aggregate them (e.g.
+        paired-recording electrophysiology). Build pair-level resampling /
+        null-model summaries on top of repeated calls.
+
+        Materializes the filtered cross-product once, then samples from it, so
+        every accumulated filter (distance, bounding box, cell type, id
+        restriction) is honored exactly. Compose those filters first to keep
+        the materialized frame small — sampling does not avoid the collect, it
+        just draws rows from it. The same ~10M-row warning as :meth:`collect`
+        fires if the frame is large.
+
+        ``weights`` biases the draw, the hook for matching an experimental
+        sampling distribution. Pass a column name or a polars expression that
+        evaluates to a non-negative per-pair weight; pairs are drawn with
+        probability proportional to it. For example, to mimic "80 recorded
+        pairs drawn according to a target distance distribution", register a
+        kernel of the pair distance and pass it here::
+
+            kernel = (-((pl.col("rho") - 50) ** 2) / 200).exp()  # any non-neg expr
+            pu.filter_by_ids(pre_ids=type_a, post_ids=type_b)
+              .sample_pairs(80, weights=kernel, seed=0)
+
+        Parameters
+        ----------
+        n : int
+            Number of pairs to draw.
+        weights : str or polars.Expr or None, optional
+            Per-pair sampling weight. ``None`` (default) draws uniformly. A
+            string is read as a column name; an expression is evaluated against
+            the materialized frame. Weights must be finite and non-negative and
+            sum to a positive value.
+        replace : bool, optional
+            Draw with replacement (default ``True``, the bootstrap-friendly
+            choice and required when ``n`` exceeds the number of eligible
+            pairs). ``False`` draws ``n`` distinct pairs.
+        seed : int or None, optional
+            Numpy seed for reproducibility.
+
+        Returns
+        -------
+        pl.DataFrame
+            ``n`` sampled rows with the full pair-frame columns (ids, weights,
+            registered annotations / expressions) plus a ``connected`` boolean
+            (``n_syn > 0``) when an ``n_syn`` weight is present. ``n_syn`` and
+            any other weights carry the per-pair connectivity for non-binary
+            summaries.
+
+        Raises
+        ------
+        ValueError
+            If ``n`` is not positive, the universe is empty, ``replace=False``
+            and ``n`` exceeds the eligible-pair count, or the weights are
+            invalid (negative, non-finite, or summing to zero).
+
+        See Also
+        --------
+        cell_bootstrap_iter : cell-draw resampling; the right unit for dense
+            reconstructions.
+        connection_probability : closed-form binomial CI — the analytic twin of
+            an unweighted pair draw of binary connectivity.
+        """
+        try:
+            import numpy as np
+        except ImportError as e:  # pragma: no cover
+            raise ImportError(
+                "sample_pairs requires numpy. Install with `pip install numpy` "
+                "or `uv add numpy`."
+            ) from e
+
+        if n <= 0:
+            raise ValueError(f"n must be positive, got {n}")
+
+        df = self.collect()  # full filtered frame; reuses the ~10M-row warning
+        pop = df.height
+        if pop == 0:
+            raise ValueError("cannot sample from an empty pair universe")
+        if not replace and n > pop:
+            raise ValueError(
+                f"cannot draw {n} distinct pairs without replacement from "
+                f"{pop} eligible pairs; pass replace=True or lower n"
+            )
+
+        rng = np.random.default_rng(seed)
+        if weights is None:
+            idx = rng.choice(pop, size=n, replace=replace)
+        else:
+            w_expr = pl.col(weights) if isinstance(weights, str) else weights
+            w = df.select(w_expr.alias("__w__"))["__w__"].to_numpy().astype(float)
+            if not np.isfinite(w).all() or (w < 0).any():
+                raise ValueError("sample weights must be finite and non-negative")
+            total = w.sum()
+            if total <= 0:
+                raise ValueError("sample weights sum to zero; nothing to draw")
+            idx = rng.choice(pop, size=n, replace=replace, p=w / total)
+
+        sampled = df[idx]
+        if "n_syn" in self._weights and "connected" not in sampled.columns:
+            sampled = sampled.with_columns((pl.col("n_syn") > 0).alias("connected"))
+        return sampled
+
     # ── copy ─────────────────────────────────────────────────────────────
 
     def _copy(self) -> "PairUniverse":
@@ -489,6 +615,20 @@ def possible_pairs(
     # denominator universe consistently.
     weights = list(el.weights)
     observed = el.build_lazy().select([pre_col, post_col] + weights)
+    # Align the cross-product id dtypes to the observed (source) id dtypes
+    # before joining. The cross is keyed by the universe annotation's
+    # cell-id column, which may have been inferred as a signed integer
+    # (e.g. Int64 from a python-int frame), while observed ids come straight
+    # from the source data (e.g. UInt64 root ids in parquet). Joining a
+    # signed key against an unsigned one panics deep in the streaming engine
+    # ("cannot get ref Int64 from UInt64"); casting the cross side to match
+    # makes pre_col / post_col one consistent dtype throughout the plan, so
+    # the weight overlay and every downstream annotation join line up.
+    obs_schema = observed.collect_schema()
+    cross = cross.with_columns(
+        pl.col(pre_col).cast(obs_schema[pre_col]),
+        pl.col(post_col).cast(obs_schema[post_col]),
+    )
     cross = cross.join(observed, on=[pre_col, post_col], how="left").with_columns(
         *[pl.col(w).fill_null(0) for w in weights]
     )

@@ -18,7 +18,7 @@ return a ConnectivityTable.
 from __future__ import annotations
 
 from dataclasses import replace
-from typing import Callable, Iterable
+from typing import Iterable
 
 import polars as pl
 
@@ -27,10 +27,11 @@ from ._base import (
     build_cell_annotation_spec,
     build_pair_plan,
     filter_by_id_sets,
+    filter_by_soma_distance_impl,
     materialize_aliased_spec,
 )
 from .connectivity_table import ConnectivityTable
-from .spatial import bbox_predicate, euclidean_distance
+from .spatial import bbox_predicate, euclidean_distance, radial_distance
 
 
 class EdgeList(ConnectivityTable):
@@ -242,36 +243,32 @@ class EdgeList(ConnectivityTable):
         """
         return filter_by_id_sets(self, pre_ids, post_ids)
 
-    def filter_by_soma_distance(
-        self,
-        max_distance: float,
-        *,
-        annotation: str | None = None,
-        distance_fn: Callable[[str, str], pl.Expr] = euclidean_distance,
+    def filter_by_radial_distance(
+        self, max_distance: float, *, annotation: str | None = None
     ) -> EdgeList:
-        """Keep pairs whose pre / post soma-soma distance is ``<= max_distance``.
+        """Keep pairs whose pre / post **lateral** soma distance is ``<= max_distance``.
 
-        Positions are looked up from the registered cell annotation whose
-        ``position_col`` was set at ``add_annotation`` time. The joined
-        per-side columns are ``{position_col}_pre`` / ``{position_col}_post``.
-
-        Parameters
-        ----------
-        max_distance : float
-            Maximum distance to retain. Units match the position columns.
-        annotation : str or None, optional
-            Name of the annotation whose ``position_col`` to use. If ``None``
-            (default), uses the unique position-bearing annotation; raises if
-            zero or more than one are registered.
-        distance_fn : callable
-            Takes two position-column names and returns a ``pl.Expr`` for the
-            distance. Defaults to 3-D Euclidean. Use ``radial_distance`` for
-            lateral-only.
+        Lateral (radial, depth-free) distance via :func:`trajan.radial_distance`
+        (``sqrt(dx² + dz²)``), ignoring the depth axis. Positions come from the
+        position-bearing cell annotation (auto-resolved when unique; pass
+        ``annotation=`` otherwise). Units match the position columns.
         """
-        ann_name = self._resolve_position_annotation(annotation)
-        pos_col = self._cell_annotations[ann_name].position_col
-        return self.filter(
-            distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, radial_distance
+        )
+
+    def filter_by_euclidean_distance(
+        self, max_distance: float, *, annotation: str | None = None
+    ) -> EdgeList:
+        """Keep pairs whose pre / post **3-D euclidean** soma distance is ``<= max_distance``.
+
+        Full 3-D distance via :func:`trajan.euclidean_distance`
+        (``sqrt(dx² + dy² + dz²)``), depth included. Positions come from the
+        position-bearing cell annotation (auto-resolved when unique; pass
+        ``annotation=`` otherwise). Units match the position columns.
+        """
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, euclidean_distance
         )
 
     def filter_by_bbox(
@@ -286,7 +283,7 @@ class EdgeList(ConnectivityTable):
         synapse position), EdgeList's bbox filter checks both cells — a pair
         is kept only if both somas lie within the box. Positions are looked up
         from the position-bearing cell annotation (see
-        ``filter_by_soma_distance`` for resolution rules).
+        ``filter_by_euclidean_distance`` for resolution rules).
 
         Parameters
         ----------

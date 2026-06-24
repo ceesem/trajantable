@@ -494,3 +494,36 @@ def test_with_distance_ambiguous_annotation_raises(synapses):
     # Explicit annotation= disambiguates.
     st_b = with_distance(st, "d_b", euclidean_distance, annotation="b")
     assert "d_b" in st_b.expression_names
+
+
+# ── numeric bins sort numerically (ordered Enum) ─────────────────────────────
+
+
+def test_numeric_bin_column_is_ordered_enum(pu):
+    """Continuous bins are emitted as an ordered Enum so they sort by bin
+    order, not lexically. d_rho here = |dx| (y=z=0)."""
+    df = counts(pu, bin_by={"d_rho": [0, 50, 100, 200]})
+    assert isinstance(df.schema["d_rho_bin"], pl.Enum)
+    bins = df["d_rho_bin"].to_list()
+    # counts() sorts by keys; with the Enum that is ascending bin order.
+    # Lexical order would put "(100, 200]" before "(50, 100]".
+    assert bins == ["(0, 50]", "(50, 100]", "(100, 200]", "(200, inf]"]
+
+
+def test_numeric_bin_sorts_numerically_after_shuffle(pu):
+    """Even after a shuffle, sorting on the bin column respects numeric order."""
+    df = counts(pu, bin_by={"d_rho": [0, 50, 100, 200]})
+    reshuffled = df.sort("k_observed")  # scramble row order
+    assert reshuffled.sort("d_rho_bin")["d_rho_bin"].to_list() == [
+        "(0, 50]",
+        "(50, 100]",
+        "(100, 200]",
+        "(200, inf]",
+    ]
+
+
+def test_categorical_passthrough_bin_not_enum(pu):
+    """Categorical pass-through (spec=None) is user-controlled and left as-is —
+    the ordered-Enum treatment is only for numeric bins."""
+    df = counts(pu, bin_by={"cell_type_post": None})
+    assert not isinstance(df.schema["cell_type_post"], pl.Enum)

@@ -90,14 +90,15 @@ st = st.add_cell_annotation(
     position_col="pt_position",   # declare the position role on this annotation
 )
 
-# Keep only local connections (soma < 100 µm apart)
-st_local = st.filter_by_soma_distance(100_000)  # units match your position data
+# Keep only local connections (somata < 100 µm apart in 3-D)
+st_local = st.filter_by_euclidean_distance(100_000)  # units match your position data
 ```
 
-By default uses Euclidean (3-D) distance. Pass `distance_fn=radial_distance` to
-ignore the z axis:
+Pick the metric explicitly. `filter_by_euclidean_distance` is full 3-D
+(`sqrt(dx² + dy² + dz²)`, depth included); `filter_by_radial_distance` is
+lateral only (`sqrt(dx² + dz²)`, depth-free) — the right choice for cortical
+column / lateral-reach analyses and the one that matches `rho` distance bins:
 
 ```python
-from trajan import radial_distance
-st_local = st.filter_by_soma_distance(100_000, distance_fn=radial_distance)
+st_local = st.filter_by_radial_distance(100_000)   # lateral, ignores depth
 ```

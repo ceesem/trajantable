@@ -62,7 +62,8 @@ filter auto-resolves to it. Pass `annotation=<name>` to disambiguate if more
 than one position-bearing annotation is registered:
 
 ```python
-near = el.filter_by_soma_distance(100_000)  # same units as your position data
+near = el.filter_by_radial_distance(100_000)  # lateral; same units as your position data
+# or el.filter_by_euclidean_distance(100_000) for full 3-D (depth included)
 ```
 
 ## Connectivity matrix

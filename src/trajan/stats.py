@@ -376,18 +376,48 @@ def with_distance(
 # ── binning primitive ────────────────────────────────────────────────────────
 
 
+def _ordered_cut_labels(breaks: list) -> list[str]:
+    """Polars' own ``cut`` labels for ``breaks``, in ascending numeric order.
+
+    Derived by cutting one representative point inside each of the
+    ``len(breaks) + 1`` bins (``(-inf, b0]`` … ``(b_last, inf]``) rather than
+    formatting the labels by hand — so the strings match exactly what
+    ``pl.Expr.cut`` produces for real data, and the subsequent ``Enum`` cast
+    cannot mismatch. Used to make continuous bins sort numerically (see
+    :func:`_resolve_bin_spec`).
+    """
+    pts = (
+        [breaks[0] - 1]
+        + [(breaks[i] + breaks[i + 1]) / 2 for i in range(len(breaks) - 1)]
+        + [breaks[-1] + 1]
+    )
+    return pl.Series([float(p) for p in pts]).cut(breaks).cast(pl.Utf8).to_list()
+
+
 def _resolve_bin_spec(name: str, spec: BinSpec) -> tuple[str, pl.Expr | None]:
     """Compile one ``(column, spec)`` entry into ``(output_col, optional_expr)``.
 
     Returns the column name to group by, plus an expression that materializes
     the bin column when needed (``None`` for categorical pass-through where
     no new column is required).
+
+    Continuous bins are emitted as an ordered :class:`polars.Enum` (categories
+    in ascending bin order) rather than the bare ``Categorical`` ``pl.cut``
+    returns. A ``cut`` ``Categorical`` sorts *lexically* (so ``"(100, 200]"``
+    lands before ``"(50, 100]"``) and only carries the bins present in the
+    data; the ordered ``Enum`` makes ``sort`` / ``pivot`` / plotting axes honor
+    numeric order automatically and includes every bin. Categorical
+    pass-through (``spec is None``) is already user-controlled, so it is left
+    untouched — the ordering issue only arises for numeric bins.
     """
     if spec is None:
         return name, None
     if isinstance(spec, (list, tuple)):
         out = f"{name}_bin"
-        return out, pl.col(name).cut(list(spec)).alias(out)
+        breaks = list(spec)
+        labels = _ordered_cut_labels(breaks)
+        expr = pl.col(name).cut(breaks).cast(pl.Enum(labels)).alias(out)
+        return out, expr
     raise TypeError(
         f"bin_by spec for {name!r} must be a list of edges or None, "
         f"got {type(spec).__name__}"

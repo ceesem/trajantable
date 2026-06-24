@@ -146,7 +146,8 @@ st = trajan.SynapseTable(
 )
 ```
 
-Soma positions for `filter_by_soma_distance` and `add_spatial_features` are
+Soma positions for the distance filters (`filter_by_radial_distance` /
+`filter_by_euclidean_distance`) and `add_spatial_features` are
 declared on the cell annotation that carries them, not on the SynapseTable
 itself — pass `position_col=<col>` to `add_cell_annotation`. The annotation's
 cell-id set can also be marked as the authoritative cell universe with

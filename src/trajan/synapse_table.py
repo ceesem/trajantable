@@ -4,7 +4,7 @@ import base64
 import math
 import warnings
 from pathlib import Path
-from typing import Callable, Union
+from typing import Union
 
 import polars as pl
 
@@ -20,6 +20,7 @@ from ._base import (
     apply_plan_tail,
     classify_by_cell_sides,
     filter_by_id_sets,
+    filter_by_soma_distance_impl,
     join_cell_annotations_symmetric,
     reject_reserved_names,
     resolve_position_annotation,
@@ -32,6 +33,7 @@ from .spatial import (
     bbox_predicate,
     depth_component,
     euclidean_distance,
+    radial_distance,
     spatial_feature_exprs,
 )
 
@@ -114,7 +116,8 @@ class SynapseTable(_CachedTable):
     -----
     Soma-position support is now declared on the cell annotation itself, via
     ``add_cell_annotation(..., position_col=<col>)``. Spatial filters
-    (``filter_by_soma_distance``, ``add_spatial_features``) auto-resolve the
+    (``filter_by_radial_distance`` / ``filter_by_euclidean_distance``,
+    ``add_spatial_features``) auto-resolve the
     position-bearing annotation; pass ``annotation=<name>`` when more than one
     is registered.
 
@@ -647,7 +650,8 @@ class SynapseTable(_CachedTable):
             or a column name whose ``_x`` / ``_y`` / ``_z`` triplet is present
             — in the latter case the triplet is auto-packed into a struct
             named ``position_col``. Declaring this role lets spatial filters
-            (``filter_by_soma_distance``, ``add_spatial_features``) find the
+            (``filter_by_radial_distance`` / ``filter_by_euclidean_distance``,
+            ``add_spatial_features``) find the
             position without further configuration. For more exotic packing
             needs (multiple split columns in one annotation), pre-pack the
             DataFrame with ``trajan.spatial.pack_position`` before passing.
@@ -1359,44 +1363,34 @@ class SynapseTable(_CachedTable):
         new._filter_sides = self._filter_sides + [self._classify_expression(expr)]
         return new
 
-    def filter_by_soma_distance(
-        self,
-        max_distance: float,
-        *,
-        annotation: str | None = None,
-        distance_fn: Callable[[str, str], pl.Expr] = euclidean_distance,
+    def filter_by_radial_distance(
+        self, max_distance: float, *, annotation: str | None = None
     ) -> SynapseTable:
-        """Return a new SynapseTable keeping only synapses where soma-soma
-        distance is ≤ max_distance (in the same units as your position columns).
+        """Keep only synapses whose pre/post **lateral** soma distance is ≤ max_distance.
 
-        Positions are looked up from a registered cell annotation whose
-        ``position_col`` was declared at ``add_cell_annotation`` time. The
-        position column must be packed as a struct with ``x`` / ``y`` / ``z``
-        fields (see ``pack_position``).
-
-        Parameters
-        ----------
-        max_distance : float
-            Maximum soma-to-soma distance to retain, in the same units as
-            the position columns.
-        annotation : str or None, optional
-            Name of the cell annotation whose ``position_col`` to use. If
-            ``None`` (default), uses the unique position-bearing annotation;
-            raises if zero or more than one are registered.
-        distance_fn : Callable[[str, str], pl.Expr], optional
-            Callable taking two column name strings and returning a pl.Expr for
-            the distance. Defaults to euclidean_distance. Use radial_distance to
-            ignore the z axis, or supply a custom function.
-
-        Returns
-        -------
-        SynapseTable
-            A new SynapseTable keeping only synapses within max_distance.
+        Lateral (radial, depth-free) distance via :func:`trajan.radial_distance`
+        (``sqrt(dx² + dz²)``), ignoring the depth axis — the metric for cortical
+        column / lateral-reach analyses. Positions are looked up from the
+        position-bearing cell annotation (a struct with ``x`` / ``y`` / ``z``
+        fields; see ``pack_position``), auto-resolved when unique. Units match
+        the position columns.
         """
-        ann_name = self._resolve_position_annotation(annotation)
-        pos_col = self._cell_annotations[ann_name].position_col
-        return self.filter(
-            distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, radial_distance
+        )
+
+    def filter_by_euclidean_distance(
+        self, max_distance: float, *, annotation: str | None = None
+    ) -> SynapseTable:
+        """Keep only synapses whose pre/post **3-D euclidean** soma distance is ≤ max_distance.
+
+        Full 3-D distance via :func:`trajan.euclidean_distance`
+        (``sqrt(dx² + dy² + dz²)``), depth included. Positions are looked up from
+        the position-bearing cell annotation (auto-resolved when unique). Units
+        match the position columns.
+        """
+        return filter_by_soma_distance_impl(
+            self, max_distance, annotation, euclidean_distance
         )
 
     def add_spatial_features(

@@ -2,8 +2,9 @@
 
 Covers direct construction, inheritance of ConnectivityTable behavior
 (Liskov check via a representative sample of parent tests), and the
-cell-specific additions: ``filter_by_ids``, ``filter_by_soma_distance``,
-``filter_by_bbox``, and ``aggregate_to_type`` (tier promotion).
+cell-specific additions: ``filter_by_ids``, ``filter_by_radial_distance`` /
+``filter_by_euclidean_distance``, ``filter_by_bbox``, and ``aggregate_to_type``
+(tier promotion).
 """
 
 import math
@@ -120,7 +121,7 @@ def test_filter_by_ids_neither_returns_copy(el):
     assert len(out.df) == 5
 
 
-# ── filter_by_soma_distance ──────────────────────────────────────────────────
+# ── filter_by_radial_distance / filter_by_euclidean_distance ─────────────────
 
 
 @pytest.fixture
@@ -141,25 +142,50 @@ def el_with_positions(pair_frame):
     return el
 
 
-def test_filter_by_soma_distance(el_with_positions):
+def test_filter_by_euclidean_distance(el_with_positions):
     """Only pairs with soma-soma distance <= 200 should remain.
 
     Distances (pre->post):
       1->10 = 0, 1->11 = 500, 2->10 = 100, 2->11 = 400, 3->11 = 500
     With max=200: keep (1,10), (2,10). Two rows.
     """
-    out = el_with_positions.filter_by_soma_distance(200.0)
+    out = el_with_positions.filter_by_euclidean_distance(200.0)
     assert isinstance(out, EdgeList)
     assert len(out.df) == 2
 
 
-def test_filter_by_soma_distance_no_position_annotation_raises(pair_frame):
+def test_filter_by_radial_distance_ignores_depth(pair_frame):
+    """Radial distance ignores the depth (y) axis, so a pair separated only in
+    depth survives a radial filter that euclidean would reject."""
+    pos = pl.DataFrame(
+        {
+            "cid": [1, 2, 3, 10, 11],
+            "soma_x": [0.0, 100.0, 0.0, 0.0, 500.0],
+            "soma_y": [0.0, 0.0, 0.0, 1000.0, 0.0],  # cid 10 deep below
+            "soma_z": [0.0, 0.0, 0.0, 0.0, 0.0],
+        }
+    )
+    el = EdgeList(pair_frame, pre_col="pre", post_col="post")
+    el.add_annotation(
+        "pos",
+        pack_position(pos, "soma", x="soma_x", y="soma_y", z="soma_z"),
+        cell_id_col="cid",
+        position_col="soma",
+    )
+    # 1->10: euclidean 1000 (deep) but radial 0. radial keeps it; euclidean drops it.
+    radial = el.filter_by_radial_distance(200.0).df
+    euclid = el.filter_by_euclidean_distance(200.0).df
+    assert (1, 10) in set(zip(radial["pre"].to_list(), radial["post"].to_list()))
+    assert (1, 10) not in set(zip(euclid["pre"].to_list(), euclid["post"].to_list()))
+
+
+def test_filter_by_euclidean_distance_no_position_annotation_raises(pair_frame):
     el = EdgeList(pair_frame, pre_col="pre", post_col="post")
     with pytest.raises(ValueError, match="No annotation with a position_col"):
-        el.filter_by_soma_distance(100.0)
+        el.filter_by_euclidean_distance(100.0)
 
 
-def test_filter_by_soma_distance_ambiguous_raises(pair_frame):
+def test_filter_by_euclidean_distance_ambiguous_raises(pair_frame):
     pos1 = pl.DataFrame(
         {"cid": [1, 2, 3, 10, 11], "a_x": [0.0] * 5, "a_y": [0.0] * 5, "a_z": [0.0] * 5}
     )
@@ -172,9 +198,9 @@ def test_filter_by_soma_distance_ambiguous_raises(pair_frame):
     el.add_annotation("a", a_packed, cell_id_col="cid", position_col="a")
     el.add_annotation("b", b_packed, cell_id_col="cid", position_col="b")
     with pytest.raises(ValueError, match="Multiple annotations carry positions"):
-        el.filter_by_soma_distance(100.0)
+        el.filter_by_euclidean_distance(100.0)
     # disambiguating works
-    out = el.filter_by_soma_distance(100.0, annotation="a")
+    out = el.filter_by_euclidean_distance(100.0, annotation="a")
     assert isinstance(out, EdgeList)
 
 

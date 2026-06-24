@@ -472,7 +472,7 @@ def test_edgelist_propagates_position_col_role(base_synapses):
     el = st.edgelist()
     assert el._resolve_position_annotation() == "soma"
     # Spatial filter works on the propagated annotation without explicit args
-    out = el.filter_by_soma_distance(10.0)
+    out = el.filter_by_euclidean_distance(10.0)
     assert isinstance(out, type(el))
 
 
@@ -1417,9 +1417,9 @@ def test_resolve_position_annotation_ambiguous_raises(base_synapses):
         .add_cell_annotation("b", soma_b, cell_id_col="root_id", position_col="pos_b")
     )
     with pytest.raises(ValueError, match="Multiple cell annotations"):
-        st.filter_by_soma_distance(10.0)
+        st.filter_by_euclidean_distance(10.0)
     # Disambiguating works
-    out = st.filter_by_soma_distance(10.0, annotation="a")
+    out = st.filter_by_euclidean_distance(10.0, annotation="a")
     assert isinstance(out, SynapseTable)
 
 

@@ -53,8 +53,9 @@ Cell annotations can carry **role declarations** that let library operations
 locate them without explicit per-call arguments:
 
 - `position_col=<col>` — names a data column carrying the cell's position as
-  a struct with `x` / `y` / `z` fields. Picked up by `filter_by_soma_distance`
-  and `add_spatial_features`.
+  a struct with `x` / `y` / `z` fields. Picked up by the distance filters
+  (`filter_by_radial_distance` / `filter_by_euclidean_distance`) and
+  `add_spatial_features`.
 - `is_universe=True` — marks this annotation's cell-id set as the
   authoritative cell universe (the set of cells that *exist*, including those
   with zero observed connections). Picked up by denominator-bearing

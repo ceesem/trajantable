@@ -11,6 +11,7 @@ nav:
     - Annotations: guides/annotations.md
     - Cell ID aliasing: guides/cell-aliases.md
     - Filtering: guides/filtering.md
+    - Connectivity statistics: guides/connectivity-statistics.md
     - Connectivity representations: guides/output.md
     - Persistence: guides/persistence.md
 - Function Reference:

@@ -282,8 +282,9 @@ class CellAnnotationSpec:
     position_col : str or None
         Name of the data column (within ``data_cols``) that carries the cell's
         position as a struct with ``x`` / ``y`` / ``z`` fields. Declaring this
-        role lets spatial filters (``filter_by_soma_distance``,
-        ``filter_by_bbox``) locate the position without explicit per-call args.
+        role lets spatial filters (``filter_by_radial_distance`` /
+        ``filter_by_euclidean_distance``, ``filter_by_bbox``) locate the
+        position without explicit per-call args.
         ``None`` means this annotation does not carry positions.
     is_universe : bool
         If True, this annotation's key set defines the authoritative cell
@@ -808,6 +809,12 @@ def filter_by_id_sets(table, pre_ids, post_ids):
     join) and goes through the table's own ``filter`` so the result keeps the
     caller's concrete type. With both id sets ``None`` it returns a copy,
     matching the no-op semantics of the per-class methods it replaces.
+
+    The ids are passed as a plain python list, not a dtype-matched Series:
+    ``is_in`` against a same-dtype Series collection takes an ambiguous code
+    path that panics on signed/unsigned id columns, whereas the list literal
+    coerces cleanly. Join-key dtypes themselves are normalized upstream in
+    :func:`possible_pairs`.
     """
     if pre_ids is None and post_ids is None:
         return table._copy()
@@ -817,6 +824,27 @@ def filter_by_id_sets(table, pre_ids, post_ids):
     if post_ids is not None:
         new = new.filter(pl.col(table.post_col).is_in(list(post_ids)))
     return new
+
+
+def filter_by_soma_distance_impl(table, max_distance, annotation, distance_fn):
+    """Shared soma-soma distance filter for the cell-bearing tiers.
+
+    Backs ``filter_by_radial_distance`` / ``filter_by_euclidean_distance`` on
+    ``SynapseTable``, ``EdgeList``, and ``PairUniverse``. Resolves the
+    position-bearing cell annotation, then filters on
+    ``distance_fn("{pos}_pre", "{pos}_post") <= max_distance`` through the
+    table's own ``filter`` so the concrete type is preserved.
+
+    The metric is supplied by the caller (``radial_distance`` for lateral,
+    ``euclidean_distance`` for 3-D) — there is intentionally no default here, so
+    every public entry point names its metric explicitly rather than inheriting
+    a silent one.
+    """
+    ann_name = table._resolve_position_annotation(annotation)
+    pos_col = table._cell_annotations[ann_name].position_col
+    return table.filter(
+        distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
+    )
 
 
 # ── side-classification ───────────────────────────────────────────────────────

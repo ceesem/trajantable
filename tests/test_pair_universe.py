@@ -177,6 +177,62 @@ def test_filter_by_ids_pre(st):
     assert set(df["pre_pt_root_id"].to_list()) == {10, 20}
 
 
+# ── mixed signed/unsigned id dtypes (regression) ─────────────────────────────
+
+
+@pytest.fixture
+def st_mismatched_id_dtype():
+    """Synapse ids are UInt64 (as parquet root ids load), but the universe
+    annotation's root_id was inferred Int64. Joining the two used to panic
+    in the streaming engine ('cannot get ref Int64 from UInt64')."""
+    synapses = pl.DataFrame(
+        {
+            "id": [1, 2, 3, 4],
+            "pre_pt_root_id": pl.Series([10, 10, 20, 30], dtype=pl.UInt64),
+            "post_pt_root_id": pl.Series([20, 30, 30, 10], dtype=pl.UInt64),
+            "size": [100, 50, 200, 80],
+        }
+    )
+    cells = pl.DataFrame(
+        {
+            "root_id": pl.Series([10, 20, 30, 40], dtype=pl.Int64),
+            "cell_type": ["L23", "L23", "L4", "L5"],
+        }
+    )
+    st = SynapseTable(synapses)
+    st.add_cell_annotation("cells", cells, cell_id_col="root_id", is_universe=True)
+    return st
+
+
+def test_possible_pairs_mismatched_id_dtype(st_mismatched_id_dtype):
+    """possible_pairs aligns the cross-product id dtype to the observed
+    (source) dtype, so the weight-overlay join doesn't panic on the
+    signed/unsigned mismatch."""
+    pu = possible_pairs(st_mismatched_id_dtype)
+    df = pu.collect()
+    assert len(df) == 12  # 4 cells, 4² − 4
+    # observed ordered pairs (10,20),(10,30),(20,30),(30,10) → n_syn > 0
+    assert df.filter(pl.col("n_syn") > 0).height == 4
+
+
+def test_filter_by_ids_mismatched_id_dtype(st_mismatched_id_dtype):
+    """filter_by_ids with a python-int list against an unsigned id column
+    matches the column dtype rather than panicking on the lowered join."""
+    pu = possible_pairs(st_mismatched_id_dtype).filter_by_ids(pre_ids=[10, 20])
+    df = pu.collect()
+    assert set(df["pre_pt_root_id"].to_list()) == {10, 20}
+
+
+def test_connection_probability_mismatched_id_dtype(st_mismatched_id_dtype):
+    """End-to-end: the original failing call (multi-id filter feeding a
+    binned connection_probability) completes."""
+    from trajan.stats import connection_probability
+
+    pu = possible_pairs(st_mismatched_id_dtype).filter_by_ids(pre_ids=[10, 20, 30])
+    out = connection_probability(pu, group_by="pre_pt_root_id")
+    assert set(out["pre_pt_root_id"].to_list()) == {10, 20, 30}
+
+
 @pytest.fixture
 def st_with_positions(synapses, universe_cells):
     cells_with_pos = universe_cells.with_columns(
@@ -198,8 +254,8 @@ def st_with_positions(synapses, universe_cells):
     return st
 
 
-def test_filter_by_soma_distance(st_with_positions):
-    pu = possible_pairs(st_with_positions).filter_by_soma_distance(150.0)
+def test_filter_by_euclidean_distance(st_with_positions):
+    pu = possible_pairs(st_with_positions).filter_by_euclidean_distance(150.0)
     df = pu.collect()
     # Distances under 150:
     #   10-20, 20-10  (=100)
@@ -212,6 +268,12 @@ def test_filter_by_soma_distance(st_with_positions):
     assert len(df) == 12
     assert 50 not in df["pre_pt_root_id"].to_list()
     assert 50 not in df["post_pt_root_id"].to_list()
+
+
+def test_filter_by_radial_distance(st_with_positions):
+    # positions all share y=z=0, so radial (xz) == euclidean here → same 12 pairs.
+    pu = possible_pairs(st_with_positions).filter_by_radial_distance(150.0)
+    assert len(pu.collect()) == 12
 
 
 # ── from EdgeList directly ───────────────────────────────────────────────────
@@ -388,3 +450,77 @@ def test_preview_limits_rows(st):
     out = pu.preview(3)
     assert len(out) == 3
     assert pu.pre_col in out.columns
+
+
+# ── sample_pairs ─────────────────────────────────────────────────────────────
+
+
+def test_sample_pairs_basic(st):
+    pu = possible_pairs(st)
+    out = pu.sample_pairs(50, seed=0)
+    assert out.height == 50  # with replacement, n may exceed the 20 pairs
+    assert "connected" in out.columns
+    # connected is exactly n_syn > 0
+    assert out["connected"].to_list() == (out["n_syn"] > 0).to_list()
+    assert pu.pre_col in out.columns and pu.post_col in out.columns
+
+
+def test_sample_pairs_seed_reproducible(st):
+    pu = possible_pairs(st)
+    a = pu.sample_pairs(30, seed=7)
+    b = pu.sample_pairs(30, seed=7)
+    assert a.equals(b)
+
+
+def test_sample_pairs_without_replacement_distinct(st):
+    pu = possible_pairs(st)
+    out = pu.sample_pairs(20, replace=False, seed=1)
+    pairs = set(zip(out[pu.pre_col].to_list(), out[pu.post_col].to_list()))
+    assert len(pairs) == 20  # all 20 distinct pairs, each once
+
+
+def test_sample_pairs_without_replacement_too_many_raises(st):
+    pu = possible_pairs(st)
+    with pytest.raises(ValueError, match="without replacement"):
+        pu.sample_pairs(21, replace=False)
+
+
+def test_sample_pairs_weights_bias_draw(st):
+    """A weight that zeroes out every post cell except 30 must only draw
+    pairs whose post is 30."""
+    pu = possible_pairs(st)
+    w = (pl.col("cell_type_post") == "L4").cast(pl.Float64)  # only cell 30 is L4
+    out = pu.sample_pairs(40, weights=w, seed=2)
+    assert set(out[pu.post_col].to_list()) == {30}
+
+
+def test_sample_pairs_weights_by_column_name(st):
+    pu = possible_pairs(st).add_expression(
+        "w", (pl.col("cell_type_post") == "L4").cast(pl.Float64)
+    )
+    out = pu.sample_pairs(40, weights="w", seed=3)
+    assert set(out[pu.post_col].to_list()) == {30}
+
+
+def test_sample_pairs_negative_weights_raise(st):
+    pu = possible_pairs(st)
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        pu.sample_pairs(10, weights=pl.lit(-1.0))
+
+
+def test_sample_pairs_zero_weight_sum_raises(st):
+    pu = possible_pairs(st)
+    with pytest.raises(ValueError, match="sum to zero"):
+        pu.sample_pairs(10, weights=pl.lit(0.0))
+
+
+def test_sample_pairs_nonpositive_n_raises(st):
+    pu = possible_pairs(st)
+    with pytest.raises(ValueError, match="n must be positive"):
+        pu.sample_pairs(0)
+
+
+def test_sample_pairs_empty_universe_raises(st):
+    pu = possible_pairs(st).filter_by_ids(pre_ids=[999999])  # no such cell
+    with pytest.raises(ValueError, match="empty pair universe"):
+        pu.sample_pairs(5)

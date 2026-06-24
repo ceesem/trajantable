@@ -357,7 +357,8 @@ Spatial filters read the declared `position_col` directly — no feature column
 needed:
 
 ```python
-near = st.filter_by_soma_distance(100, distance_fn=radial_distance)   # ≤100 lateral
+near = st.filter_by_radial_distance(100)      # ≤100 lateral (depth-free)
+far3d = st.filter_by_euclidean_distance(100)  # ≤100 in 3-D (depth included)
 box  = st.filter_by_bbox(((xmin, ymin, zmin), (xmax, ymax, zmax)))     # synapse in box
 ```
 
@@ -379,7 +380,7 @@ because the full cross-product is enormous. **Prune before you collect.**
 from trajan import possible_pairs
 
 pp = possible_pairs(el)                    # |U|² − |U| lazy rows, n_syn overlaid
-pp = pp.filter_by_soma_distance(200)       # spatial pruning is what keeps it tractable
+pp = pp.filter_by_radial_distance(200)     # lateral pruning is what keeps it tractable
 pp = pp.filter(pl.col("cell_type_pre") == "23P")
 ```
 
@@ -398,6 +399,16 @@ pp.group_by(["cell_type_pre", "cell_type_post"]).agg(
 pp.collect()          # full (pruned) frame — warns above ~10M rows
 pp.to_edgelist()      # just the observed (n_syn > 0) subset, as an EdgeList
 pp.to_pair_frame()    # full cross-product incl. zeros, as a raw DataFrame
+```
+
+Draw a random sample of pairs with their connectivity (the **pair-draw**
+primitive — see §6 for when to use it). `weights` biases the draw to match an
+experimental sampling distribution:
+
+```python
+pp.filter_by_radial_distance(200).sample_pairs(500, seed=0)   # uniform, w/ replacement
+pp.sample_pairs(80, weights="w", seed=0)   # ∝ a registered per-pair weight expr
+# returns sampled rows + a `connected` (n_syn > 0) boolean
 ```
 
 ---
@@ -450,6 +461,14 @@ bootstrap_over_cells(
 ```
 
 For custom summaries over the resamples, iterate with `cell_bootstrap_iter(...)`.
+
+**Match the resampling unit to how the data was collected.** Dense EM
+reconstruction → resample *cells* (`bootstrap_over_cells`), because pairs sharing
+a cell co-vary. Paired-recording designs that probe individual pairs → resample
+*pairs*; for binary connectivity that is exactly `wilson_ci`, and for weighted /
+non-binary draws build on `PairUniverse.sample_pairs` (§5). With a single pre
+cell, skip the cell bootstrap and use `wilson_ci`. The
+[Connectivity statistics](connectivity-statistics.md) guide covers this in full.
 
 ---
 
@@ -619,7 +638,7 @@ genuinely need the full wide frame repeatedly → `.df` (then `clear_cache()`).
   · `add_spatial_features(prefix=, center=, target=, depth_axis=, cell_depth=)`
 
 **Filter** (returns a new table)
-: `filter(expr)` · `filter_by_ids(pre_ids=, post_ids=)` · `filter_by_soma_distance(d, distance_fn=)`
+: `filter(expr)` · `filter_by_ids(pre_ids=, post_ids=)` · `filter_by_radial_distance(d)` / `filter_by_euclidean_distance(d)`
   · `filter_by_bbox(bbox)` · `filter_by_min_synapses(n, weight_col=)` · `filter_to_annotated(name, pre=, post=)`
 
 **Reshape**
@@ -630,7 +649,7 @@ genuinely need the full wide frame repeatedly → `.df` (then `clear_cache()`).
 : `cells(table, annotations="all"|[...]|None, scope="universe"|"filtered"|"observed", participation=, universe=, strict=)`
   · `cell_summary(st, pre_agg=, post_agg=)` *(observed cells only; richer aggregates)*
   · `possible_pairs(table, universe=, include_self=)` → `PairUniverse`
-  · `PairUniverse`: `.filter()` `.filter_by_soma_distance()` `.filter_by_bbox()` `.filter_by_ids()` `.group_by().agg()` `.collect()` `.to_edgelist()` `.to_pair_frame()`
+  · `PairUniverse`: `.filter()` `.filter_by_radial_distance()` `.filter_by_euclidean_distance()` `.filter_by_bbox()` `.filter_by_ids()` `.sample_pairs()` `.group_by().agg()` `.collect()` `.to_edgelist()` `.to_pair_frame()`
 
 **Statistics** (accept `PairUniverse` | `SynapseTable` | `EdgeList`)
 : `counts(pu, bin_by=, group_by=)` *(PairUniverse only)*
