@@ -26,6 +26,7 @@ from .stats import (
     connection_density,
     connection_probability,
     counts,
+    pivot_grid,
     wilson_ci,
     with_distance,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "euclidean_distance",
     "pack_all_positions",
     "pack_position",
+    "pivot_grid",
     "possible_pairs",
     "radial_distance",
     "to_dataframe",

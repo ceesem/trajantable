@@ -40,7 +40,7 @@ and ``project_edgelist_abstraction.md``.
 from __future__ import annotations
 
 import warnings
-from typing import TYPE_CHECKING, Callable, Iterator, Union
+from typing import TYPE_CHECKING, Callable, Iterator, NamedTuple, Union
 
 import polars as pl
 
@@ -590,6 +590,175 @@ def counts(
         agg_exprs.append(pl.sum(w).alias(f"sum_{w}"))
 
     return lf.group_by(keys).agg(agg_exprs).sort(keys).collect()
+
+
+# ── reshaping for heatmaps ────────────────────────────────────────────────────
+
+
+class PivotGrid(NamedTuple):
+    """A binned stats result reshaped into a dense, ordered 2-D matrix.
+
+    Returned by :func:`pivot_grid`. ``matrix[i, j]`` is the value for
+    ``row_labels[i]`` × ``col_labels[j]``; ``row_edges`` / ``col_edges`` carry
+    the numeric bin boundaries (``None`` for a non-interval / categorical axis).
+    """
+
+    matrix: "np.ndarray"
+    row_labels: list
+    col_labels: list
+    row_edges: "np.ndarray | None"
+    col_edges: "np.ndarray | None"
+
+
+def _parse_interval(label) -> tuple[float, float] | None:
+    """Parse a ``pl.cut`` interval label like ``"(10, 35]"`` into ``(lo, hi)``.
+
+    Returns ``None`` for anything that is not a numeric interval (e.g. a
+    categorical group-by label such as ``"L23"``), so callers can treat that
+    axis as categorical. ``-inf`` / ``inf`` bounds (the cut over/underflow bins)
+    parse to infinite floats.
+    """
+    if not (isinstance(label, str) and label[:1] in "([" and label[-1:] in "])"):
+        return None
+    parts = label[1:-1].split(", ")
+    if len(parts) != 2:
+        return None
+    try:
+        return float(parts[0]), float(parts[1])
+    except ValueError:
+        return None
+
+
+def _is_overflow_label(label) -> bool:
+    """True for a cut over/underflow bin — ``(-inf, e0]`` or ``(e_last, inf]``."""
+    iv = _parse_interval(label)
+    if iv is None:
+        return False
+    lo, hi = iv
+    return lo == float("-inf") or hi == float("inf")
+
+
+def _ordered_categories(s: pl.Series) -> list:
+    """Ordered category list for a key column.
+
+    For an :class:`polars.Enum` (what continuous ``bin_by`` emits) this is the
+    full declared category order — every bin, including ones absent from the
+    data — so a reindex against it yields a regular grid with gaps rather than
+    a collapsed axis. For other dtypes it falls back to the sorted distinct
+    values actually present.
+    """
+    if isinstance(s.dtype, pl.Enum):
+        return s.cat.get_categories().to_list()
+    return s.unique().drop_nulls().sort().to_list()
+
+
+def pivot_grid(
+    df: pl.DataFrame,
+    *,
+    index: str,
+    on: str,
+    values: str,
+    drop_overflow: bool = False,
+    aggregate_function: str = "first",
+) -> PivotGrid:
+    """Reshape a binned stats result into a dense, ordered matrix for heatmaps.
+
+    :meth:`polars.DataFrame.pivot` orders its rows / columns by *first
+    appearance* and only emits keys present in the data — so feeding its output
+    straight into ``imshow`` / ``sns.heatmap`` silently scrambles axes (the row
+    order follows whatever sort the producer happened to use) and drops empty
+    bins, leaving the matrix misaligned with any externally-supplied tick
+    labels. This helper fixes all three: it orders both axes by the bin columns'
+    natural order (the :class:`polars.Enum` category order that continuous
+    ``bin_by`` emits, so bins sort numerically rather than lexically), reindexes
+    to the *complete* set of bins (missing ones become ``NaN`` gaps), and
+    returns the numeric bin edges so tick labels cannot drift out of sync.
+
+    Parameters
+    ----------
+    df : pl.DataFrame
+        A result from :func:`counts` / :func:`connection_probability` /
+        :func:`bootstrap_over_cells` (or any frame with the named columns).
+    index, on : str
+        Column whose bins become the matrix rows (``index``) and columns
+        (``on``). Typically the two ``bin_by`` output columns (``*_bin``).
+    values : str
+        Column to read each cell's value from (e.g. ``"p"``, ``"k_observed"``).
+    drop_overflow : bool
+        If ``True``, drop the open-ended ``(-inf, e0]`` / ``(e_last, inf]``
+        cut bins on each axis. Detected by *category*, not position — so it is
+        correct even when only one side's overflow bin is populated (e.g. a
+        non-negative quantity like radial distance has no ``(-inf, 0]`` bin, for
+        which a blind ``[1:-1]`` slice would wrongly chop a real interior bin).
+    aggregate_function : str
+        Passed to :meth:`polars.DataFrame.pivot`. Defaults to ``"first"``;
+        binned stats results have one row per cell so no real aggregation
+        happens, but ``"first"`` keeps polars from erroring on the lookup.
+
+    Returns
+    -------
+    PivotGrid
+        ``(matrix, row_labels, col_labels, row_edges, col_edges)``. ``matrix``
+        is a ``float64`` 2-D array (rows = ``index`` bins top-to-bottom, columns
+        = ``on`` bins left-to-right). ``*_edges`` are the ``len(labels) + 1``
+        numeric boundaries for a continuous axis (label ticks at
+        ``np.arange(len(edges))``), or ``None`` for a categorical axis (label
+        ticks at cell centres ``np.arange(len(labels)) + 0.5``).
+
+    Examples
+    --------
+    >>> res = connection_probability(pu, bin_by={"rho": hbins, "post_depth": vbins})
+    >>> g = pivot_grid(res, index="post_depth_bin", on="rho_bin",
+    ...                values="p", drop_overflow=True)
+    >>> ax = sns.heatmap(g.matrix, vmin=0, vmax=1)
+    >>> ax.set_yticks(np.arange(len(g.row_edges)))
+    >>> ax.set_yticklabels(g.row_edges.astype(int))
+    >>> ax.set_xticks(np.arange(len(g.col_edges)))
+    >>> _ = ax.set_xticklabels(g.col_edges.astype(int))
+    """
+    try:
+        import numpy as np
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "pivot_grid requires numpy. Install with `pip install numpy` "
+            "or `uv add numpy`."
+        ) from e
+
+    for name, col in (("index", index), ("on", on), ("values", values)):
+        if col not in df.columns:
+            raise ValueError(
+                f"pivot_grid {name}={col!r} not found in df columns: {df.columns}"
+            )
+
+    row_cats = _ordered_categories(df[index])
+    col_cats = _ordered_categories(df[on])
+    if drop_overflow:
+        row_cats = [c for c in row_cats if not _is_overflow_label(c)]
+        col_cats = [c for c in col_cats if not _is_overflow_label(c)]
+
+    piv = df.pivot(
+        index=index, on=on, values=values, aggregate_function=aggregate_function
+    )
+    # Reindex rows to the full ordered category set (left join preserves the
+    # left frame's order, so the row order is exactly row_cats), then make sure
+    # every expected column exists before selecting them in order.
+    row_df = pl.DataFrame({index: row_cats}).with_columns(
+        pl.col(index).cast(df[index].dtype)
+    )
+    piv = row_df.join(piv, on=index, how="left")
+    for c in col_cats:
+        if c not in piv.columns:
+            piv = piv.with_columns(pl.lit(None, dtype=pl.Float64).alias(c))
+
+    matrix = piv.select(col_cats).to_numpy().astype(np.float64)
+
+    def _edges(labels):
+        ivs = [_parse_interval(label) for label in labels]
+        if not ivs or any(iv is None for iv in ivs):
+            return None
+        return np.array([ivs[0][0]] + [hi for _, hi in ivs], dtype=np.float64)
+
+    return PivotGrid(matrix, row_cats, col_cats, _edges(row_cats), _edges(col_cats))
 
 
 # ── CI estimators ────────────────────────────────────────────────────────────

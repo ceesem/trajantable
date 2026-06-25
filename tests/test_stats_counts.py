@@ -22,6 +22,7 @@ from trajan import (
     connection_density,
     connection_probability,
     counts,
+    pivot_grid,
     possible_pairs,
     wilson_ci,
     with_distance,
@@ -668,3 +669,108 @@ def test_bootstrap_numpy_path_matches_manual_resample(pu):
     assert a["cell_type_post"].to_list() == b["cell_type_post"].to_list()
     assert np.allclose(a["k_observed"].to_numpy(), b["k_observed"].to_numpy())
     assert np.allclose(a["n_possible"].to_numpy(), b["n_possible"].to_numpy())
+
+
+# ── pivot_grid: dense ordered matrix for heatmaps ────────────────────────────
+
+
+@pytest.fixture
+def grid_result(synapses, universe_cells):
+    """A 2-D binned connection_probability over rho × post_depth, the shape
+    that feeds a heatmap (and the one that exposed the pivot-ordering trap)."""
+    packed = pack_position(universe_cells, "soma", x="soma_x", y="soma_y", z="soma_z")
+    st = SynapseTable(synapses)
+    st.add_cell_annotation(
+        "cells", packed, cell_id_col="root_id", is_universe=True, position_col="soma"
+    )
+    pu = possible_pairs(st).add_expression(
+        "post_depth", pl.col("soma_post").struct.field("y")
+    )
+    pu = pu.add_expression("rho", radial_distance("soma_pre", "soma_post"))
+    res = connection_probability(
+        pu,
+        bin_by={"rho": [0, 100, 250], "post_depth": list(np.arange(-15, 510, 25))},
+    )
+    return res
+
+
+def test_pivot_grid_rows_sorted_numerically(grid_result):
+    """Rows come back in ascending bin order regardless of the producer's sort,
+    fixing the first-appearance scramble that raw pivot would give."""
+    g = pivot_grid(grid_result, index="post_depth_bin", on="rho_bin", values="p")
+    lows = [_low_edge(label) for label in g.row_labels]
+    assert lows == sorted(lows)
+
+
+def test_pivot_grid_reindexes_to_all_bins(grid_result):
+    """Every declared depth bin appears as a row even if no pair fell in it, so
+    the matrix is a regular grid (gaps are NaN, not collapsed rows)."""
+    n_depth_cats = grid_result["post_depth_bin"].cat.get_categories().len()
+    g = pivot_grid(grid_result, index="post_depth_bin", on="rho_bin", values="p")
+    assert g.matrix.shape[0] == n_depth_cats
+    assert len(g.row_labels) == n_depth_cats
+    # at least one fully-empty bin → an all-NaN row
+    assert np.isnan(g.matrix).any()
+
+
+def test_pivot_grid_drop_overflow_by_category(grid_result):
+    """drop_overflow removes the (-inf, e0] / (e_last, inf] bins by category —
+    correct even though rho (>= 0) has no populated (-inf, 0] underflow, where a
+    blind [1:-1] slice would chop a real interior column."""
+    g = pivot_grid(
+        grid_result,
+        index="post_depth_bin",
+        on="rho_bin",
+        values="p",
+        drop_overflow=True,
+    )
+    assert not any(_is_overflowy(label) for label in g.row_labels)
+    assert not any(_is_overflowy(label) for label in g.col_labels)
+    # edges line up for boundary-style tick labels: n_bins + 1 == n_edges
+    assert g.matrix.shape[0] + 1 == len(g.row_edges)
+    assert g.matrix.shape[1] + 1 == len(g.col_edges)
+
+
+def test_pivot_grid_values_match_source(grid_result):
+    """Each matrix cell carries the p for its (row, col) bin from the source."""
+    g = pivot_grid(grid_result, index="post_depth_bin", on="rho_bin", values="p")
+    lookup = {
+        (r["post_depth_bin"], r["rho_bin"]): r["p"]
+        for r in grid_result.iter_rows(named=True)
+    }
+    for i, rl in enumerate(g.row_labels):
+        for j, cl in enumerate(g.col_labels):
+            expected = lookup.get((rl, cl))
+            cell = g.matrix[i, j]
+            if expected is None:
+                assert np.isnan(cell)
+            else:
+                assert cell == pytest.approx(expected)
+
+
+def test_pivot_grid_categorical_axis_has_no_edges(pu):
+    """A categorical group-by axis (cell_type) returns its labels with edges
+    None, signalling centre-tick labelling rather than boundary edges."""
+    res = connection_probability(
+        pu, bin_by={"d_rho": [0, 50, 100, 1000], "cell_type_post": None}
+    )
+    g = pivot_grid(res, index="cell_type_post", on="d_rho_bin", values="p")
+    assert g.row_edges is None  # categorical → no numeric edges
+    assert g.col_edges is not None  # continuous rho → edges present
+    assert set(g.row_labels) <= set(res["cell_type_post"].to_list())
+
+
+def test_pivot_grid_unknown_column_raises(grid_result):
+    with pytest.raises(ValueError, match="not found in df columns"):
+        pivot_grid(grid_result, index="nope", on="rho_bin", values="p")
+
+
+def _low_edge(label: str) -> float:
+    return float(label[1:-1].split(", ")[0])
+
+
+def _is_overflowy(label: str) -> bool:
+    if not (isinstance(label, str) and label.startswith("(")):
+        return False
+    lo, hi = label[1:-1].split(", ")
+    return lo == "-inf" or hi == "inf"
