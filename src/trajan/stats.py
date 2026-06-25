@@ -52,6 +52,10 @@ from ._base import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    import numpy as np
+
     from .edgelist import EdgeList
     from .pair_universe import PairUniverse
     from .synapse_table import SynapseTable
@@ -64,7 +68,8 @@ if TYPE_CHECKING:
 # ── shared types ──────────────────────────────────────────────────────────────
 
 # Each entry of a ``bin_by`` mapping accepts:
-#   - list / tuple of numerics: edges passed to ``pl.Expr.cut`` — produces an
+#   - an array-like of numerics (list, tuple, ``range``, ``numpy.ndarray``,
+#     pandas / polars ``Series``): edges passed to ``pl.Expr.cut`` — produces an
 #     output column named ``{name}_bin`` carrying the bin label.
 #   - ``None``: categorical pass-through — the raw column is used as a
 #     group-by key directly. Useful for `cell_type_pre`, `compartment_post`,
@@ -72,7 +77,7 @@ if TYPE_CHECKING:
 # Joint binning is the cross product of multiple entries: ``bin_by={"d_rho":
 # [...], "d_y": [...]}`` produces a 2-D grid of bins. Mixing continuous +
 # categorical is fine: ``bin_by={"d_rho": [...], "cell_type_post": None}``.
-BinSpec = Union[list, tuple, None]
+BinSpec = Union["Sequence", "np.ndarray", None]
 
 # An ``Estimator`` consumes two polars expressions — k and n — and returns a
 # dict of ``{output_col_name: expr}`` for new columns to attach to the
@@ -413,16 +418,40 @@ def _resolve_bin_spec(name: str, spec: BinSpec) -> tuple[str, pl.Expr | None]:
     """
     if spec is None:
         return name, None
-    if isinstance(spec, (list, tuple)):
-        out = f"{name}_bin"
-        breaks = list(spec)
-        labels = _ordered_cut_labels(breaks)
-        expr = pl.col(name).cut(breaks).cast(pl.Enum(labels)).alias(out)
-        return out, expr
-    raise TypeError(
-        f"bin_by spec for {name!r} must be a list of edges or None, "
-        f"got {type(spec).__name__}"
-    )
+    breaks = _coerce_edges(name, spec)
+    out = f"{name}_bin"
+    labels = _ordered_cut_labels(breaks)
+    expr = pl.col(name).cut(breaks).cast(pl.Enum(labels)).alias(out)
+    return out, expr
+
+
+def _coerce_edges(name: str, spec: BinSpec) -> list:
+    """Coerce a bin spec to a plain list of edges.
+
+    Accepts any array-like — list, tuple, ``range``, ``numpy.ndarray``, pandas /
+    polars ``Series`` — converting to native Python scalars where possible so the
+    edge dtypes (and thus the ``cut`` labels) match what a literal list would give.
+    Strings, bytes, and mappings are rejected (iterable but not edges), as are
+    non-iterables.
+    """
+    if isinstance(spec, (str, bytes)) or isinstance(spec, dict):
+        raise TypeError(
+            f"bin_by spec for {name!r} must be None or an array-like of edges "
+            f"(list, tuple, numpy array, Series, range, ...), got "
+            f"{type(spec).__name__}"
+        )
+    if hasattr(spec, "tolist"):  # numpy ndarray, pandas Series
+        return list(spec.tolist())
+    if hasattr(spec, "to_list"):  # polars Series
+        return list(spec.to_list())
+    try:
+        return list(spec)
+    except TypeError:
+        raise TypeError(
+            f"bin_by spec for {name!r} must be None or an array-like of edges "
+            f"(list, tuple, numpy array, Series, range, ...), got "
+            f"{type(spec).__name__}"
+        ) from None
 
 
 # ── shared binning helper ────────────────────────────────────────────────────
@@ -783,8 +812,18 @@ def connection_density(
 
 # ── cell-level bootstrap ─────────────────────────────────────────────────────
 
+# Default ceiling on the number of distinct key combinations (bins) the
+# cell-bootstrap will materialize. The bootstrap distribution is a dense
+# ``n_resamples × n_bins`` array, so an accidental high-cardinality key
+# (e.g. grouping by a raw cell id, or binning a continuous column that was
+# never actually bucketed) silently turns into gigabytes. We'd rather raise a
+# pointed error than OOM. Override with ``max_bins=None`` for a deliberate
+# very-fine-grained analysis. 50k bins × 1000 resamples × 8 bytes ≈ 400 MB,
+# already past what most laptops want to spend on a CI.
+_DEFAULT_MAX_BINS = 50_000
 
-def _bootstrap_setup(pu, bin_by, group_by, universe):
+
+def _bootstrap_setup(pu, bin_by, group_by, universe, max_bins=_DEFAULT_MAX_BINS):
     """Encode the binned pair frame into compact numpy arrays for resampling.
 
     Returns ``(pre_idx, post_idx, connected, gid, key_table, N)``:
@@ -862,27 +901,59 @@ def _bootstrap_setup(pu, bin_by, group_by, universe):
         .astype(np.int32)
     )
     key_table = key_table.drop("__gid__")
+
+    # Guard against a high-cardinality key blowing memory up. The bootstrap
+    # distribution downstream is a dense ``n_resamples × B`` array, so B is the
+    # multiplier that matters. A B in the hundreds of thousands almost always
+    # means a key was grouped/binned at the wrong granularity (a raw cell id, an
+    # unbucketed continuous column) rather than a genuine analysis intent.
+    B = key_table.height
+    if max_bins is not None and B > max_bins:
+        # Surface the worst offenders so the fix is obvious from the message.
+        card = {k: key_table[k].n_unique() for k in key_table.columns}
+        ranked = ", ".join(
+            f"{k} ({n:,} distinct)"
+            for k, n in sorted(card.items(), key=lambda kv: kv[1], reverse=True)
+        )
+        raise ValueError(
+            f"cell bootstrap would materialize {B:,} bins (key combinations), "
+            f"exceeding max_bins={max_bins:,}. This usually means a key is too "
+            f"fine-grained — e.g. grouping by a raw cell id or binning a "
+            f"continuous column that was not bucketed. Keys by cardinality: "
+            f"{ranked}. Coarsen the bins/groups, or pass max_bins=None (or a "
+            f"higher value) to override if this is intentional."
+        )
     return pre_idx, post_idx, connected, gid, key_table, N
+
+
+def _bootstrap_counts(pre_idx, post_idx, connected, gid, B, m):
+    """One resample → ``(k, n)`` per-bin weighted-count arrays (length ``B``).
+
+    ``m`` is the per-cell multiplicity vector for this resample (length ``N``).
+    Each pair contributes weight ``m[pre] * m[post]`` to its group; ``np.bincount``
+    sums those weights per group id for the denominator ``n`` (``n_possible``)
+    and over the connected subset for the numerator ``k`` (``k_observed``).
+    Returns ``Float64`` arrays (weighted sums). This is the bin-indexed core
+    shared by the frame-yielding iterator and the array-accumulating CI driver,
+    so the two paths cannot drift on the weighting/reduction.
+    """
+    import numpy as np
+
+    w = (m[pre_idx] * m[post_idx]).astype(np.float64)
+    n = np.bincount(gid, weights=w, minlength=B)
+    k = np.bincount(gid[connected], weights=w[connected], minlength=B)
+    return k, n
 
 
 def _bootstrap_one(pre_idx, post_idx, connected, gid, key_table, m):
     """One bootstrap resample → ``(*keys, k_observed, n_possible, p)`` DataFrame.
 
-    ``m`` is the per-cell multiplicity vector for this resample (length ``N``).
-    Each pair contributes weight ``m[pre] * m[post]`` to its group; ``np.bincount``
-    sums those weights per group id for the denominator (``n_possible``) and over
-    the connected subset for the numerator (``k_observed``). Counts are
-    ``Float64`` (weighted sums, matching :func:`counts`' column names). Groups
-    with no surviving weight (every pair has a zero-multiplicity endpoint) are
-    dropped, mirroring the old inner-join behaviour — so callers see only the
-    bins present in the resample.
+    Wraps :func:`_bootstrap_counts` in the labelled frame the public iterator
+    yields. Groups with no surviving weight (every pair has a zero-multiplicity
+    endpoint) are dropped, mirroring the old inner-join behaviour — so callers
+    see only the bins present in the resample.
     """
-    import numpy as np
-
-    B = key_table.height
-    w = (m[pre_idx] * m[post_idx]).astype(np.float64)
-    n = np.bincount(gid, weights=w, minlength=B)
-    k = np.bincount(gid[connected], weights=w[connected], minlength=B)
+    k, n = _bootstrap_counts(pre_idx, post_idx, connected, gid, key_table.height, m)
     return (
         key_table.with_columns(
             pl.Series("k_observed", k),
@@ -923,6 +994,7 @@ def cell_bootstrap_iter(
     n_resamples: int = 1000,
     seed: int | None = None,
     universe: str | None = None,
+    max_bins: int | None = _DEFAULT_MAX_BINS,
     progress: bool = False,
 ) -> Iterator[pl.DataFrame]:
     """Yield ``n_resamples`` cell-bootstrap per-bin DataFrames.
@@ -953,6 +1025,12 @@ def cell_bootstrap_iter(
         Number of resamples to draw. Default ``1000``.
     seed : int or None
         Numpy seed; pass an int for reproducibility.
+    max_bins : int or None
+        Guardrail on the number of distinct key combinations (bins). Raises
+        ``ValueError`` before any resampling if the keys would produce more
+        than ``max_bins`` bins (default ``50_000``) — a high count almost
+        always means a key is too fine-grained (a raw cell id, an unbucketed
+        continuous column) and would blow memory up. Pass ``None`` to disable.
     progress : bool, optional
         Show a tqdm progress bar over the resampling loop (default ``False``).
         Covers the per-resample iterations only — the one-time collect of the
@@ -995,7 +1073,7 @@ def cell_bootstrap_iter(
 
     pu = _as_pair_universe(table, universe=universe)
     pre_idx, post_idx, connected, gid, key_table, N = _bootstrap_setup(
-        pu, bin_by, group_by, universe
+        pu, bin_by, group_by, universe, max_bins=max_bins
     )
     rng = np.random.default_rng(seed)
     pvals = np.full(N, 1.0 / N)
@@ -1021,6 +1099,7 @@ def bootstrap_over_cells(
     alpha: float = 0.05,
     seed: int | None = None,
     universe: str | None = None,
+    max_bins: int | None = _DEFAULT_MAX_BINS,
     progress: bool = False,
 ) -> pl.DataFrame:
     """Cell-bootstrap percentile CI for per-bin connection density.
@@ -1055,6 +1134,14 @@ def bootstrap_over_cells(
         Two-sided significance level. Default ``0.05`` (95% CI).
     seed : int or None
         Numpy seed for reproducibility. ``None`` draws fresh randomness.
+    max_bins : int or None
+        Guardrail on the number of distinct key combinations (bins). Raises
+        ``ValueError`` before any resampling if the keys would produce more
+        than ``max_bins`` bins (default ``50_000``). The bootstrap distribution
+        is held as a dense ``n_resamples × n_bins`` array, so a fine-grained
+        key (a raw cell id, an unbucketed continuous column) is the usual cause
+        of a memory blow-up; the guard turns that into a pointed error naming
+        the offending keys. Pass ``None`` to disable.
     progress : bool, optional
         Show a tqdm progress bar over the resampling loop (default ``False``);
         useful when a large pair universe makes the bootstrap slow. Tracks the
@@ -1080,31 +1167,66 @@ def bootstrap_over_cells(
     too thin for cell-bootstrap to characterize, and you likely want to
     widen them or report counts directly.
     """
+    try:
+        import numpy as np
+    except ImportError as e:  # pragma: no cover
+        raise ImportError(
+            "bootstrap_over_cells requires numpy. Install with "
+            "`pip install numpy` or `uv add numpy`."
+        ) from e
+
     if not 0 < alpha < 1:
         raise ValueError(f"alpha must be in (0, 1), got {alpha!r}")
+    if n_resamples < 1:
+        raise ValueError(f"n_resamples must be >= 1, got {n_resamples}")
+    if not bin_by and not group_by:
+        raise ValueError(
+            "bootstrap_over_cells requires at least one bin_by or group_by key"
+        )
 
     pu = _as_pair_universe(table, universe=universe)
     keys = _resolve_keys(bin_by, group_by)
     point = connection_probability(pu, bin_by=bin_by, group_by=group_by)
-    per_resample = list(
-        cell_bootstrap_iter(
-            pu,
-            bin_by=bin_by,
-            group_by=group_by,
-            n_resamples=n_resamples,
-            seed=seed,
-            universe=universe,
-            progress=progress,
-        )
+
+    # Accumulate the bootstrap distribution straight into a dense
+    # ``n_resamples × B`` float array indexed by the dense group id, rather than
+    # collecting B-row labelled frames into a list and concatenating. That older
+    # path repeated the full key_table (string/struct labels included) once per
+    # resample, so memory scaled with the labelled width × n_resamples; this
+    # holds 8 bytes per (resample, bin) and attaches the keys exactly once.
+    # Bins absent from a resample stay NaN, so np.nanquantile reproduces the old
+    # "computed only over resamples where the bin was sampled" semantics.
+    pre_idx, post_idx, connected, gid, key_table, N = _bootstrap_setup(
+        pu, bin_by, group_by, universe, max_bins=max_bins
     )
-    stacked = pl.concat(per_resample)
-    # Use linear interpolation (numpy's default) so the percentile CI agrees
-    # with hand-computed references and the broader scientific-Python
-    # convention. Polars' default ``nearest`` would give answers off by a
-    # ``1 / n_resamples`` step at percentile boundaries.
-    ci = stacked.group_by(keys).agg(
-        pl.col("p").quantile(alpha / 2, interpolation="linear").alias("p_lo"),
-        pl.col("p").quantile(1 - alpha / 2, interpolation="linear").alias("p_hi"),
+    B = key_table.height
+    rng = np.random.default_rng(seed)
+    pvals = np.full(N, 1.0 / N)
+    dist = np.empty((n_resamples, B), dtype=np.float64)
+    iterations = _progress_iter(
+        range(n_resamples), total=n_resamples, enabled=progress, desc="cell bootstrap"
+    )
+    for i in iterations:
+        m = rng.multinomial(N, pvals)
+        k, n = _bootstrap_counts(pre_idx, post_idx, connected, gid, B, m)
+        with np.errstate(invalid="ignore"):
+            p = k / n  # 0/0 → nan for unsampled bins (k == 0 there)
+        p[n == 0] = np.nan
+        dist[i] = p
+
+    # Linear interpolation (numpy's default) so the percentile CI agrees with
+    # hand-computed references and the scientific-Python convention; polars'
+    # ``nearest`` default would shift bounds by a ``1 / n_resamples`` step.
+    # nanquantile ignores resamples where a bin was unsampled; an all-NaN bin
+    # (never sampled in any resample) yields NaN bounds — suppress the warning
+    # numpy raises for that empty-slice case.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        lo = np.nanquantile(dist, alpha / 2, axis=0)
+        hi = np.nanquantile(dist, 1 - alpha / 2, axis=0)
+    ci = key_table.with_columns(
+        pl.Series("p_lo", lo),
+        pl.Series("p_hi", hi),
     )
     # join_nulls so a null group/bin key (e.g. an untyped cell, cell_type=None)
     # matches between point and ci; otherwise that bin keeps its computed p but

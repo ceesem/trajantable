@@ -233,6 +233,62 @@ def test_connection_probability_mismatched_id_dtype(st_mismatched_id_dtype):
     assert set(out["pre_pt_root_id"].to_list()) == {10, 20, 30}
 
 
+def test_build_time_pre_ids_prunes_universe(st):
+    """``possible_pairs(pre_ids=...)`` restricts the pre side before the cross
+    product, matching a post-hoc filter_by_ids on the result."""
+    pruned = possible_pairs(st, pre_ids=[10, 20]).collect()
+    posthoc = possible_pairs(st).filter_by_ids(pre_ids=[10, 20]).collect()
+    assert set(pruned["pre_pt_root_id"].to_list()) == {10, 20}
+    assert pruned.sort(["pre_pt_root_id", "post_pt_root_id"]).equals(
+        posthoc.sort(["pre_pt_root_id", "post_pt_root_id"])
+    )
+
+
+def test_build_time_pre_post_ids_bound_cross_product(st):
+    """With both sides pruned the product is exactly |pre| × |post| (minus any
+    self-pairs), never the full universe square."""
+    df = possible_pairs(st, pre_ids=[10, 20], post_ids=[30, 40]).collect()
+    assert set(df["pre_pt_root_id"].to_list()) == {10, 20}
+    assert set(df["post_pt_root_id"].to_list()) == {30, 40}
+    assert df.height == 4  # 2 × 2, no overlap so no self-pairs dropped
+
+
+def test_build_time_pruning_does_not_enumerate_full_universe(st_mismatched_id_dtype):
+    """The pruned id set is applied to the universe scan(s) feeding the cross
+    join, so the plan does not depend on post-cross pushdown to stay bounded —
+    no id predicate is left stranded above the cross join."""
+    pu = possible_pairs(st_mismatched_id_dtype, pre_ids=[10])
+    plan = pu.build_lazy().explain(optimized=True)
+    cross_at = plan.find("NESTED LOOP JOIN")
+    assert cross_at != -1
+    assert "is_in" not in plan[:cross_at], (
+        f"build-time pruning left an id filter above the cross join:\n{plan}"
+    )
+
+
+def test_filter_by_ids_pushes_below_cross_join(st_mismatched_id_dtype):
+    """A single-sided ``filter_by_ids`` must prune the cross-product *before*
+    it is enumerated, not after. The id-dtype alignment is done at the per-side
+    select feeding ``join(how="cross")`` rather than as a ``with_columns`` cast
+    placed above the cross join — a post-cross ``strict_cast`` redefines the id
+    column and so is an opaque predicate-pushdown barrier, stranding the
+    ``is_in`` above the join and forcing the full |U|² product to materialize
+    before the filter drops it (the cause of a single-pre-id OOM on a large
+    universe). Assert the optimizer pushes ``is_in`` below the cross join.
+    """
+    pu = possible_pairs(st_mismatched_id_dtype).filter_by_ids(pre_ids=[10])
+    plan = pu.build_lazy().explain(optimized=True)
+    # The cross join shows as a NESTED LOOP JOIN (the pre != post condition).
+    cross_at = plan.find("NESTED LOOP JOIN")
+    assert cross_at != -1, f"expected a cross join in the plan:\n{plan}"
+    # If pushdown worked, no id predicate sits above the cross join; it has been
+    # lowered onto the scan(s) feeding it.
+    assert "is_in" not in plan[:cross_at], (
+        "filter_by_ids predicate was not pushed below the cross join — the "
+        f"full cross-product will materialize:\n{plan}"
+    )
+
+
 @pytest.fixture
 def st_with_positions(synapses, universe_cells):
     cells_with_pos = universe_cells.with_columns(

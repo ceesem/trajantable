@@ -523,6 +523,8 @@ def possible_pairs(
     *,
     universe: str | None = None,
     include_self: bool = False,
+    pre_ids: Iterable | None = None,
+    post_ids: Iterable | None = None,
 ) -> PairUniverse:
     """Enumerate the ``universe × universe`` pair frame with observed counts.
 
@@ -559,13 +561,31 @@ def possible_pairs(
         Name of the universe annotation; auto-resolved when unambiguous.
     include_self : bool
         If False (default), self-pairs (``pre == post``) are excluded.
+    pre_ids, post_ids : iterable of cell id or None
+        Restrict the pre / post universe to these ids *before* forming the
+        cross-product, so the plan never enumerates more than
+        ``|pre_ids| × |post_ids|`` pairs. Prefer this over a post-hoc
+        ``.filter_by_ids(...)`` when you already know the id set at
+        construction time: filtering the cross-product relies on the query
+        optimizer pushing the predicate below the cross join, which a large
+        whole-brain universe can defeat (e.g. an id-dtype cast barrier), in
+        which case the full ``|U|²`` product materializes first. Pruning the
+        universe here is deterministic — the ``|U|²`` node is never built.
+        Both default to ``None`` (use the whole universe on that side).
 
     Returns
     -------
     PairUniverse
-        Lazy ``|U|² − |U|`` (or ``|U|²``) row plan with observed weights
-        overlaid. Compose filters / aggregations on this; call ``.collect()``
-        or ``.group_by(...).agg(...)`` at the end.
+        Lazy row plan with observed weights overlaid — ``|pre| × |post|`` minus
+        self-pairs, where each side is the full universe unless restricted by
+        ``pre_ids`` / ``post_ids``. Compose filters / aggregations on this; call
+        ``.collect()`` or ``.group_by(...).agg(...)`` at the end.
+
+    See Also
+    --------
+    PairUniverse.filter_by_ids : restrict an already-built cross-product
+        (relies on predicate pushdown; use ``pre_ids`` / ``post_ids`` here to
+        prune before the cross-product is formed instead).
     """
     # Normalize to EdgeList — synapse-level filters bake in during aggregation.
     # Capture cell-level filters from the source BEFORE aggregation, because
@@ -600,35 +620,50 @@ def possible_pairs(
     pre_col = el.pre_col
     post_col = el.post_col
 
-    # Cross-product over universe cell ids only — annotations are re-attached
-    # as registered annotations so the PairUniverse can manage them under the
-    # same alias / projection rules as EdgeList.
-    pre_ids = universe_spec.lf.select(pl.col(cell_id).alias(pre_col))
-    post_ids = universe_spec.lf.select(pl.col(cell_id).alias(post_col))
-    cross = pre_ids.join(post_ids, how="cross")
-    if not include_self:
-        cross = cross.filter(pl.col(pre_col) != pl.col(post_col))
-
     # Overlay observed weights from the source's already-merged edgelist.
     # build_lazy() bakes in cell-level filters too — we'll also re-apply
     # them via projection on the cross-product below to constrain the
     # denominator universe consistently.
     weights = list(el.weights)
     observed = el.build_lazy().select([pre_col, post_col] + weights)
-    # Align the cross-product id dtypes to the observed (source) id dtypes
-    # before joining. The cross is keyed by the universe annotation's
-    # cell-id column, which may have been inferred as a signed integer
-    # (e.g. Int64 from a python-int frame), while observed ids come straight
-    # from the source data (e.g. UInt64 root ids in parquet). Joining a
-    # signed key against an unsigned one panics deep in the streaming engine
-    # ("cannot get ref Int64 from UInt64"); casting the cross side to match
-    # makes pre_col / post_col one consistent dtype throughout the plan, so
-    # the weight overlay and every downstream annotation join line up.
     obs_schema = observed.collect_schema()
-    cross = cross.with_columns(
-        pl.col(pre_col).cast(obs_schema[pre_col]),
-        pl.col(post_col).cast(obs_schema[post_col]),
+
+    # Cross-product over universe cell ids only — annotations are re-attached
+    # as registered annotations so the PairUniverse can manage them under the
+    # same alias / projection rules as EdgeList.
+    #
+    # Align the id dtypes to the observed (source) ids BEFORE the cross join,
+    # not after. The cross is keyed by the universe annotation's cell-id column,
+    # which may differ from the observed ids' dtype (e.g. UInt64 root ids in
+    # parquet vs Int64 inferred from a python-int frame). The dtypes must match
+    # or the weight overlay / annotation joins panic in the streaming engine
+    # ("cannot get ref Int64 from UInt64"). Casting here — at the per-side
+    # ``select`` below the cross join — rather than with a ``with_columns`` cast
+    # placed *above* the cross join is what keeps single-sided pruning cheap: a
+    # post-cross ``strict_cast`` redefines pre_col/post_col and so is an opaque
+    # predicate-pushdown barrier, leaving e.g. ``filter_by_ids(pre_ids=[x])``
+    # stranded above the join — the full |U|² product then materializes before
+    # the filter drops it to one row. Cast pre-cross and the optimizer pushes
+    # the id predicate down onto the scan, so the cross is |selected| × |U|.
+    pre_side = universe_spec.lf.select(
+        pl.col(cell_id).cast(obs_schema[pre_col]).alias(pre_col)
     )
+    post_side = universe_spec.lf.select(
+        pl.col(cell_id).cast(obs_schema[post_col]).alias(post_col)
+    )
+    # Build-time universe pruning: filter each side's id list before the cross
+    # join so the product is bounded by construction, independent of whether the
+    # optimizer can push a post-cross predicate down. A plain python list (not a
+    # dtype-matched Series) keeps is_in on the clean coercion path for
+    # signed/unsigned id columns, matching filter_by_id_sets.
+    if pre_ids is not None:
+        pre_side = pre_side.filter(pl.col(pre_col).is_in(list(pre_ids)))
+    if post_ids is not None:
+        post_side = post_side.filter(pl.col(post_col).is_in(list(post_ids)))
+    cross = pre_side.join(post_side, how="cross")
+    if not include_self:
+        cross = cross.filter(pl.col(pre_col) != pl.col(post_col))
+
     cross = cross.join(observed, on=[pre_col, post_col], how="left").with_columns(
         *[pl.col(w).fill_null(0) for w in weights]
     )

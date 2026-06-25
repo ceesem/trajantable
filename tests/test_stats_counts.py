@@ -11,6 +11,7 @@ will rely on:
 - connection_probability adds p = k/n and optionally estimator columns
 """
 
+import numpy as np
 import polars as pl
 import pytest
 
@@ -269,8 +270,66 @@ def test_connection_probability_with_joint_binning(pu):
 
 
 def test_bin_spec_rejects_unknown_type(pu):
-    with pytest.raises(TypeError, match="must be a list of edges or None"):
+    # a string is iterable but not edges — rejected with a clear message
+    with pytest.raises(TypeError, match="array-like of edges"):
         counts(pu, bin_by={"d_rho": "quantile:10"})  # not yet supported
+
+
+# ── bin_by accepts array-likes (not just lists) ──────────────────────────────
+
+
+def test_bin_by_accepts_numpy_array(pu):
+    df = counts(pu, bin_by={"d_rho": np.array([0.0, 50.0, 100.0, 1000.0])})
+    assert df.height > 0
+    assert "d_rho_bin" in df.columns
+
+
+def test_bin_by_accepts_linspace_and_range(pu):
+    assert counts(pu, bin_by={"d_rho": np.linspace(0, 1000, 5)}).height > 0
+    assert counts(pu, bin_by={"d_rho": range(0, 1001, 250)}).height > 0
+
+
+def test_bin_by_accepts_polars_series(pu):
+    df = counts(pu, bin_by={"d_rho": pl.Series([0.0, 50.0, 100.0, 1000.0])})
+    assert df.height > 0
+
+
+def test_bin_by_array_matches_list(pu):
+    # a numpy array of edges produces the same result as the equivalent list
+    edges = [0.0, 50.0, 100.0, 1000.0]
+    from_list = counts(pu, bin_by={"d_rho": edges}).sort("d_rho_bin")
+    from_array = counts(pu, bin_by={"d_rho": np.array(edges)}).sort("d_rho_bin")
+    assert from_list.equals(from_array)
+
+
+# ── mixed UInt64 / Int64 root-id dtypes across the annotation join ────────────
+
+
+@pytest.mark.parametrize(
+    "syn_dtype,uni_dtype",
+    [(pl.UInt64, pl.Int64), (pl.Int64, pl.UInt64)],
+)
+def test_counts_with_mixed_root_id_dtypes(
+    synapses, universe_cells, syn_dtype, uni_dtype
+):
+    # The spine (synapse root ids) and an annotation's cell-id can come from
+    # different sources with different int signedness (UInt64 parquet ids vs
+    # Int64 python frames). The annotation join must not panic the engine.
+    synapses = synapses.with_columns(
+        pl.col("pre_pt_root_id").cast(syn_dtype),
+        pl.col("post_pt_root_id").cast(syn_dtype),
+    )
+    universe_cells = universe_cells.with_columns(pl.col("root_id").cast(uni_dtype))
+    packed = pack_position(universe_cells, "soma", x="soma_x", y="soma_y", z="soma_z")
+    st = SynapseTable(synapses)
+    st.add_cell_annotation(
+        "cells", packed, cell_id_col="root_id", is_universe=True, position_col="soma"
+    )
+    st.add_spatial_features(prefix="d")
+    pu = possible_pairs(st)
+    # the spatial bin forces the cells annotation join (mismatched dtypes)
+    df = counts(pu, bin_by={"d_rho": [0.0, 50.0, 100.0, 1000.0]})
+    assert df.height > 0
 
 
 # ── CI estimators: Wilson ────────────────────────────────────────────────────

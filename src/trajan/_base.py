@@ -685,16 +685,46 @@ def join_cell_annotations_symmetric(
         else:
             pre_key = pre_col
             post_key = post_col
+        # Align the annotation's join-key dtype to the spine's. The spine id
+        # columns come from the source data (e.g. UInt64 root ids in parquet),
+        # while an annotation frame's cell-id may have been inferred as a signed
+        # int (Int64 from a python frame). Joining mismatched int signedness panics
+        # deep in the streaming engine ("cannot get ref UInt64 from Int64"); casting
+        # the annotation key to the spine dtype keeps every join consistent.
+        left_dtypes = lf.collect_schema()
         joined_sides = spec.sides()
         if "pre" in joined_sides:
             pre_lf = spec.lf.rename({c: f"{c}_pre" for c in spec.data_cols})
+            pre_lf = _align_key_dtype(
+                pre_lf, spec.cell_id_col, left_dtypes.get(pre_key)
+            )
             lf = lf.join(pre_lf, left_on=pre_key, right_on=spec.cell_id_col, how="left")
         if "post" in joined_sides:
             post_lf = spec.lf.rename({c: f"{c}_post" for c in spec.data_cols})
+            post_lf = _align_key_dtype(
+                post_lf, spec.cell_id_col, left_dtypes.get(post_key)
+            )
             lf = lf.join(
                 post_lf, left_on=post_key, right_on=spec.cell_id_col, how="left"
             )
     return lf
+
+
+def _align_key_dtype(
+    ann_lf: pl.LazyFrame, key_col: str, target_dtype: pl.DataType | None
+) -> pl.LazyFrame:
+    """Cast ``ann_lf``'s ``key_col`` to ``target_dtype`` if they differ.
+
+    No-op when the target dtype is unknown (``None``) or already matches. Used to
+    line up a cell-annotation's join key with the spine's id dtype before a join,
+    so signed/unsigned (Int64/UInt64) root-id mismatches don't panic the engine.
+    """
+    if target_dtype is None:
+        return ann_lf
+    current = ann_lf.collect_schema().get(key_col)
+    if current is not None and current != target_dtype:
+        ann_lf = ann_lf.with_columns(pl.col(key_col).cast(target_dtype))
+    return ann_lf
 
 
 def apply_plan_tail(
