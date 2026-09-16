@@ -463,84 +463,87 @@ class EdgeList(ConnectivityTable):
         import base64
         import warnings
 
-        from ._base import _as_folio
+        from ._base import _as_folio, _folio_read, _folio_scan
 
         folio = _as_folio(folio)
-        config = folio.get_json("config")
-        saved_type = config.get("__type__", "ConnectivityTable")
-        if saved_type != cls._TYPE_TAG:
-            raise TypeError(
-                f"Saved folio is a {saved_type!r}; cannot load as "
-                f"{cls.__name__}. Call the matching .load() — or "
-                f"ConnectivityTable.load(folio), which dispatches."
-            )
-
-        def _lf(name: str) -> pl.LazyFrame:
-            return pl.scan_parquet(folio.get_data_path(name))
-
-        instance = cls(
-            _lf("pairs"),
-            pre_col=config["pre_col"],
-            post_col=config["post_col"],
-            weight_cols=config.get("weights", []),
-        )
-
-        annotations = config.get("annotations", {})
-        # Non-aliased pass — these may be alias sources.
-        for name, ann_meta in annotations.items():
-            if ann_meta.get("join_on_alias") is None:
-                instance.add_annotation(
-                    name,
-                    _lf(f"ann_{name}"),
-                    cell_id_col=ann_meta["cell_id_col"],
-                    position_col=ann_meta.get("position_col"),
-                    is_universe=ann_meta.get("is_universe", False),
-                    side=ann_meta.get("side", "both"),
-                )
-        # Cell aliases must be set after their source annotations are present.
-        for alias_name, alias_meta in config.get("cell_aliases", {}).items():
-            instance.set_cell_alias(
-                alias_meta["annotation_name"],
-                alias_meta["col"],
-                alias_name=alias_name,
-            )
-        # Aliased annotations now find their alias.
-        for name, ann_meta in annotations.items():
-            if ann_meta.get("join_on_alias") is not None:
-                instance.add_annotation(
-                    name,
-                    _lf(f"ann_{name}"),
-                    cell_id_col=ann_meta["cell_id_col"],
-                    position_col=ann_meta.get("position_col"),
-                    is_universe=ann_meta.get("is_universe", False),
-                    join_on_alias=ann_meta["join_on_alias"],
-                    side=ann_meta.get("side", "both"),
+        with _folio_read(folio):
+            config = folio.get("config")
+            saved_type = config.get("__type__", "ConnectivityTable")
+            if saved_type != cls._TYPE_TAG:
+                raise TypeError(
+                    f"Saved folio is a {saved_type!r}; cannot load as "
+                    f"{cls.__name__}. Call the matching .load() — or "
+                    f"ConnectivityTable.load(folio), which dispatches."
                 )
 
-        for name, expr_val in config.get("expressions", {}).items():
-            expr = None
-            try:
-                expr = pl.Expr.deserialize(base64.b64decode(expr_val), format="binary")
-            except Exception:
-                pass
-            if expr is None:
-                try:
-                    expr = pl.Expr.deserialize(expr_val.encode(), format="json")
-                except Exception:
-                    warnings.warn(
-                        f"Could not deserialize expression {name!r} from folio "
-                        "(likely a Polars version incompatibility). Re-save to fix.",
-                        stacklevel=2,
+            def _lf(name: str) -> pl.LazyFrame:
+                return _folio_scan(folio, name)
+
+            instance = cls(
+                _lf("pairs"),
+                pre_col=config["pre_col"],
+                post_col=config["post_col"],
+                weight_cols=config.get("weights", []),
+            )
+
+            annotations = config.get("annotations", {})
+            # Non-aliased pass — these may be alias sources.
+            for name, ann_meta in annotations.items():
+                if ann_meta.get("join_on_alias") is None:
+                    instance.add_annotation(
+                        name,
+                        _lf(f"ann_{name}"),
+                        cell_id_col=ann_meta["cell_id_col"],
+                        position_col=ann_meta.get("position_col"),
+                        is_universe=ann_meta.get("is_universe", False),
+                        side=ann_meta.get("side", "both"),
                     )
-                    continue
-            instance.add_expression(name, expr)
+            # Cell aliases must be set after their source annotations are present.
+            for alias_name, alias_meta in config.get("cell_aliases", {}).items():
+                instance.set_cell_alias(
+                    alias_meta["annotation_name"],
+                    alias_meta["col"],
+                    alias_name=alias_name,
+                )
+            # Aliased annotations now find their alias.
+            for name, ann_meta in annotations.items():
+                if ann_meta.get("join_on_alias") is not None:
+                    instance.add_annotation(
+                        name,
+                        _lf(f"ann_{name}"),
+                        cell_id_col=ann_meta["cell_id_col"],
+                        position_col=ann_meta.get("position_col"),
+                        is_universe=ann_meta.get("is_universe", False),
+                        join_on_alias=ann_meta["join_on_alias"],
+                        side=ann_meta.get("side", "both"),
+                    )
 
-        saved_sides = config.get("filter_sides")
-        for i, f_json in enumerate(config.get("filters", [])):
-            instance = instance.filter(
-                pl.Expr.deserialize(f_json.encode(), format="json")
-            )
-            if saved_sides is not None and i < len(saved_sides):
-                instance._filter_sides[-1] = saved_sides[i]
+            for name, expr_val in config.get("expressions", {}).items():
+                expr = None
+                try:
+                    expr = pl.Expr.deserialize(
+                        base64.b64decode(expr_val), format="binary"
+                    )
+                except Exception:
+                    pass
+                if expr is None:
+                    try:
+                        expr = pl.Expr.deserialize(expr_val.encode(), format="json")
+                    except Exception:
+                        warnings.warn(
+                            f"Could not deserialize expression {name!r} from folio "
+                            "(likely a Polars version incompatibility). Re-save to fix.",
+                            stacklevel=2,
+                        )
+                        continue
+                instance.add_expression(name, expr)
 
-        return instance
+            saved_sides = config.get("filter_sides")
+            for i, f_json in enumerate(config.get("filters", [])):
+                instance = instance.filter(
+                    pl.Expr.deserialize(f_json.encode(), format="json")
+                )
+                if saved_sides is not None and i < len(saved_sides):
+                    instance._filter_sides[-1] = saved_sides[i]
+
+            return instance

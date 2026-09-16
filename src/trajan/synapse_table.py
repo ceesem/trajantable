@@ -16,6 +16,10 @@ from ._base import (
     _as_folio,
     _auto_pack,
     _CachedTable,
+    _folio_add,
+    _folio_batch,
+    _folio_read,
+    _folio_scan,
     _to_lazy,
     apply_plan_tail,
     classify_by_cell_sides,
@@ -2077,20 +2081,35 @@ class SynapseTable(_CachedTable):
                 for name, spec in self._vertex_annotations.items()
             },
         }
-        folio.add_json("config", config, overwrite=overwrite)
-        if self.metadata:
-            folio.metadata.update(self.metadata)
-        folio.add_table("synapses", self._syn_lf.collect(), overwrite=overwrite)
-        for name, spec in self._synapse_annotations.items():
-            folio.add_table(
-                f"synapse_ann_{name}", spec.lf.collect(), overwrite=overwrite
-            )
-        for name, spec in self._cell_annotations.items():
-            folio.add_table(f"cell_ann_{name}", spec.lf.collect(), overwrite=overwrite)
-        for name, spec in self._vertex_annotations.items():
-            folio.add_table(
-                f"vertex_ann_{name}", spec.lf.collect(), overwrite=overwrite
-            )
+        with _folio_batch(folio):
+            folio.add("config", config, overwrite=overwrite)
+            if self.metadata:
+                folio.metadata.update(self.metadata)
+            folio.add("synapses", self._syn_lf.collect(), overwrite=overwrite)
+            for name, spec in self._synapse_annotations.items():
+                _folio_add(
+                    folio,
+                    f"synapse_ann_{name}",
+                    spec.lf.collect(),
+                    overwrite=overwrite,
+                    described_as=f"synapse annotation {name!r}",
+                )
+            for name, spec in self._cell_annotations.items():
+                _folio_add(
+                    folio,
+                    f"cell_ann_{name}",
+                    spec.lf.collect(),
+                    overwrite=overwrite,
+                    described_as=f"cell annotation {name!r}",
+                )
+            for name, spec in self._vertex_annotations.items():
+                _folio_add(
+                    folio,
+                    f"vertex_ann_{name}",
+                    spec.lf.collect(),
+                    overwrite=overwrite,
+                    described_as=f"vertex annotation {name!r}",
+                )
 
     @classmethod
     def load(cls, folio: Union[str, Path, object]) -> SynapseTable:
@@ -2109,77 +2128,82 @@ class SynapseTable(_CachedTable):
             and filters restored.
         """
         folio = _as_folio(folio)
+        with _folio_read(folio):
 
-        def _lf(name: str) -> pl.LazyFrame:
-            return pl.scan_parquet(folio.get_data_path(name))
+            def _lf(name: str) -> pl.LazyFrame:
+                return _folio_scan(folio, name)
 
-        config = folio.get_json("config")
-        st = cls(
-            _lf("synapses"),
-            pre_col=config["pre_col"],
-            post_col=config["post_col"],
-            id_col=config["id_col"],
-            synapse_position_col=config["synapse_position_col"],
-        )
-        for name, meta in config["synapse_annotations"].items():
-            st.add_synapse_annotation(
-                name,
-                _lf(f"synapse_ann_{name}"),
-                syn_id_col=meta.get("syn_id_col"),
+            config = folio.get("config")
+            st = cls(
+                _lf("synapses"),
+                pre_col=config["pre_col"],
+                post_col=config["post_col"],
+                id_col=config["id_col"],
+                synapse_position_col=config["synapse_position_col"],
             )
-        for name, meta in config["cell_annotations"].items():
-            st.add_cell_annotation(
-                name,
-                _lf(f"cell_ann_{name}"),
-                cell_id_col=meta["cell_id_col"],
-                join_on_alias=meta.get("join_on_alias"),
-                position_col=meta.get("position_col"),
-                is_universe=meta.get("is_universe", False),
-            )
-        for alias_name, alias_meta in config.get("cell_aliases", {}).items():
-            st.set_cell_alias(
-                alias_meta["annotation_name"],
-                alias_meta["col"],
-                alias_name=alias_name,
-            )
-        for name, meta in config["vertex_annotations"].items():
-            st.add_vertex_annotation(
-                name,
-                _lf(f"vertex_ann_{name}"),
-                vertex_id_col=meta["vertex_id_col"],
-                pre_vertex_col=meta["pre_vertex_col"],
-                post_vertex_col=meta["post_vertex_col"],
-            )
-        for name, expr_val in config.get("expressions", {}).items():
-            expr = None
-            # New format: base64-encoded binary (round-trips all literals correctly)
-            try:
-                expr = pl.Expr.deserialize(base64.b64decode(expr_val), format="binary")
-            except Exception:
-                pass
-            # Old format: JSON string (may fail for expressions containing NaN literals)
-            if expr is None:
+            for name, meta in config["synapse_annotations"].items():
+                st.add_synapse_annotation(
+                    name,
+                    _lf(f"synapse_ann_{name}"),
+                    syn_id_col=meta.get("syn_id_col"),
+                )
+            for name, meta in config["cell_annotations"].items():
+                st.add_cell_annotation(
+                    name,
+                    _lf(f"cell_ann_{name}"),
+                    cell_id_col=meta["cell_id_col"],
+                    join_on_alias=meta.get("join_on_alias"),
+                    position_col=meta.get("position_col"),
+                    is_universe=meta.get("is_universe", False),
+                )
+            for alias_name, alias_meta in config.get("cell_aliases", {}).items():
+                st.set_cell_alias(
+                    alias_meta["annotation_name"],
+                    alias_meta["col"],
+                    alias_name=alias_name,
+                )
+            for name, meta in config["vertex_annotations"].items():
+                st.add_vertex_annotation(
+                    name,
+                    _lf(f"vertex_ann_{name}"),
+                    vertex_id_col=meta["vertex_id_col"],
+                    pre_vertex_col=meta["pre_vertex_col"],
+                    post_vertex_col=meta["post_vertex_col"],
+                )
+            for name, expr_val in config.get("expressions", {}).items():
+                expr = None
+                # New format: base64-encoded binary (round-trips all literals correctly)
                 try:
-                    expr = pl.Expr.deserialize(expr_val.encode(), format="json")
-                except Exception:
-                    warnings.warn(
-                        f"Could not deserialize expression {name!r} from folio "
-                        f"(likely a Polars version incompatibility). "
-                        f"Re-save the folio to fix this.",
-                        stacklevel=2,
+                    expr = pl.Expr.deserialize(
+                        base64.b64decode(expr_val), format="binary"
                     )
-                    continue
-            st.add_expression(name, expr)
-        for col in config.get("weights", []):
-            st.add_weight(col)
-        # Use saved filter_sides when present (post-Universe+Scope refactor);
-        # fall back to live reclassification for older folios. Both paths yield
-        # the same classification given the order annotations are restored above.
-        saved_sides = config.get("filter_sides")
-        for i, f_json in enumerate(config["filters"]):
-            st = st.filter(pl.Expr.deserialize(f_json.encode(), format="json"))
-            if saved_sides is not None and i < len(saved_sides):
-                st._filter_sides[-1] = saved_sides[i]
-        _internal = {"created_at", "updated_at", "_datafolio"}
-        st.metadata = {k: v for k, v in folio.metadata.items() if k not in _internal}
-        return st
+                except Exception:
+                    pass
+                # Old format: JSON string (may fail for expressions containing NaN literals)
+                if expr is None:
+                    try:
+                        expr = pl.Expr.deserialize(expr_val.encode(), format="json")
+                    except Exception:
+                        warnings.warn(
+                            f"Could not deserialize expression {name!r} from folio "
+                            f"(likely a Polars version incompatibility). "
+                            f"Re-save the folio to fix this.",
+                            stacklevel=2,
+                        )
+                        continue
+                st.add_expression(name, expr)
+            for col in config.get("weights", []):
+                st.add_weight(col)
+            # Use saved filter_sides when present (post-Universe+Scope refactor);
+            # fall back to live reclassification for older folios. Both paths yield
+            # the same classification given the order annotations are restored above.
+            saved_sides = config.get("filter_sides")
+            for i, f_json in enumerate(config["filters"]):
+                st = st.filter(pl.Expr.deserialize(f_json.encode(), format="json"))
+                if saved_sides is not None and i < len(saved_sides):
+                    st._filter_sides[-1] = saved_sides[i]
+            _internal = {"created_at", "updated_at", "_datafolio"}
+            st.metadata = {
+                k: v for k, v in folio.metadata.items() if k not in _internal
+            }
+            return st

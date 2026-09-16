@@ -1854,3 +1854,81 @@ def test_collect_accepts_single_string(st_with_cell_ann):
 def test_collect_unknown_column_raises(st_with_cell_ann):
     with pytest.raises(ValueError, match="not found in table"):
         st_with_cell_ann.collect(["nope"])
+
+
+# ── DataFolio 2 persistence behaviors ────────────────────────────────────────
+
+
+def test_save_is_one_folio_commit(base_synapses, tmp_path):
+    """save() stages every table into a single DataFolio commit.
+
+    DataFolio publishes its manifest per add(); batching keeps a multi-table
+    save atomic and, on a cloud folio, collapses N+2 round trips into one.
+    """
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    st = SynapseTable(base_synapses)
+    st = st.add_cell_annotation(
+        "types",
+        pl.DataFrame({"root_id": [1, 2, 3], "cell_type": ["a", "b", "c"]}),
+        cell_id_col="root_id",
+    )
+
+    # DataFolio bumps the manifest revision once per publish; a batched save
+    # publishes once no matter how many tables it writes.
+    before = folio._manifest_revision or 0
+    st.save(folio)
+    assert (folio._manifest_revision or 0) == before + 1
+    assert set(folio.list_contents()["included_tables"]) == {
+        "synapses",
+        "cell_ann_types",
+    }
+
+
+def test_save_inside_a_caller_opened_batch(base_synapses, tmp_path):
+    """save() stages into a batch the caller already opened (DataFolio won't nest)."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    st = SynapseTable(base_synapses)
+    st.metadata["source"] = "batched"
+    with folio.batch():
+        st.save(folio)
+
+    assert SynapseTable.load(folio).metadata["source"] == "batched"
+
+
+def test_save_rejects_annotation_name_datafolio_cannot_store(base_synapses, tmp_path):
+    """An annotation name that is not a legal folio item name fails naming itself.
+
+    DataFolio validates item names; trajan derives them by prefixing the
+    annotation name, so the raw error would quote 'cell_ann_cell type'.
+    """
+    st = SynapseTable(base_synapses)
+    st = st.add_cell_annotation(
+        "cell type",
+        pl.DataFrame({"root_id": [1, 2, 3], "cell_type": ["a", "b", "c"]}),
+        cell_id_col="root_id",
+    )
+    with pytest.raises(ValueError, match="cell annotation 'cell type'"):
+        st.save(str(tmp_path / "folio"))
+
+
+def test_load_from_read_only_snapshot(base_synapses, tmp_path):
+    """A table loads from a snapshot view, which is a read-only folio."""
+    import datafolio
+
+    folio = datafolio.DataFolio(str(tmp_path / "folio"))
+    st = SynapseTable(base_synapses)
+    st = st.add_cell_annotation(
+        "types",
+        pl.DataFrame({"root_id": [1, 2, 3], "cell_type": ["a", "b", "c"]}),
+        cell_id_col="root_id",
+    )
+    st.save(folio)
+    folio.create_snapshot("v1")
+
+    loaded = SynapseTable.load(folio.get_snapshot("v1"))
+    assert loaded.cell_annotation_names == ["types"]
+    assert len(loaded.df) == len(st.df)

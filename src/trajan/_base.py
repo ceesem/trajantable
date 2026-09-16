@@ -26,6 +26,7 @@ observed duplication across the tiers rather than speculated in advance.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal, TypeVar, Union
@@ -1073,3 +1074,64 @@ def _as_folio(folio):
 
         return DataFolio(folio)
     return folio
+
+
+def _folio_batch(folio):
+    """Context manager staging every write of a ``save()`` into one commit.
+
+    DataFolio commits its manifest on each ``add()``, so saving a table with N
+    annotations would otherwise cost N+2 atomic manifest replaces (and, on a
+    cloud folio, N+2 round trips). ``batch()`` collapses them into a single
+    publish that either lands whole or not at all.
+
+    DataFolio refuses to nest ``batch()`` blocks, so if the caller already
+    opened one around ``save()`` we stage into theirs instead of opening our
+    own.
+    """
+    if getattr(folio, "_batch_mode", False):
+        return contextlib.nullcontext()
+    return folio.batch()
+
+
+def _folio_read(folio):
+    """Context manager pinning ``folio`` for the duration of a ``load()``.
+
+    Every DataFolio read re-checks the on-disk manifest revision. A ``load()``
+    issues one read per saved table, so pinning collapses those checks into a
+    single one taken on entry — and, more importantly, gives the whole load a
+    single consistent view of the folio even if another writer commits midway.
+    """
+    return folio.pinned()
+
+
+def _folio_scan(folio, name: str) -> pl.LazyFrame:
+    """Scan a table item from ``folio`` as a polars LazyFrame.
+
+    Prefers DataFolio's ``scan_table``, which stays genuinely lazy, resolves
+    external references, and reads cloud folios through the folio's own
+    credentials rather than re-deriving a path.
+    """
+    return folio.scan_table(name)
+
+
+def _folio_add(folio, item_name: str, obj, *, overwrite: bool, described_as=None):
+    """``folio.add`` with a trajan-level error when the item name is rejected.
+
+    DataFolio validates item names (letters, digits, ``.``, ``_``, ``-``, with
+    ``/`` for namespacing). trajan derives item names from user-chosen
+    annotation names, so a name that is perfectly usable in memory can be
+    refused at save time — and DataFolio's message quotes the derived item
+    name (``cell_ann_cell type``), not the annotation the caller named. Point
+    at the annotation instead.
+    """
+    try:
+        folio.add(item_name, obj, overwrite=overwrite)
+    except ValueError as exc:
+        if described_as is None or "Invalid item name" not in str(exc):
+            raise
+        raise ValueError(
+            f"Cannot save {described_as}: it becomes the folio item "
+            f"{item_name!r}, which DataFolio rejects. Annotation names may "
+            f"contain only letters, digits, '.', '_', and '-', and must start "
+            f"with a letter or digit. Rename the annotation and save again."
+        ) from exc

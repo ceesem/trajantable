@@ -1,8 +1,12 @@
 # Persistence
 
-`SynapseTable` can be saved to and loaded from a
-[DataFolio](https://github.com/caseysm/datafolio), which stores each table as a
-Parquet file and a JSON config alongside it.
+`SynapseTable`, `EdgeList`, and `ConnectivityTable` can be saved to and loaded
+from a [DataFolio](https://github.com/caseysm/datafolio), which stores each
+table as a Parquet file and a JSON config alongside it.
+
+trajan requires **DataFolio 2.0 or newer**. Folios written by DataFolio 1.x
+still load without a conversion step — DataFolio migrates them to the unified
+manifest on the next write.
 
 ## Saving
 
@@ -28,6 +32,22 @@ Use `overwrite=True` to replace an existing folio:
 st.save(folio, overwrite=True)
 ```
 
+A `save()` is a single DataFolio commit: every table lands together or none
+does, so an interrupted save never leaves a half-written folio behind. If you
+are writing several tables into one folio, wrapping them in your own
+`folio.batch()` block works too — `save()` stages into it rather than opening
+a competing batch.
+
+```python
+with folio.batch():
+    st.save(folio)
+    el.save(folio)
+```
+
+Annotation names become DataFolio item names, so they may contain only
+letters, digits, `.`, `_`, and `-`, and must start with a letter or digit. An
+annotation named `"cell type"` is fine in memory but is rejected at `save()`.
+
 ## Loading
 
 ```python
@@ -36,7 +56,17 @@ st2 = trajan.SynapseTable.load(folio)
 
 The loaded table is identical to the saved one: all annotations, aliases,
 expressions, and filters are restored and the lazy plan is reconstructed
-from the saved Parquet files.
+from the saved Parquet files — lazily, via `folio.scan_table()`, so opening a
+folio does not read the Parquet data. The whole load reads one pinned,
+consistent view of the folio even if another process commits to it midway.
+
+`ConnectivityTable.load()` dispatches on the saved type, so it returns an
+`EdgeList` when the folio holds one:
+
+```python
+ct = trajan.ConnectivityTable.load(folio)   # -> EdgeList if that is what was saved
+el = trajan.EdgeList.load(folio)            # TypeError if the folio is not an EdgeList
+```
 
 ## Round-trip example
 

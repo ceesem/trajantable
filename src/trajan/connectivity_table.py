@@ -33,6 +33,10 @@ from ._base import (
     _AnnotationProxy,
     _as_folio,
     _CachedTable,
+    _folio_add,
+    _folio_batch,
+    _folio_read,
+    _folio_scan,
     _to_lazy,
     build_cell_annotation_spec,
     build_pair_plan,
@@ -715,10 +719,17 @@ class ConnectivityTable(_CachedTable):
             },
             **self._extra_save_config(),
         }
-        folio.add_json("config", config, overwrite=overwrite)
-        folio.add_table("pairs", self._pair_lf.collect(), overwrite=overwrite)
-        for name, spec in self._cell_annotations.items():
-            folio.add_table(f"ann_{name}", spec.lf.collect(), overwrite=overwrite)
+        with _folio_batch(folio):
+            folio.add("config", config, overwrite=overwrite)
+            folio.add("pairs", self._pair_lf.collect(), overwrite=overwrite)
+            for name, spec in self._cell_annotations.items():
+                _folio_add(
+                    folio,
+                    f"ann_{name}",
+                    spec.lf.collect(),
+                    overwrite=overwrite,
+                    described_as=f"annotation {name!r}",
+                )
 
     def _spec_to_config(self, spec: CellAnnotationSpec) -> dict:
         """Serialize an annotation spec to a config dict.
@@ -753,76 +764,79 @@ class ConnectivityTable(_CachedTable):
         isn't guaranteed.
         """
         folio = _as_folio(folio)
-        config = folio.get_json("config")
-        saved_type = config.get("__type__", "ConnectivityTable")
+        with _folio_read(folio):
+            config = folio.get("config")
+            saved_type = config.get("__type__", "ConnectivityTable")
 
-        # Dispatch from the base class to the concrete subclass if needed.
-        if cls is ConnectivityTable and saved_type != "ConnectivityTable":
-            if saved_type == "EdgeList":
-                from .edgelist import EdgeList
+            # Dispatch from the base class to the concrete subclass if needed.
+            if cls is ConnectivityTable and saved_type != "ConnectivityTable":
+                if saved_type == "EdgeList":
+                    from .edgelist import EdgeList
 
-                return EdgeList.load(folio)
-            raise TypeError(
-                f"Saved folio's __type__ is {saved_type!r}; unknown at "
-                f"ConnectivityTable.load."
-            )
-        if cls is not ConnectivityTable and saved_type != cls._TYPE_TAG:
-            raise TypeError(
-                f"Saved folio is a {saved_type!r}; cannot load as "
-                f"{cls.__name__}. Call the matching .load() — or "
-                f"ConnectivityTable.load(folio), which dispatches."
-            )
+                    return EdgeList.load(folio)
+                raise TypeError(
+                    f"Saved folio's __type__ is {saved_type!r}; unknown at "
+                    f"ConnectivityTable.load."
+                )
+            if cls is not ConnectivityTable and saved_type != cls._TYPE_TAG:
+                raise TypeError(
+                    f"Saved folio is a {saved_type!r}; cannot load as "
+                    f"{cls.__name__}. Call the matching .load() — or "
+                    f"ConnectivityTable.load(folio), which dispatches."
+                )
 
-        def _lf(name: str) -> pl.LazyFrame:
-            return pl.scan_parquet(folio.get_data_path(name))
+            def _lf(name: str) -> pl.LazyFrame:
+                return _folio_scan(folio, name)
 
-        instance = cls(
-            _lf("pairs"),
-            pre_col=config["pre_col"],
-            post_col=config["post_col"],
-            weight_cols=config.get("weights", []),
-        )
-
-        for name, ann_meta in config.get("annotations", {}).items():
-            instance.add_annotation(
-                name,
-                _lf(f"ann_{name}"),
-                cell_id_col=ann_meta["cell_id_col"],
-                position_col=ann_meta.get("position_col"),
-                is_universe=ann_meta.get("is_universe", False),
-                side=ann_meta.get("side", "both"),
+            instance = cls(
+                _lf("pairs"),
+                pre_col=config["pre_col"],
+                post_col=config["post_col"],
+                weight_cols=config.get("weights", []),
             )
 
-        # Named expressions — binary format first (round-trips literals
-        # correctly), with a JSON fallback for older saved folios.
-        for name, expr_val in config.get("expressions", {}).items():
-            expr = None
-            try:
-                expr = pl.Expr.deserialize(base64.b64decode(expr_val), format="binary")
-            except Exception:
-                pass
-            if expr is None:
+            for name, ann_meta in config.get("annotations", {}).items():
+                instance.add_annotation(
+                    name,
+                    _lf(f"ann_{name}"),
+                    cell_id_col=ann_meta["cell_id_col"],
+                    position_col=ann_meta.get("position_col"),
+                    is_universe=ann_meta.get("is_universe", False),
+                    side=ann_meta.get("side", "both"),
+                )
+
+            # Named expressions — binary format first (round-trips literals
+            # correctly), with a JSON fallback for older saved folios.
+            for name, expr_val in config.get("expressions", {}).items():
+                expr = None
                 try:
-                    expr = pl.Expr.deserialize(expr_val.encode(), format="json")
-                except Exception:
-                    warnings.warn(
-                        f"Could not deserialize expression {name!r} from folio "
-                        "(likely a Polars version incompatibility). Re-save to fix.",
-                        stacklevel=2,
+                    expr = pl.Expr.deserialize(
+                        base64.b64decode(expr_val), format="binary"
                     )
-                    continue
-            instance.add_expression(name, expr)
+                except Exception:
+                    pass
+                if expr is None:
+                    try:
+                        expr = pl.Expr.deserialize(expr_val.encode(), format="json")
+                    except Exception:
+                        warnings.warn(
+                            f"Could not deserialize expression {name!r} from folio "
+                            "(likely a Polars version incompatibility). Re-save to fix.",
+                            stacklevel=2,
+                        )
+                        continue
+                instance.add_expression(name, expr)
 
-        # Filters accumulate via .filter() which returns a new instance.
-        # Use saved filter_sides when present; fall back to live reclassification
-        # for older folios. Both paths agree because annotations are restored
-        # before filters above.
-        saved_sides = config.get("filter_sides")
-        for i, f_json in enumerate(config.get("filters", [])):
-            instance = instance.filter(
-                pl.Expr.deserialize(f_json.encode(), format="json")
-            )
-            if saved_sides is not None and i < len(saved_sides):
-                instance._filter_sides[-1] = saved_sides[i]
+            # Filters accumulate via .filter() which returns a new instance.
+            # Use saved filter_sides when present; fall back to live reclassification
+            # for older folios. Both paths agree because annotations are restored
+            # before filters above.
+            saved_sides = config.get("filter_sides")
+            for i, f_json in enumerate(config.get("filters", [])):
+                instance = instance.filter(
+                    pl.Expr.deserialize(f_json.encode(), format="json")
+                )
+                if saved_sides is not None and i < len(saved_sides):
+                    instance._filter_sides[-1] = saved_sides[i]
 
-        return instance
+            return instance
