@@ -199,6 +199,20 @@ class PairUniverse(_LazyBacked):
         self._expressions[name] = expr.alias(name)
         return self
 
+    def add_weight(self, name: str) -> "PairUniverse":
+        """Register an existing column (or named expression) as a weight.
+
+        Weights are summed per bin by :func:`trajan.counts` as ``sum_<name>``. Use it for
+        per-pair multipliers such as :func:`trajan.edge_weight`.
+        """
+        if name not in self._current_columns():
+            raise ValueError(
+                f"Column {name!r} not found in pair universe; add it with add_expression() first."
+            )
+        if name not in self._weights:
+            self._weights.append(name)
+        return self
+
     def filter_by_ids(
         self,
         pre_ids: Iterable | None = None,

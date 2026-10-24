@@ -4,6 +4,7 @@ __version__ = "0.0.1"
 
 from ._base import Scope
 from .connectivity_table import ConnectivityTable
+from .edge_correction import LateralBox, edge_weight, lateral_box, ring_inside_fraction
 from .edgelist import EdgeList
 from .export import to_dataframe, to_graph
 from .pair_universe import PairUniverse, possible_pairs
@@ -13,6 +14,7 @@ from .spatial import (
     euclidean_distance,
     pack_all_positions,
     pack_position,
+    position_is_valid,
     radial_distance,
     transform_point,
     unpack_all_positions,
@@ -35,6 +37,10 @@ from .synapse_table import SynapseTable
 __all__ = [
     "ConnectivityTable",
     "EdgeList",
+    "LateralBox",
+    "edge_weight",
+    "lateral_box",
+    "ring_inside_fraction",
     "PairUniverse",
     "Scope",
     "SynapseTable",
@@ -52,6 +58,7 @@ __all__ = [
     "pack_position",
     "pivot_grid",
     "possible_pairs",
+    "position_is_valid",
     "radial_distance",
     "to_dataframe",
     "to_graph",
