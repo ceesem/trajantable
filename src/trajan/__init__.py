@@ -4,6 +4,11 @@ __version__ = "0.0.1"
 
 from ._base import Scope
 from .connectivity_table import ConnectivityTable
+from .completeness import (
+    edge_distance_expr,
+    interior_share,
+    universe_share_by_edge_distance,
+)
 from .edge_correction import LateralBox, edge_weight, lateral_box, ring_inside_fraction
 from .edgelist import EdgeList
 from .export import to_dataframe, to_graph
@@ -38,7 +43,10 @@ __all__ = [
     "ConnectivityTable",
     "EdgeList",
     "LateralBox",
+    "edge_distance_expr",
     "edge_weight",
+    "interior_share",
+    "universe_share_by_edge_distance",
     "lateral_box",
     "ring_inside_fraction",
     "PairUniverse",
