@@ -787,6 +787,7 @@ class ConnectivityTable(_CachedTable):
         aggregate: str = "error",
         max_cells: int | None = 10_000_000,
         keep: str | list[str] | None = None,
+        normalize: Literal["pre", "post"] | None = None,
     ) -> pl.DataFrame:
         """Pivot into a dense pre × post matrix DataFrame.
 
@@ -795,6 +796,14 @@ class ConnectivityTable(_CachedTable):
         values : str or None, optional
             Column to use as matrix entries. Defaults to the first registered
             weight.
+        normalize : {"pre", "post"} or None, optional
+            Shorthand for ``.normalize(by=normalize, values=values)`` followed
+            by pivoting the resulting ``fraction`` column, so the column that is
+            normalized is guaranteed to be the one pivoted. ``"pre"`` makes rows
+            sum to 1 (output budget); ``"post"`` makes columns sum to 1 (input
+            budget). Fractions are of the currently visible table; for an
+            external denominator, reweighting or enrichment, call
+            :meth:`normalize` explicitly. Defaults to None (raw values).
         fill_value : float, optional
             Value for (pre, post) pairs absent from the plan.
         aggregate : str, optional
@@ -825,6 +834,14 @@ class ConnectivityTable(_CachedTable):
             a null category, if observed, appears last. Unobserved Enum
             categories are not added automatically.
         """
+        if normalize is not None:
+            return self.normalize(by=normalize, values=values).to_dense(
+                values="fraction",
+                fill_value=fill_value,
+                aggregate=aggregate,
+                max_cells=max_cells,
+                keep=keep,
+            )
         values = self._resolve_values(values)
         if values not in self._current_columns():
             raise ValueError(f"values={values!r} not found in table.")
@@ -925,6 +942,7 @@ class ConnectivityTable(_CachedTable):
         pre_ids: Iterable | None = None,
         post_ids: Iterable | None = None,
         aggregate: str = "error",
+        normalize: Literal["pre", "post"] | None = None,
     ) -> tuple:
         """Export a CSR array and its explicit row and column identities.
 
@@ -932,6 +950,9 @@ class ConnectivityTable(_CachedTable):
         ----------
         values : str or None, optional
             Numeric entry column, defaulting to the first registered weight.
+        normalize : {"pre", "post"} or None, optional
+            Normalize ``values`` by pre or post totals before export, exactly
+            as in :meth:`to_dense`. Defaults to None (raw values).
         pre_ids, post_ids : iterable or None, optional
             Ordered axis identities. Supply universe IDs to include cells with
             zero observed connections. Defaults to sorted observed identities.
@@ -958,6 +979,13 @@ class ConnectivityTable(_CachedTable):
             raise ImportError(
                 "Sparse export requires scipy. Install trajan[sparse]."
             ) from exc
+        if normalize is not None:
+            return self.normalize(by=normalize, values=values).to_sparse(
+                values="fraction",
+                pre_ids=pre_ids,
+                post_ids=post_ids,
+                aggregate=aggregate,
+            )
         if aggregate not in {"error", "sum", "mean", "min", "max", "first"}:
             raise ValueError("Unsupported sparse duplicate reducer.")
         values = self._resolve_values(values)

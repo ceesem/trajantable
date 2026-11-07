@@ -564,3 +564,63 @@ def test_collect_accepts_single_string(ct):
 def test_collect_unknown_column_raises(ct):
     with pytest.raises(ValueError, match="not found in table"):
         ct.collect(["bogus"])
+
+
+# ── to_dense / to_sparse normalize shorthand ─────────────────────────────────
+
+
+@pytest.fixture
+def ct_two_weights():
+    df = pl.DataFrame(
+        {
+            "pre": [1, 1, 2, 2, 3],
+            "post": [10, 11, 10, 11, 11],
+            "n_syn": [3, 1, 2, 4, 5],
+            "size": [30.0, 70.0, 10.0, 10.0, 50.0],
+        }
+    )
+    return ConnectivityTable(
+        df, pre_col="pre", post_col="post", weight_cols=["n_syn", "size"]
+    )
+
+
+def test_to_dense_normalize_pre_uses_requested_values(ct_two_weights):
+    dense = ct_two_weights.to_dense("size", normalize="pre").sort("pre")
+    expected = (
+        ct_two_weights.normalize("pre", values="size").to_dense("fraction").sort("pre")
+    )
+    assert dense.equals(expected)
+    # size-weighted, not count-weighted: pre=1 is 30/100 onto post=10
+    assert dense.filter(pl.col("pre") == 1)["10"].item() == pytest.approx(0.3)
+    row_sums = dense.select(pl.sum_horizontal(pl.exclude("pre")))
+    assert row_sums.to_series().to_list() == pytest.approx([1.0, 1.0, 1.0])
+
+
+def test_to_dense_normalize_post_columns_sum_to_one(ct_two_weights):
+    dense = ct_two_weights.to_dense(normalize="post")  # default: first weight
+    sums = dense.select(pl.exclude("pre").sum()).row(0)
+    assert sums == pytest.approx((1.0, 1.0))
+    assert dense.filter(pl.col("pre") == 1)["10"].item() == pytest.approx(3 / 5)
+
+
+def test_to_dense_normalize_none_is_raw(ct_two_weights):
+    dense = ct_two_weights.to_dense("size")
+    assert dense.filter(pl.col("pre") == 1)["11"].item() == 70.0
+
+
+def test_to_dense_normalize_keeps_pre_annotations(ct_two_weights):
+    ann = pl.DataFrame({"root_id": [1, 2, 3], "ct": ["a", "b", "b"]})
+    ct = ct_two_weights.add_annotation("cells", ann, cell_id_col="root_id", side="pre")
+    dense = ct.to_dense("size", normalize="pre", keep="ct_pre")
+    assert dense.columns[:2] == ["pre", "ct_pre"]
+
+
+def test_to_dense_normalize_rejects_bad_axis(ct_two_weights):
+    with pytest.raises(ValueError, match="by must be"):
+        ct_two_weights.to_dense(normalize="both")
+
+
+def test_to_sparse_normalize_matches_dense(ct_two_weights):
+    pytest.importorskip("scipy.sparse")
+    mat, pre, post = ct_two_weights.to_sparse("size", normalize="pre")
+    assert mat.sum(axis=1).tolist() == pytest.approx([1.0, 1.0, 1.0])
