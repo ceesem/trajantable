@@ -14,6 +14,7 @@ nav:
     - Connectivity statistics: guides/connectivity-statistics.md
     - Connectivity representations: guides/output.md
     - Persistence: guides/persistence.md
+    - Analysis assessment: guides/analysis-assessment.md
 - Function Reference:
     - reference/api.md
 - Changelog: changelog.md

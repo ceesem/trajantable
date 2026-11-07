@@ -244,3 +244,97 @@ def test_spatial_depth_axis_x(vec_df):
     assert math.isclose(row["depth_diff"], 3.0)
     assert math.isclose(row["rho"], 4.0)
     assert math.isclose(row["euclidean"], 5.0)
+
+
+@pytest.fixture
+def axon_points():
+    rng = np.random.default_rng(0)
+    # an elongated, lateralized axon: offset from the origin, long along x
+    xz = rng.multivariate_normal([50.0, -20.0], [[400.0, 60.0], [60.0, 25.0]], 200)
+    y = rng.normal(300.0, 40.0, 200)
+    pts = [{"x": a, "y": b, "z": c} for (a, c), b in zip(xz, y)]
+    sparse = [{"x": 0.0, "y": 0.0, "z": 0.0}, {"x": 1.0, "y": 0.0, "z": 1.0}]
+    df = pl.DataFrame(
+        {
+            "pre": [1] * 200 + [2, 2, 2],
+            "pos": pts + sparse + [None],
+        }
+    )
+    return df, xz, y
+
+
+def test_lateral_spread_matches_numpy(axon_points):
+    from trajan.spatial import lateral_spread
+
+    df, xz, y = axon_points
+    out = lateral_spread(df, "pre", "pos").sort("pre")
+    row = out.row(0, named=True)
+    assert row["n_points"] == 200
+    centroid = row["pos_centroid"]
+    np.testing.assert_allclose(
+        [centroid["x"], centroid["y"], centroid["z"]],
+        [xz[:, 0].mean(), y.mean(), xz[:, 1].mean()],
+    )
+    cov = np.cov(xz.T, ddof=1)
+    np.testing.assert_allclose(
+        [row["pos_cov"]["xx"], row["pos_cov"]["xz"], row["pos_cov"]["zz"]],
+        [cov[0, 0], cov[0, 1], cov[1, 1]],
+    )
+    # the null position is dropped, leaving two points: too few for a covariance
+    sparse = out.row(1, named=True)
+    assert sparse["n_points"] == 2 and sparse["pos_cov"] is None
+    assert lateral_spread(df.lazy(), "pre", "pos").collect().height == 2
+
+
+def test_lateral_mahalanobis_matches_numpy(axon_points):
+    from trajan.spatial import lateral_mahalanobis_distance, lateral_spread
+
+    df, xz, _ = axon_points
+    spread = lateral_spread(df, "pre", "pos").filter(pl.col("pre") == 1)
+    post = pl.DataFrame(
+        {"soma": [{"x": 80.0, "y": 0.0, "z": -10.0}, {"x": 50.0, "y": 900.0, "z": 0.0}]}
+    )
+    out = post.join(spread, how="cross").select(
+        lateral_mahalanobis_distance("pos_centroid", "soma", "pos_cov").alias("d")
+    )["d"]
+    mu, inv = xz.mean(0), np.linalg.inv(np.cov(xz.T, ddof=1))
+    for d, target in zip(out, [(80.0, -10.0), (50.0, 0.0)]):
+        off = np.array(target) - mu
+        assert math.isclose(d, math.sqrt(off @ inv @ off), rel_tol=1e-9)
+
+
+def test_lateral_mahalanobis_isotropic_is_scaled_radial():
+    from trajan.spatial import lateral_mahalanobis_distance
+
+    df = pl.DataFrame(
+        {
+            "a": [{"x": 0.0, "y": 5.0, "z": 0.0}],
+            "b": [{"x": 3.0, "y": -40.0, "z": 4.0}],
+            "cov": [{"xx": 4.0, "xz": 0.0, "zz": 4.0}],
+        }
+    )
+    d = df.select(
+        lateral_mahalanobis_distance("a", "b", "cov").alias("m"),
+        radial_distance("a", "b").alias("r"),
+    ).row(0)
+    assert math.isclose(d[0], d[1] / 2.0)  # depth ignored, sigma = 2
+
+
+def test_lateral_mahalanobis_degenerate_is_nan():
+    from trajan.spatial import lateral_mahalanobis_distance
+
+    df = pl.DataFrame(
+        {
+            "a": [{"x": 0.0, "y": 0.0, "z": 0.0}] * 3,
+            "b": [{"x": 1.0, "y": 0.0, "z": 1.0}, None, {"x": 1.0, "y": 0.0, "z": 1.0}],
+            "cov": [
+                {"xx": 1.0, "xz": 1.0, "zz": 1.0},
+                {"xx": 1.0, "xz": 0.0, "zz": 1.0},
+                None,
+            ],
+        }
+    )
+    d = df.select(lateral_mahalanobis_distance("a", "b", "cov").alias("d"))["d"]
+    assert all(math.isnan(v) for v in d)
+    # NaN never passes a radius threshold, so degenerate cells drop out of a filter
+    assert df.filter(lateral_mahalanobis_distance("a", "b", "cov") <= 1e9).height == 0

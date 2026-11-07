@@ -20,6 +20,13 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
 ]
 
+[project.optional-dependencies]
+sparse = ["scipy>=1.15.3"]
+delta = [
+    "deltalake>=1.0",
+    "pyarrow>=16",
+]
+
 [dependency-groups]
 dev = [
     "ipykernel",
@@ -118,4 +125,3 @@ help = "Start Jupyter Lab"
 cwd = "scratch"
 cmd = "uv run --with jupyterlab --with jupyterlab-vim --with jupyterlab-code-formatter --with jupyter-resource-usage --with jupyterlab-execute-time --with catppuccin-jupyterlab --with ipywidgets jupyter lab --no-browser"
 help = "Start Jupyter Lab"
-

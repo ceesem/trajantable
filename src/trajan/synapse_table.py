@@ -3,8 +3,10 @@ from __future__ import annotations
 import base64
 import math
 import warnings
+from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
-from typing import Union
+from typing import Literal, Union
 
 import polars as pl
 
@@ -29,6 +31,7 @@ from ._base import (
     reject_reserved_names,
     resolve_position_annotation,
     resolve_universe_annotation,
+    validate_pair_filter,
     validate_unique_key,
 )
 from .connectivity_table import ConnectivityTable
@@ -192,7 +195,135 @@ class SynapseTable(_CachedTable):
         # populated via set_cell_alias() or alias_col in add_cell_annotation()
         self._cell_aliases: dict[str, tuple[str, str]] = {}
         self._cache: pl.DataFrame | None = None
-        self._n_syn_base: int = self._syn_lf.select(pl.len()).collect().item()
+        # Keep disk-backed construction lazy. In-memory frames already know
+        # their height; scanned sources are counted only on explicit request.
+        self._n_syn_base: int | None = (
+            len(syn_df) if not isinstance(syn_df, pl.LazyFrame) else None
+        )
+
+    @classmethod
+    def from_delta(
+        cls,
+        source: str | Path,
+        *,
+        version: int | None = None,
+        storage_options: dict[str, str] | None = None,
+        pre_col: str = "pre_pt_root_id",
+        post_col: str = "post_pt_root_id",
+        id_col: str = "id",
+        synapse_position_col: str | None = None,
+    ) -> SynapseTable:
+        """Open a version-pinned Delta Lake synapse table lazily.
+
+        Parameters
+        ----------
+        source : str or Path
+            Local table directory or cloud URI, such as ``s3://bucket/synapses``.
+        version : int or None, optional
+            Delta commit version. None resolves the latest commit once, at open.
+        storage_options : dict[str, str] or None, optional
+            Delta storage credentials/options. These are not saved in metadata.
+        pre_col, post_col, id_col : str, optional
+            Declared presynaptic, postsynaptic, and synapse identifier columns.
+        synapse_position_col : str or None, optional
+            Synapse position column; split x/y/z columns are packed automatically.
+
+        Returns
+        -------
+        SynapseTable
+            Lazy analysis over one Delta snapshot. Its URI and resolved version
+            are recorded in ``metadata["synapse_source"]``. Later table commits
+            become visible only by opening another SynapseTable.
+
+        Notes
+        -----
+        Install ``trajan[delta]`` to use this method. Delta stores the base
+        synapses; annotations, filters, and expressions remain analysis state.
+        Referenced files must remain available (including after Delta vacuum).
+        """
+        try:
+            from deltalake import DeltaTable
+        except ImportError as exc:
+            raise ImportError("Delta Lake support requires trajan[delta].") from exc
+
+        # Canonical local paths keep provenance meaningful across sessions.
+        uri = str(source) if "://" in str(source) else str(Path(source).resolve())
+        table = DeltaTable(uri, version=version, storage_options=storage_options)
+        st = cls(
+            pl.scan_delta(table, storage_options=storage_options),
+            pre_col=pre_col,
+            post_col=post_col,
+            id_col=id_col,
+            synapse_position_col=synapse_position_col,
+        )
+        st.metadata["synapse_source"] = {
+            "format": "delta",
+            "uri": uri,
+            "version": table.version(),
+        }
+        return st
+
+    def write_synapses_delta(
+        self,
+        target: str | Path,
+        *,
+        mode: Literal["error", "append", "overwrite"] = "error",
+        storage_options: dict[str, str] | None = None,
+        partition_by: list[str] | None = None,
+    ) -> None:
+        """Write the base synapses to a Delta Lake table.
+
+        Parameters
+        ----------
+        target : str or Path
+            Local table directory or cloud URI.
+        mode : {'error', 'append', 'overwrite'}, optional
+            Existing-table behavior. Defaults to refusing an existing table.
+            Append does not deduplicate synapse IDs. Overwrite replaces rows;
+            schema changes are rejected by the Delta writer.
+        storage_options : dict[str, str] or None, optional
+            Delta storage credentials/options, passed only to the writer.
+        partition_by : list[str] or None, optional
+            Base columns to partition by. Prefer low-cardinality columns;
+            partitioning by individual cell or synapse IDs creates tiny files.
+
+        Notes
+        -----
+        Requires ``trajan[delta]``. This materializes the base frame in memory.
+        Filters, expressions, annotations, and analysis metadata are not written.
+        For large ingestion, use delta-rs batch writing upstream, then open with
+        :meth:`from_delta`. This export does not change this instance's source.
+        Top-level unsigned integers are cast strictly to signed Delta types;
+        UInt64 values above the Int64 range raise rather than lose precision.
+        """
+        if mode not in {"error", "append", "overwrite"}:
+            raise ValueError("mode must be 'error', 'append', or 'overwrite'.")
+        try:
+            import deltalake  # noqa: F401
+            import pyarrow  # noqa: F401
+        except ImportError as exc:
+            raise ImportError("Delta Lake support requires trajan[delta].") from exc
+
+        df = self._syn_lf.collect()
+        signed = {
+            pl.UInt8: pl.Int16,
+            pl.UInt16: pl.Int32,
+            pl.UInt32: pl.Int64,
+            pl.UInt64: pl.Int64,
+        }
+        df = df.with_columns(
+            pl.col(name).cast(signed[dtype], strict=True)
+            for name, dtype in df.schema.items()
+            if dtype in signed
+        )
+        df.write_delta(
+            target,
+            mode=mode,
+            storage_options=storage_options,
+            delta_write_options={"partition_by": partition_by}
+            if partition_by
+            else None,
+        )
 
     # ── repr / info ───────────────────────────────────────────────────────
 
@@ -217,7 +348,7 @@ class SynapseTable(_CachedTable):
         if self._cache is not None:
             n = len(self._cache)
         elif not self._filters:
-            n = self._n_syn_base
+            n = len(self)
         else:
             n = self.build_lazy().select(pl.len()).collect().item()
         lines.append(f"SynapseTable  ({n:,} synapses, {len(self._filters)} filter(s))")
@@ -351,7 +482,7 @@ class SynapseTable(_CachedTable):
         if self._cache is not None:
             n = len(self._cache)
         elif not self._filters:
-            n = self._n_syn_base
+            n = self._n_syn_base if self._n_syn_base is not None else "uncached"
         else:
             n = "uncached"
         return (
@@ -369,6 +500,8 @@ class SynapseTable(_CachedTable):
         if self._cache is not None:
             return len(self._cache)
         if not self._filters:
+            if self._n_syn_base is None:
+                self._n_syn_base = self._syn_lf.select(pl.len()).collect().item()
             return self._n_syn_base
         return self.build_lazy().select(pl.len()).collect().item()
 
@@ -422,7 +555,7 @@ class SynapseTable(_CachedTable):
         """Cell-side classification of each accumulated filter.
 
         Parallel to ``self._filters``. Each entry is ``'pre'``, ``'post'``,
-        ``'both'``, or ``None`` — captured at ``filter()`` time against the
+        ``'both'``, ``'pair'`` (explicit eligibility), or ``None`` — captured at ``filter()`` time against the
         cell annotations registered then. Classification does not retroactively
         change when annotations are added or removed later (matching the
         existing ``expression_sides`` caveat).
@@ -1212,7 +1345,7 @@ class SynapseTable(_CachedTable):
         new._cell_aliases = self._cell_aliases.copy()
         new._filters = self._filters.copy()
         new._filter_sides = self._filter_sides.copy()
-        new.metadata = self.metadata.copy()
+        new.metadata = deepcopy(self.metadata)
         new._cache = None
         new._n_syn_base = self._n_syn_base
         return new
@@ -1283,7 +1416,7 @@ class SynapseTable(_CachedTable):
             k: v for k, v in self._expression_sides.items() if k in new._expressions
         }
         new._weights = self._weights.copy()
-        new.metadata = self.metadata.copy()
+        new.metadata = deepcopy(self.metadata)
         new._filters = self._filters.copy() if keep_filters else []
         new._filter_sides = self._filter_sides.copy() if keep_filters else []
         # carry only aliases whose source annotation is still present in the view
@@ -1365,6 +1498,26 @@ class SynapseTable(_CachedTable):
         new = self._copy()
         new._filters = self._filters + [expr]
         new._filter_sides = self._filter_sides + [self._classify_expression(expr)]
+        return new
+
+    def filter_pairs(self, expr: pl.Expr) -> SynapseTable:
+        """Restrict eligible pairs in both observed and possible connectivity.
+
+        Parameters
+        ----------
+        expr : pl.Expr
+            Boolean predicate using declared cell IDs, cell annotation columns,
+            or expressions derived from them. Synapse measurements are rejected.
+
+        Returns
+        -------
+        SynapseTable
+            New table whose eligibility predicate also applies in possible_pairs.
+            Cell universe membership and bootstrap population remain unchanged.
+        """
+        validate_pair_filter(self, expr)
+        new = self.filter(expr)
+        new._filter_sides[-1] = "pair"
         return new
 
     def filter_by_radial_distance(
@@ -1634,7 +1787,7 @@ class SynapseTable(_CachedTable):
         new = self._copy()
         new._syn_lf = filtered_lf
         new._syn_col_names = filtered_lf.collect_schema().names()
-        new._n_syn_base = filtered_lf.select(pl.len()).collect().item()
+        new._n_syn_base = None
         return new
 
     def filter_by_bbox(self, bbox) -> SynapseTable:
@@ -1656,6 +1809,47 @@ class SynapseTable(_CachedTable):
         if self._synapse_position_col is None:
             raise ValueError("synapse_position_col not set on this SynapseTable")
         return self.filter(bbox_predicate(self._synapse_position_col, bbox))
+
+    def cell_agg(
+        self,
+        column: str | list[str],
+        agg: pl.Expr | list[pl.Expr] | dict[str, pl.Expr] | None = None,
+        *,
+        scope: Literal["universe", "filtered", "observed"] = "universe",
+        universe: str | None = None,
+    ) -> pl.DataFrame:
+        """Aggregate the decorated cell population by one or more columns.
+
+        Parameters
+        ----------
+        column : str or list of str
+            Cell annotation columns to group by, without pre/post suffixes.
+        agg : Expr, list of Expr, dict of str to Expr, or None, optional
+            Polars aggregations. A dictionary names the output columns.
+            Defaults to ``pl.len().alias("n_cells")``, including null labels.
+        scope : {"universe", "filtered", "observed"}, optional
+            Passed to :func:`trajan.cells`. The default includes cells with
+            no observed connections and ignores downstream synapse filters.
+        universe : str or None, optional
+            Universe annotation name, needed when multiple are registered.
+
+        Returns
+        -------
+        pl.DataFrame
+            One row per group. Row order is unspecified.
+
+        Examples
+        --------
+        >>> population = st.cell_agg("subclass")
+        """
+        from .scope import cells
+
+        grouped = cells(self, scope=scope, universe=universe).group_by(column)
+        if agg is None:
+            return grouped.agg(pl.len().alias("n_cells"))
+        if isinstance(agg, dict):
+            return grouped.agg(**agg)
+        return grouped.agg(agg)
 
     # ── edgelist ───────────────────────────────────────────────────────────
 
@@ -1841,12 +2035,16 @@ class SynapseTable(_CachedTable):
         count_by: str | list[str] | dict[str, list[float] | None] | None = None,
         fraction_by: str | list[str] | dict[str, list[float] | None] | None = None,
         fraction_include_null: bool = True,
+        *,
+        drop_nulls: bool = True,
     ) -> EdgeList:
         """Aggregate synapses into a cell-pair EdgeList.
 
         Always produces an ``n_syn`` weight column (synapse count per pair).
         Registered weights (``self.weights``) are auto-summed. Additional
         per-pair aggregations can be passed via ``agg``.
+        Rows with a null pre or post cell id are excluded by default; they
+        remain available on the source SynapseTable.
 
         Cell annotations are *propagated* — registered on the resulting
         EdgeList rather than inlined into the pair frame — so role
@@ -1894,6 +2092,11 @@ class SynapseTable(_CachedTable):
             ``__null__`` field, so the value/bin fields sum to 1.0 on their own
             (a pair whose values are all null yields NaN). No effect on
             ``count_by`` raw counts.
+        drop_nulls : bool, optional
+            Exclude rows where either declared cell id is null before grouping.
+            Defaults to True. False retains groups with unresolved endpoints.
+            Null values in other columns (including annotations and weights)
+            do not cause rows to be dropped.
 
         Returns
         -------
@@ -1914,12 +2117,10 @@ class SynapseTable(_CachedTable):
             fraction_include_null=fraction_include_null,
         )
 
-        pair_df = (
-            self.build_lazy()
-            .group_by([self._pre_col, self._post_col])
-            .agg(agg_exprs)
-            .collect()
-        )
+        lf = self.build_lazy()
+        if drop_nulls:
+            lf = lf.drop_nulls([self._pre_col, self._post_col])
+        pair_df = lf.group_by([self._pre_col, self._post_col]).agg(agg_exprs)
 
         weight_cols = ["n_syn"] + list(self._weights)
         el = EdgeList(
@@ -1932,15 +2133,16 @@ class SynapseTable(_CachedTable):
         # Propagate cell annotations (including aliased ones — aliases are
         # 1:1 with root cell ids, so the alias join on the EdgeList yields
         # the same per-pair values that inlining via .first() would have).
-        for ann_name, spec in self._cell_annotations.items():
-            el.add_annotation(
-                ann_name,
-                spec.lf,
-                cell_id_col=spec.cell_id_col,
-                position_col=spec.position_col,
-                is_universe=spec.is_universe,
-                join_on_alias=spec.join_on_alias,
-            )
+        el._cell_annotations = self._cell_annotations.copy()
+        el.metadata = deepcopy(self.metadata)
+        # Preserve eligibility independently of the observed counts baked in.
+        eligible = [
+            (f, side)
+            for f, side in zip(self._filters, self._filter_sides)
+            if side in ("pre", "post", "both", "pair")
+        ]
+        el._filters = [f for f, _ in eligible]
+        el._filter_sides = [side for _, side in eligible]
         # Re-register cell-level expressions. Their bodies reference
         # annotation-derived columns (e.g. cell_type_pre) which the
         # EdgeList's annotation joins now provide; they evaluate live at
@@ -1949,7 +2151,14 @@ class SynapseTable(_CachedTable):
         # Registration order matters when expressions depend on prior ones;
         # dict ordering preserves it.
         for name, side in self._expression_sides.items():
-            if side in ("pre", "post", "both"):
+            # Include ID-derived expressions needed by explicit pair filters.
+            eligible_expression = False
+            try:
+                validate_pair_filter(self, self._expressions[name])
+                eligible_expression = True
+            except ValueError:
+                pass
+            if side in ("pre", "post", "both") or eligible_expression:
                 el.add_expression(name, self._expressions[name])
         return el
 
@@ -1961,6 +2170,8 @@ class SynapseTable(_CachedTable):
         count_by: str | list[str] | dict[str, list[float] | None] | None = None,
         fraction_by: str | list[str] | dict[str, list[float] | None] | None = None,
         fraction_include_null: bool = True,
+        *,
+        drop_nulls: bool = True,
     ) -> ConnectivityTable:
         """Aggregate synapses into a type-to-type ConnectivityTable.
 
@@ -1990,10 +2201,20 @@ class SynapseTable(_CachedTable):
             by all synapses and keeps ``__null__`` (fields sum to 1.0); ``False``
             divides by the non-null synapses and drops ``__null__``. See
             ``edgelist`` for details.
+        drop_nulls : bool, optional
+            Exclude rows where either declared grouping column (``pre_col``
+            or ``post_col``) is null before grouping. Defaults to True,
+            matching ``edgelist``. False retains unresolved groups. Only
+            grouping keys are checked; null measurements are retained.
 
         Returns
         -------
         ConnectivityTable
+            A lazy table. Root-keyed cell annotations are retained on any
+            axis that still uses its original cell ID column, making those
+            properties available to ``to_dense(keep=...)``. Label axes do not
+            retain the original cell annotations; alias-keyed annotations
+            must be materialized separately.
         """
         if post_col is None:
             if pre_col.endswith("_pre"):
@@ -2011,16 +2232,33 @@ class SynapseTable(_CachedTable):
             fraction_include_null=fraction_include_null,
         )
 
-        pair_df = (
-            self.build_lazy().group_by([pre_col, post_col]).agg(agg_exprs).collect()
-        )
+        lf = self.build_lazy()
+        if drop_nulls:
+            lf = lf.drop_nulls([pre_col, post_col])
+        pair_df = lf.group_by([pre_col, post_col]).agg(agg_exprs)
         weight_cols = ["n_syn"] + list(self._weights)
-        return ConnectivityTable(
+        ct = ConnectivityTable(
             pair_df,
             pre_col=pre_col,
             post_col=post_col,
             weight_cols=weight_cols,
         )
+        ct.metadata = deepcopy(self.metadata)
+        # A retained cell-ID axis can still carry its cell properties.
+        # Label axes cannot be joined to the original root-keyed annotation.
+        survives = []
+        if pre_col == self._pre_col:
+            survives.append("pre")
+        if post_col == self._post_col:
+            survives.append("post")
+        if survives:
+            side = "both" if len(survives) == 2 else survives[0]
+            ct._cell_annotations = {
+                name: replace(spec, side=side)
+                for name, spec in self._cell_annotations.items()
+                if spec.join_on_alias is None
+            }
+        return ct
 
     # ── persistence ────────────────────────────────────────────────────────
 

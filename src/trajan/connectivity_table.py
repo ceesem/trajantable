@@ -11,8 +11,8 @@ table does not distinguish. Operations that treat entities as points in space
 belong on the narrower ``EdgeList`` subclass, not here (see
 ``project_edgelist_abstraction.md`` and the blessed-columns memory).
 
-This first landing is dense-only (``to_dense`` via Polars pivot). A sparse
-backend is tracked as a follow-up (Phase 3b in REFACTOR.md).
+Dense export uses a guarded Polars pivot. Sparse export returns a CSR array
+and explicit axis identities without constructing a dense matrix.
 
 Persistence via DataFolio is supported and preserves the concrete class —
 a saved ``EdgeList`` round-trips as an ``EdgeList`` even when loaded via
@@ -22,9 +22,13 @@ a saved ``EdgeList`` round-trips as an ``EdgeList`` even when loaded via
 from __future__ import annotations
 
 import base64
+import math
 import warnings
+from collections.abc import Mapping
+from copy import deepcopy
+from numbers import Real
 from pathlib import Path
-from typing import Union
+from typing import Iterable, Literal, Union
 
 import polars as pl
 
@@ -142,6 +146,8 @@ class ConnectivityTable(_CachedTable):
         # expression's side (matching SynapseTable). Drives the same
         # side-decomposed projection in cells() / possible_pairs().
         self._expression_sides: dict[str, str | None] = {}
+        self.metadata: dict = {}
+        self._n_pair_base = len(df) if not isinstance(df, pl.LazyFrame) else None
         self._cache: pl.DataFrame | None = None
 
     # ── read-only accessors ────────────────────────────────────────────────
@@ -240,7 +246,7 @@ class ConnectivityTable(_CachedTable):
         if self._cache is not None:
             n = len(self._cache)
         elif not self._filters:
-            n = self._pair_lf.select(pl.len()).collect().item()
+            n = self._n_pair_base if self._n_pair_base is not None else "uncached"
         else:
             n = "uncached"
         return (
@@ -474,6 +480,8 @@ class ConnectivityTable(_CachedTable):
         new._filter_sides = self._filter_sides.copy()
         new._expressions = self._expressions.copy()
         new._expression_sides = self._expression_sides.copy()
+        new.metadata = deepcopy(self.metadata)
+        new._n_pair_base = self._n_pair_base
         new._cache = None
         return new
 
@@ -495,8 +503,11 @@ class ConnectivityTable(_CachedTable):
         by: str = "pre",
         values: str | None = None,
         total_col: str | None = None,
+        *,
+        reweight_by: str | Mapping[object, float] | pl.DataFrame | None = None,
+        mode: Literal["fraction", "enrichment"] = "fraction",
     ) -> ConnectivityTable:
-        """Normalize a weight column to a fraction.
+        """Normalize a weight column to fractions or population enrichment.
 
         Two modes:
 
@@ -525,12 +536,44 @@ class ConnectivityTable(_CachedTable):
         total_col : str or None, optional
             If None, use internal axis sum. Otherwise the name of a column in
             the merged plan whose per-row value is the denominator.
+        reweight_by : str, Mapping, DataFrame, or None, optional
+            Divide values by this opportunity denominator before computing
+            internal fractions. A string names a numeric column in the merged
+            plan. A mapping supplies category-to-denominator values for the
+            opposite axis: post categories for ``by="pre"``, pre categories
+            for ``by="post"``. Mapping values must be finite and positive,
+            and every observed category must be covered; extra keys are fine.
+            Invalid column denominators produce null fractions and are
+            excluded from totals. Groups with no positive adjusted total
+            produce null fractions. Cannot be combined with ``total_col``.
+            A two-column DataFrame supplies categories in its first column and
+            denominators in its second, for example ``st.cell_agg("subclass")``.
+            Category keys must be unique and the mapping validation rules apply.
+        mode : {"fraction", "enrichment"}, optional
+            Default ``"fraction"`` normalizes adjusted rates to sum to one.
+            ``"enrichment"`` divides the observed allocation fraction by the
+            supplied population fraction, writing an ``enrichment`` column.
+            One means allocation matches population abundance. Requires a
+            mapping or two-column DataFrame; all supplied categories count
+            toward the expected population total, including unobserved ones.
+            Filter the population explicitly to the intended target set.
+            Column-only denominators are insufficient to define a population
+            that includes unobserved categories and are not accepted in this mode.
 
         Returns
         -------
         ConnectivityTable
-            New table with ``values`` replaced by a ``fraction`` column.
+            New table with ``values`` replaced by ``fraction`` or ``enrichment``.
         """
+        if mode not in {"fraction", "enrichment"}:
+            raise ValueError("mode must be 'fraction' or 'enrichment'.")
+        if mode == "enrichment" and not isinstance(
+            reweight_by, (Mapping, pl.DataFrame)
+        ):
+            raise ValueError(
+                "Enrichment requires reweight_by as a mapping or two-column DataFrame defining the full eligible population."
+            )
+        output_col = "enrichment" if mode == "enrichment" else "fraction"
         if by == "pre":
             group_col = self._pre_col
         elif by == "post":
@@ -539,33 +582,140 @@ class ConnectivityTable(_CachedTable):
             raise ValueError(f"by must be 'pre' or 'post', got {by!r}")
 
         values = self._resolve_values(values)
+        if reweight_by is not None and total_col is not None:
+            raise ValueError("reweight_by cannot be combined with total_col.")
         if values not in self._current_columns():
             raise ValueError(f"values={values!r} not found in table.")
         if total_col is not None and total_col not in self._current_columns():
             raise ValueError(f"total_col={total_col!r} not found in table.")
-        if "fraction" in self._current_columns() and values != "fraction":
+        if output_col in self._current_columns() and values != output_col:
             raise ValueError(
-                "normalize() writes a 'fraction' column, but one already exists. "
+                f"normalize() writes a '{output_col}' column, but one already exists. "
                 "Rename the existing column first."
             )
 
         lf = self.build_lazy()
 
+        rate_name = None
+        population_total = None
+        if reweight_by is not None:
+            schema = lf.collect_schema()
+            if isinstance(reweight_by, str):
+                if reweight_by not in schema:
+                    raise ValueError(f"reweight_by column {reweight_by!r} not found.")
+                if not schema[reweight_by].is_numeric():
+                    raise TypeError("reweight_by column must be numeric.")
+                denominator = pl.col(reweight_by).cast(pl.Float64)
+            elif isinstance(reweight_by, Mapping):
+                denominators = {}
+                for key, value in reweight_by.items():
+                    if not isinstance(value, Real) or isinstance(value, bool):
+                        raise TypeError("reweight_by mapping values must be numeric.")
+                    value = float(value)
+                    if not math.isfinite(value) or value <= 0:
+                        raise ValueError(
+                            "reweight_by mapping values must be finite and positive."
+                        )
+                    denominators[key] = value
+                axis = self._post_col if by == "pre" else self._pre_col
+                observed = lf.select(axis).unique().collect()[axis].to_list()
+                missing = [key for key in observed if key not in denominators]
+                if missing:
+                    raise ValueError(
+                        f"reweight_by missing categories on {axis!r}: {missing!r}"
+                    )
+                category = pl.col(axis)
+                if schema[axis] == pl.Categorical or isinstance(schema[axis], pl.Enum):
+                    category = category.cast(pl.String)
+                denominator = category.replace_strict(
+                    denominators, default=None, return_dtype=pl.Float64
+                )
+                if mode == "enrichment":
+                    population_total = sum(denominators.values())
+            elif isinstance(reweight_by, pl.DataFrame):
+                if reweight_by.width != 2:
+                    raise ValueError(
+                        "reweight_by DataFrame must have exactly two columns: category and denominator."
+                    )
+                keys, terms = reweight_by.get_columns()
+                if keys.n_unique() != len(keys):
+                    raise ValueError(
+                        "reweight_by DataFrame category keys must be unique."
+                    )
+                if not terms.dtype.is_numeric():
+                    raise TypeError(
+                        "reweight_by DataFrame denominators must be numeric."
+                    )
+                terms = terms.cast(pl.Float64)
+                if terms.null_count() or not (terms.is_finite() & (terms > 0)).all():
+                    raise ValueError(
+                        "reweight_by DataFrame denominators must be finite and positive."
+                    )
+                axis = self._post_col if by == "pre" else self._pre_col
+                observed = lf.select(axis).unique().collect()[axis].to_list()
+                supplied = set(keys.to_list())
+                missing = [key for key in observed if key not in supplied]
+                if missing:
+                    raise ValueError(
+                        f"reweight_by missing categories on {axis!r}: {missing!r}"
+                    )
+                category = pl.col(axis)
+                if schema[axis] == pl.Categorical or isinstance(schema[axis], pl.Enum):
+                    category = category.cast(pl.String)
+                if keys.dtype == pl.Categorical or isinstance(keys.dtype, pl.Enum):
+                    keys = keys.cast(pl.String)
+                denominator = category.replace_strict(
+                    keys, terms, default=None, return_dtype=pl.Float64
+                )
+                if mode == "enrichment":
+                    population_total = terms.sum()
+            else:
+                raise TypeError(
+                    "reweight_by must be a column name or a mapping or a two-column DataFrame."
+                )
+            if mode == "enrichment" and (
+                not math.isfinite(population_total) or population_total <= 0
+            ):
+                raise ValueError(
+                    "Enrichment requires a positive finite population total."
+                )
+            rate_name = unique_name("__rate__", self._current_columns())
+            lf = lf.with_columns(
+                pl.when(denominator.is_finite() & (denominator > 0))
+                .then(pl.col(values) / denominator)
+                .alias(rate_name)
+            )
+
         if total_col is None:
             # Unique internal name so a user column literally named __total__
             # can't shadow the computed per-axis sum (which would silently
             # produce wrong fractions).
-            total_name = unique_name("__total__", self._current_columns())
-            totals = lf.group_by(group_col).agg(pl.sum(values).alias(total_name))
+            total_name = unique_name("__total__", lf.collect_schema().names())
+            numerator = rate_name or values
+            total_values = values if mode == "enrichment" else numerator
+            totals = lf.group_by(group_col).agg(pl.sum(total_values).alias(total_name))
+            fraction = pl.col(numerator) / pl.col(total_name)
+            if mode == "enrichment":
+                fraction = fraction * population_total
+            if rate_name is not None:
+                fraction = pl.when(
+                    pl.col(total_name).is_finite() & (pl.col(total_name) > 0)
+                ).then(fraction)
             normalized = (
                 lf.join(totals, on=group_col, how="left")
-                .with_columns((pl.col(values) / pl.col(total_name)).alias("fraction"))
-                .drop([total_name, values])
+                .with_columns(fraction.alias(output_col))
+                .drop(
+                    [
+                        total_name,
+                        *([rate_name] if rate_name else []),
+                        *([values] if values != output_col else []),
+                    ]
+                )
             )
         else:
             normalized = lf.with_columns(
                 (pl.col(values) / pl.col(total_col)).alias("fraction")
-            ).drop(values)
+            ).drop([values] if values != "fraction" else [])
 
         return self._replace_base(normalized, drop_weight=values)
 
@@ -619,6 +769,9 @@ class ConnectivityTable(_CachedTable):
         new._filters = []
         new._filter_sides = []
         new._expressions = {}
+        new.metadata = deepcopy(self.metadata)
+        new._n_pair_base = None
+        new._expression_sides = {}
         new._cache = None
         return new
 
@@ -630,6 +783,8 @@ class ConnectivityTable(_CachedTable):
         fill_value: float = 0,
         *,
         aggregate: str = "error",
+        max_cells: int | None = 10_000_000,
+        keep: str | list[str] | None = None,
     ) -> pl.DataFrame:
         """Pivot into a dense pre × post matrix DataFrame.
 
@@ -649,16 +804,68 @@ class ConnectivityTable(_CachedTable):
             polars as the pivot ``aggregate_function`` to combine duplicates
             with that reducer — ``"sum"`` (natural for additive weights),
             ``"mean"``, ``"max"``, ``"first"``, etc.
+        max_cells : int or None, optional
+            Refuse a matrix exceeding this many entries before collecting edges
+            or allocating the dense pivot. Defaults to 10 million. None disables
+            the guard; use to_sparse for larger matrices.
+        keep : str, list of str, or None, optional
+            Additional columns to retain beside the pre entity ID. Each must
+            have exactly one distinct value per pre entity, including nulls.
+            Available pre-side cell annotations are typical examples. Kept
+            columns retain their dtype and nulls and are not filled with
+            ``fill_value``. Pair axes and the pivot value cannot be kept.
 
         Returns
         -------
         pl.DataFrame
-            Columns: ``pre_col`` followed by one column per post entity.
+            Columns: ``pre_col``, kept columns, then one column per observed
+            post entity. Enum post categories follow their declared order;
+            a null category, if observed, appears last. Unobserved Enum
+            categories are not added automatically.
         """
         values = self._resolve_values(values)
         if values not in self._current_columns():
             raise ValueError(f"values={values!r} not found in table.")
-        df = self.build_lazy().select([self._pre_col, self._post_col, values]).collect()
+        kept = [keep] if isinstance(keep, str) else list(keep or [])
+        if len(set(kept)) != len(kept):
+            raise ValueError("keep columns must be unique.")
+        reserved = {self._pre_col, self._post_col, values}
+        if reserved.intersection(kept):
+            raise ValueError("keep cannot contain pair axes or the pivot value column.")
+        missing = set(kept).difference(self._current_columns())
+        if missing:
+            raise ValueError(
+                f"keep columns not found in the current table: {sorted(missing)!r}"
+            )
+        lf = self.build_lazy().select([self._pre_col, self._post_col, values, *kept])
+        if max_cells is not None:
+            if max_cells < 0:
+                raise ValueError("max_cells must be non-negative or None.")
+            n_pre, n_post = (
+                lf.select(
+                    pl.col(self._pre_col).n_unique().alias("pre"),
+                    pl.col(self._post_col).n_unique().alias("post"),
+                )
+                .collect()
+                .row(0)
+            )
+            if n_pre * n_post > max_cells:
+                raise ValueError(
+                    f"Dense matrix would have {n_pre:,} × {n_post:,} "
+                    f"= {n_pre * n_post:,} entries, exceeding max_cells={max_cells:,}. "
+                    "Use to_sparse(), or explicitly increase/disable max_cells."
+                )
+        df = lf.collect()
+        if kept:
+            conflicts = (
+                df.group_by(self._pre_col)
+                .agg(pl.col(kept).n_unique())
+                .filter(pl.any_horizontal(pl.col(kept) > 1))
+            )
+            if conflicts.height:
+                raise ValueError(
+                    "keep columns must have a single value per pre entity; conflicting values found."
+                )
         # By default, refuse duplicate (pre, post) rows: the pivot would
         # otherwise silently collapse them, producing a wrong matrix entry.
         # Pass aggregate="sum" (or another reducer) to combine them on purpose.
@@ -674,12 +881,134 @@ class ConnectivityTable(_CachedTable):
             agg_fn = "first"  # no duplicates reach the pivot
         else:
             agg_fn = aggregate
-        return df.pivot(
+        dense = df.pivot(
             on=self._post_col,
             index=self._pre_col,
             values=values,
             aggregate_function=agg_fn,
-        ).fill_null(fill_value)
+        ).with_columns(pl.exclude(self._pre_col).fill_null(fill_value))
+        post_dtype = df.schema[self._post_col]
+        if isinstance(post_dtype, pl.Enum):
+            ordered = [
+                label
+                for label in post_dtype.categories
+                if label in dense.columns and label != self._pre_col
+            ]
+            trailing = [
+                col
+                for col in dense.columns
+                if col != self._pre_col and col not in ordered
+            ]
+            dense = dense.select(self._pre_col, *ordered, *trailing)
+        if kept:
+            collisions = set(kept).intersection(dense.columns)
+            if collisions:
+                raise ValueError(
+                    f"keep columns collide with pivot output columns: {sorted(collisions)!r}"
+                )
+            properties = df.select(self._pre_col, *kept).unique(subset=self._pre_col)
+            dense = dense.join(
+                properties, on=self._pre_col, how="left", nulls_equal=True
+            )
+            pivot_columns = [
+                col for col in dense.columns if col != self._pre_col and col not in kept
+            ]
+            dense = dense.select(self._pre_col, *kept, *pivot_columns)
+        return dense
+
+    def to_sparse(
+        self,
+        values: str | None = None,
+        *,
+        pre_ids: Iterable | None = None,
+        post_ids: Iterable | None = None,
+        aggregate: str = "error",
+    ) -> tuple:
+        """Export a CSR array and its explicit row and column identities.
+
+        Parameters
+        ----------
+        values : str or None, optional
+            Numeric entry column, defaulting to the first registered weight.
+        pre_ids, post_ids : iterable or None, optional
+            Ordered axis identities. Supply universe IDs to include cells with
+            zero observed connections. Defaults to sorted observed identities.
+            Supplied axes must be unique and contain every observed identity.
+        aggregate : {'error', 'sum', 'mean', 'min', 'max', 'first'}, optional
+            Reducer for duplicate pairs. Defaults to rejecting duplicate entries.
+
+        Returns
+        -------
+        tuple
+            ``(scipy.sparse.csr_array, pre_entities, post_entities)``. The latter
+            two are Polars Series whose order defines the matrix axes. Absent
+            entries are zero. No dense matrix or full pair grid is constructed.
+
+        Notes
+        -----
+        Requires scipy. Collects only observed IDs and the selected value column.
+        Null entries and null axis identities are rejected; filter or fill them
+        explicitly before export rather than silently interpreting them as zero.
+        """
+        try:
+            from scipy.sparse import coo_array
+        except ImportError as exc:
+            raise ImportError(
+                "Sparse export requires scipy. Install trajan[sparse]."
+            ) from exc
+        if aggregate not in {"error", "sum", "mean", "min", "max", "first"}:
+            raise ValueError("Unsupported sparse duplicate reducer.")
+        values = self._resolve_values(values)
+        df = self.build_lazy().select(self._pre_col, self._post_col, values).collect()
+        if not df.schema[values].is_numeric():
+            raise ValueError("Sparse entries must be numeric.")
+        if any(df[c].null_count() for c in df.columns):
+            raise ValueError("Sparse export requires non-null axis IDs and values.")
+        keys = [self._pre_col, self._post_col]
+        if df.height != df.select(keys).n_unique():
+            if aggregate == "error":
+                raise ValueError(
+                    "to_sparse found duplicate pairs; specify aggregate='sum' or another reducer."
+                )
+            df = df.group_by(keys).agg(
+                getattr(pl.col(values), aggregate)().alias(values)
+            )
+
+        def _axis(col, ids):
+            axis = (
+                df[col].unique().sort()
+                if ids is None
+                else pl.Series(col, list(ids), dtype=df.schema[col])
+            )
+            if axis.null_count() or axis.n_unique() != len(axis):
+                raise ValueError(
+                    f"Axis {col!r} must contain unique, non-null identities."
+                )
+            return axis
+
+        pre = _axis(self._pre_col, pre_ids)
+        post = _axis(self._post_col, post_ids)
+        import numpy as np
+
+        try:
+            row = (
+                df[self._pre_col]
+                .replace_strict(pre, pl.Series(np.arange(len(pre))))
+                .to_numpy()
+            )
+            col = (
+                df[self._post_col]
+                .replace_strict(post, pl.Series(np.arange(len(post))))
+                .to_numpy()
+            )
+        except pl.exceptions.InvalidOperationError as exc:
+            raise ValueError(
+                "Supplied axes must contain every observed identity."
+            ) from exc
+        matrix = coo_array(
+            (df[values].to_numpy(), (row, col)), shape=(len(pre), len(post))
+        ).tocsr()
+        return matrix, pre, post
 
     # ── persistence ────────────────────────────────────────────────────────
 
@@ -701,6 +1030,7 @@ class ConnectivityTable(_CachedTable):
         """
         folio = _as_folio(folio)
         config = {
+            "metadata": deepcopy(self.metadata),
             "__type__": self._TYPE_TAG,
             "pre_col": self._pre_col,
             "post_col": self._post_col,
@@ -839,4 +1169,5 @@ class ConnectivityTable(_CachedTable):
                 if saved_sides is not None and i < len(saved_sides):
                     instance._filter_sides[-1] = saved_sides[i]
 
+            instance.metadata = deepcopy(config.get("metadata", {}))
             return instance

@@ -417,12 +417,28 @@ def _to_lazy(df) -> pl.LazyFrame:
 
 def _auto_pack(lf: pl.LazyFrame, col: str | None) -> pl.LazyFrame:
     """Pack ``{col}_x/y/z`` into a struct ``col`` if the struct is absent but
-    the triplet exists. No-op if ``col`` is ``None`` or already present.
+    the triplet exists. No-op if ``col`` is ``None``.
+
+    A pre-packed struct ``col`` has its ``x`` / ``y`` / ``z`` fields cast to
+    Float64 (other fields untouched), matching :func:`pack_position`, so integer
+    coordinates cannot overflow in downstream spatial arithmetic.
     """
     if col is None:
         return lf
-    names = lf.collect_schema().names()
+    schema = lf.collect_schema()
+    names = schema.names()
     if col in names:
+        dtype = schema[col]
+        if isinstance(dtype, pl.Struct):
+            fields = [
+                pl.Field(f.name, pl.Float64)
+                if f.name in ("x", "y", "z") and f.dtype.is_numeric()
+                else f
+                for f in dtype.fields
+            ]
+            target = pl.Struct(fields)
+            if target != dtype:
+                lf = lf.with_columns(pl.col(col).cast(target))
         return lf
     if all(f"{col}_{ax}" in names for ax in ("x", "y", "z")):
         return pack_position(lf, col)
@@ -851,9 +867,11 @@ def filter_by_id_sets(table, pre_ids, post_ids):
         return table._copy()
     new = table
     if pre_ids is not None:
-        new = new.filter(pl.col(table.pre_col).is_in(list(pre_ids)))
+        filter_fn = getattr(new, "filter_pairs", new.filter)
+        new = filter_fn(pl.col(table.pre_col).is_in(list(pre_ids)))
     if post_ids is not None:
-        new = new.filter(pl.col(table.post_col).is_in(list(post_ids)))
+        filter_fn = getattr(new, "filter_pairs", new.filter)
+        new = filter_fn(pl.col(table.post_col).is_in(list(post_ids)))
     return new
 
 
@@ -871,11 +889,37 @@ def filter_by_soma_distance_impl(table, max_distance, annotation, distance_fn):
     every public entry point names its metric explicitly rather than inheriting
     a silent one.
     """
+    import math
+
+    if not math.isfinite(max_distance) or max_distance < 0:
+        raise ValueError("max_distance must be finite and non-negative.")
     ann_name = table._resolve_position_annotation(annotation)
     pos_col = table._cell_annotations[ann_name].position_col
-    return table.filter(
-        distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance
-    )
+    filter_fn = getattr(table, "filter_pairs", table.filter)
+    return filter_fn(distance_fn(f"{pos_col}_pre", f"{pos_col}_post") <= max_distance)
+
+
+def validate_pair_filter(table, expr: pl.Expr) -> None:
+    """Require an eligibility predicate computable for unobserved cell pairs."""
+    available = {table.pre_col, table.post_col}
+    for spec in table._cell_annotations.values():
+        available.update(spec.produced_columns())
+    pending = set(expr.meta.root_names())
+    visited = set()
+    while pending:
+        name = pending.pop()
+        if name in visited:
+            continue
+        if name in available:
+            continue
+        if name in table._expressions:
+            visited.add(name)
+            pending.update(table._expressions[name].meta.root_names())
+        else:
+            raise ValueError(
+                f"Pair eligibility cannot depend on {name!r}. Use only cell IDs "
+                "and cell annotations; synapse/edge measurements belong in filter()."
+            )
 
 
 # ── side-classification ───────────────────────────────────────────────────────

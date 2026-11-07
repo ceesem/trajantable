@@ -397,6 +397,78 @@ def test_aggregate_to_type_requires_axis(el):
         el.aggregate_to_type()
 
 
+def test_aggregate_to_type_custom_agg_from_synapses(tmp_path):
+    from trajan import SynapseTable
+
+    synapses = pl.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "pre": [1, 1, 1, 1, 2],
+            "post": [10, 10, 10, 11, 10],
+            "size": [2.0, 4.0, None, 12.0, 100.0],
+        }
+    )
+    cells = pl.DataFrame(
+        {
+            "cid": [1, 2, 10, 11],
+            "class": ["E", "E", "I", "I"],
+            "is_proofread": [True, False, True, True],
+        }
+    )
+    st = SynapseTable(synapses, pre_col="pre", post_col="post")
+    st.add_cell_annotation("cells", cells, cell_id_col="cid")
+    selected = st.filter(pl.col("is_proofread_pre"))
+    el = selected.edgelist(agg={"mean_size": pl.mean("size")})
+    ct = el.aggregate_to_type(
+        post="class_post", agg={"mean_size": pl.mean("mean_size")}
+    )
+    assert ct.pairs["mean_size"].item() == 7.5
+    assert ct.pairs["n_syn"].item() == 4
+    assert ct.weights == ["n_syn"]
+    assert ct.df["is_proofread_pre"].item() is True
+    assert "mean_size" in el.columns  # the source is unchanged
+
+    sums = selected.edgelist(
+        agg={"size_sum": pl.sum("size"), "size_count": pl.col("size").count()}
+    )
+    weighted = sums.aggregate_to_type(
+        post="class_post", agg={"mean_size": pl.sum("size_sum") / pl.sum("size_count")}
+    )
+    assert weighted.pairs["mean_size"].item() == 6.0
+    weighted.save(tmp_path / "typed")
+    restored = ConnectivityTable.load(tmp_path / "typed")
+    assert restored.df.equals(weighted.df)
+    assert restored.weights == ["n_syn"]
+
+
+@pytest.mark.parametrize("output", ["n_syn", "pre", "type_post"])
+def test_aggregate_to_type_agg_collision(el, output):
+    el.add_annotation(
+        "types", pl.DataFrame({"cid": [10, 11], "type": ["I", "I"]}), cell_id_col="cid"
+    )
+    with pytest.raises(ValueError, match="collide"):
+        el.aggregate_to_type(post="type_post", agg={output: pl.mean("n_syn")})
+
+
+def test_aggregate_to_type_agg_without_weights():
+    el = EdgeList(
+        pl.DataFrame(
+            {
+                "pre": [1, 1],
+                "post": [10, 11],
+                "type": ["I", "I"],
+                "mean_size": [3.0, 12.0],
+            }
+        ),
+        pre_col="pre",
+        post_col="post",
+        weight_cols=[],
+    )
+    ct = el.aggregate_to_type(post="type", agg={"mean_size": pl.mean("mean_size")})
+    assert ct.pairs["mean_size"].item() == 7.5
+    assert ct.weights == []
+
+
 def test_aggregate_to_type_requires_weight(pair_frame):
     """If no weights are registered and none passed, aggregate_to_type fails."""
     df = pl.DataFrame({"pre": [1], "post": [2], "strength": [0.5]})

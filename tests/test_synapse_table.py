@@ -57,6 +57,65 @@ def test_repr_shows_count_after_collect(st):
 # ── duplicate join-key validation ──────────────────────────────────────────────
 
 
+@pytest.fixture
+def unresolved_synapses():
+    return SynapseTable(
+        pl.DataFrame(
+            {
+                "id": [1, 2, 3, 4, 5, 6],
+                "pre": [1, 1, None, 1, None, 0],
+                "post": [2, 2, 2, None, None, 2],
+                "size": [2.0, None, 100.0, 100.0, 100.0, 4.0],
+            }
+        ),
+        pre_col="pre",
+        post_col="post",
+    )
+
+
+def test_edgelist_excludes_null_endpoints_only(unresolved_synapses):
+    st = unresolved_synapses.add_weight("size")
+    st.add_cell_annotation(
+        "cells",
+        pl.DataFrame({"cid": [0, 1, 2], "type": ["E", "E", None]}),
+        cell_id_col="cid",
+        is_universe=True,
+    )
+    el = st.edgelist(agg={"mean_size": pl.mean("size")})
+    df = el.df.sort("pre")
+    assert df["pre"].to_list() == [0, 1]
+    assert df["post"].to_list() == [2, 2]
+    assert df["n_syn"].to_list() == [1, 2]
+    assert df["size"].to_list() == [4.0, 2.0]
+    assert df["mean_size"].to_list() == [4.0, 2.0]
+    assert df["type_post"].null_count() == 2
+    assert el.annotation_names == ["cells"]
+    assert len(st) == 6
+    assert st.synapses["pre"].null_count() == 2
+    from trajan import counts, possible_pairs
+
+    result = counts(possible_pairs(st), group_by="type_pre")
+    assert result["n_possible"].sum() == 6
+    assert result["k_observed"].sum() == 2
+    assert result["sum_n_syn"].sum() == 3
+
+
+def test_edgelist_can_retain_null_endpoints(unresolved_synapses):
+    df = unresolved_synapses.edgelist(drop_nulls=False).pairs
+    assert df.height == 5
+    assert df["n_syn"].sum() == 6
+    assert df["pre"].null_count() == 2
+    assert df["post"].null_count() == 2
+
+
+def test_edgelist_all_unresolved_is_empty(unresolved_synapses):
+    st = unresolved_synapses.filter(pl.col("pre").is_null() | pl.col("post").is_null())
+    el = st.edgelist(agg={"mean_size": pl.mean("size")})
+    assert el.pairs.is_empty()
+    assert el.columns == ["pre", "post", "n_syn", "mean_size"]
+    assert len(st) == 3
+
+
 def test_synapse_annotation_duplicate_id_raises(st):
     """add_synapse_annotation must reject annotation with duplicate id values."""
     dup_ann = pl.DataFrame({"id": [1, 1, 2], "score": [0.1, 0.9, 0.5]})
@@ -1221,6 +1280,51 @@ def test_add_spatial_features_euclidean_value(st_spatial):
     # Synapse 1: pre=cell10 (0,0,0), post=cell20 (3,0,0) → euclidean=3
     row = syn.filter(pl.col("id") == 1).row(0, named=True)
     assert math.isclose(row["soma_euclidean"], 3.0)
+
+
+@pytest.mark.parametrize("prepacked", [False, True])
+def test_add_spatial_features_integer_positions_do_not_overflow(
+    base_synapses, prepacked
+):
+    """Int32 nm-scale coordinates must not overflow when squared.
+
+    A 300 µm offset is 3e5 nm; squared (9e10) it overflows Int32, which used
+    to yield NaN distances. Positions are cast to Float64 on registration,
+    whether given as an x/y/z triplet or a pre-packed struct.
+    """
+    import math
+
+    soma_df = pl.DataFrame(
+        {
+            "root_id": [10, 20, 30],
+            "soma_x": [0, 300_000, 0],
+            "soma_y": [0, 0, 400_000],
+            "soma_z": [0, 0, 0],
+        },
+        schema_overrides={"soma_x": pl.Int32, "soma_y": pl.Int32, "soma_z": pl.Int32},
+    )
+    if prepacked:
+        soma_df = soma_df.select(
+            "root_id",
+            pl.struct(
+                pl.col("soma_x").alias("x"),
+                pl.col("soma_y").alias("y"),
+                pl.col("soma_z").alias("z"),
+            ).alias("soma"),
+        )
+    st = SynapseTable(base_synapses).add_cell_annotation(
+        "soma", soma_df, cell_id_col="root_id", position_col="soma"
+    )
+    st.add_spatial_features(prefix="soma")
+    syn = st.df
+    assert syn.schema["soma_pre"] == pl.Struct(
+        {"x": pl.Float64, "y": pl.Float64, "z": pl.Float64}
+    )
+    # Synapse 1: pre=cell10 (0,0,0), post=cell20 (3e5,0,0)
+    row = syn.filter(pl.col("id") == 1).row(0, named=True)
+    assert math.isclose(row["soma_euclidean"], 300_000.0)
+    assert math.isclose(row["soma_rho"], 300_000.0)
+    assert math.isclose(row["soma_theta"], math.pi / 2)
 
 
 def test_add_spatial_features_post_pre_negates_depth(st_spatial):

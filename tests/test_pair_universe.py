@@ -139,17 +139,15 @@ def test_two_separate_filters_decompose(st):
     assert set(df["post_pt_root_id"].to_list()) == {30}
 
 
-def test_both_filter_warns_and_skips_projection(st):
-    """Both-sided AND in one expression warns and does not project on the
-    cross-product (still constrains observed n_syn baked in upstream)."""
+def test_both_filter_constrains_candidate_pairs(st):
+    """A joint cell predicate constrains observed and candidate pairs alike."""
     filtered = st.filter(
         (pl.col("cell_type_pre") == "L23") & (pl.col("cell_type_post") == "L4")
     )
-    with pytest.warns(UserWarning, match="both"):
-        pu = possible_pairs(filtered)
+    pu = possible_pairs(filtered)
     df = pu.collect()
-    # Cross-product is universe × universe (20 pairs), not narrowed.
-    assert len(df) == 20
+    assert len(df) == 2
+    assert set(df["post_pt_root_id"]) == {30}
 
 
 # ── synapse-level filter bakes in only on observed counts ────────────────────

@@ -72,7 +72,7 @@ trajan.connection_probability(
 )
 ```
 
-### Restrict to specific cells → filter the `PairUniverse`, not the source
+### Select specific cells with pair eligibility
 
 !!! warning "Raw id filters on the *source* only move the numerator"
     A filter on the raw id column (`pre_pt_root_id`) is **not** a
@@ -90,6 +90,33 @@ trajan.connection_probability(
 
     For per-cell curves, `group_by("pre_pt_root_id")` instead — that's an
     aggregation key, not a filter, so it's always safe.
+
+The source helpers `st.filter_by_ids(...)`, `st.filter_by_euclidean_distance(...)`,
+and `st.filter_by_radial_distance(...)` declare pair eligibility: they now
+constrain both observed counts and the candidate denominator, including after
+`st.edgelist()`. For custom ID/cell-annotation predicates, use
+`st.filter_pairs(expr)` or `el.filter_pairs(expr)`. Synapse measurements and edge
+weights are rejected by `filter_pairs`; ordinary `.filter()` keeps their
+numerator-only meaning.
+
+Ordinary filters referencing cell annotations on both sides now also apply
+directly to candidate pairs, including joint type or spatial predicates. A
+joint predicate cannot generally be factorized into independent cell sets, so
+`cells(scope="filtered")` still warns and skips such projection. Pair eligibility
+does not redefine the cell universe or the bootstrap population.
+
+### Spatial validity
+
+`trajan.position_is_valid(col)` checks for a non-null position with finite x/y/z
+coordinates. Distances, depth, and spatial features return NaN for incomplete
+or non-finite positions, including radial distance when the unused depth field
+is invalid. Bounding-box predicates exclude these positions; transforms return
+null positions for invalid input or output. Invalid distance cutoffs, bounding
+boxes, and depth-axis specifications raise errors.
+
+Calculations use the supplied coordinate units and frame without inferring or
+converting them. Keep compared positions in a common frame and record units,
+frame, and transform versions in `table.metadata["coordinates"]`.
 
 !!! warning "Filtering the `PairUniverse` does not move the bootstrap population"
     The cell bootstrap reads its resampling population straight from the

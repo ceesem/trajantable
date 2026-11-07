@@ -3,6 +3,30 @@ from __future__ import annotations
 import polars as pl
 
 
+def position_is_valid(col: str, axes: tuple[str, ...] = ("x", "y", "z")) -> pl.Expr:
+    """Return True for non-null positions with finite coordinates on every axis.
+
+    Parameters
+    ----------
+    col : str
+        Position struct column.
+    axes : tuple of str, optional
+        Required coordinate fields. Defaults to all three spatial axes.
+
+    Returns
+    -------
+    pl.Expr
+        Boolean expression; incomplete, NaN, and infinite positions yield False.
+    """
+    if not axes or len(set(axes)) != len(axes):
+        raise ValueError("axes must contain distinct coordinate fields.")
+    c = pl.col(col)
+    return (
+        c.is_not_null()
+        & pl.all_horizontal([c.struct.field(a).is_finite() for a in axes])
+    ).fill_null(False)
+
+
 def pack_position(
     df: pl.DataFrame | pl.LazyFrame,
     col: str,
@@ -14,6 +38,8 @@ def pack_position(
 
     Infers source column names as {col}_x, {col}_y, {col}_z if not given explicitly.
     The source columns are dropped and replaced with a single struct column named col.
+    Coordinates are cast to Float64 so downstream spatial arithmetic (squared
+    differences in particular) cannot overflow on integer nanometer coordinates.
 
     Parameters
     ----------
@@ -50,9 +76,9 @@ def pack_position(
     z_col = z if z is not None else f"{col}_z"
 
     struct_expr = pl.struct(
-        pl.col(x_col).alias("x"),
-        pl.col(y_col).alias("y"),
-        pl.col(z_col).alias("z"),
+        pl.col(x_col).cast(pl.Float64).alias("x"),
+        pl.col(y_col).cast(pl.Float64).alias("y"),
+        pl.col(z_col).cast(pl.Float64).alias("z"),
     ).alias(col)
 
     if isinstance(df, (pl.DataFrame, pl.LazyFrame)):
@@ -229,10 +255,10 @@ def transform_point(
       lazy and optimizer-visible; use it for scale / flip / hand-written affine.
       It reads point-wise but runs columnar (no per-row Python).
 
-    A point is treated as missing when its struct is null *or* any axis field is
-    null; such rows map to a null output struct in both modes, so downstream
+    A point is treated as missing when its struct is null or any coordinate is
+    null, NaN, or infinite; such rows map to a null output struct in both modes, so downstream
     spatial helpers continue to treat them as missing. Array-mode output is
-    Float64.
+    Float64. Non-finite transformed outputs become null positions as well.
 
     Parameters
     ----------
@@ -270,9 +296,7 @@ def transform_point(
     c = pl.col(col)
 
     # A point is missing if the struct is null or any axis field is null.
-    missing = c.is_null() | pl.any_horizontal(
-        [c.struct.field(a).is_null() for a in axes]
-    )
+    missing = ~position_is_valid(col, axes)
 
     if vectorized:
         out = list(func(*(c.struct.field(a) for a in axes)))
@@ -282,7 +306,8 @@ def transform_point(
                 f"expressions but {len(axes)} axes {axes} were expected."
             )
         packed = pl.struct([e.alias(a) for a, e in zip(axes, out)])
-        return pl.when(missing).then(pl.lit(None)).otherwise(packed)
+        valid_out = pl.all_horizontal([e.is_finite() for e in out]).fill_null(False)
+        return pl.when(~missing & valid_out).then(packed).otherwise(pl.lit(None))
 
     def _batch(s: pl.Series) -> pl.Series:
         import numpy as np
@@ -298,6 +323,7 @@ def transform_point(
                 f"transform_point: func returned shape {out.shape}, expected "
                 f"{arr.shape} (N x {len(axes)})."
             )
+        miss |= ~np.isfinite(out).all(axis=1)
         res = pl.struct([pl.Series(a, out[:, i]) for i, a in enumerate(axes)]).alias(
             s.name
         )
@@ -335,9 +361,16 @@ def bbox_predicate(col: str, bbox) -> pl.Expr:
         (inclusive on all faces).
     """
     (xmin, ymin, zmin), (xmax, ymax, zmax) = bbox
+    import math
+
+    if not all(math.isfinite(v) for v in (xmin, ymin, zmin, xmax, ymax, zmax)):
+        raise ValueError("Bounding-box coordinates must be finite.")
+    if any(lo > hi for lo, hi in zip((xmin, ymin, zmin), (xmax, ymax, zmax))):
+        raise ValueError("Bounding-box minima must not exceed maxima.")
     p = pl.col(col)
     return (
-        (p.struct.field("x") >= xmin)
+        position_is_valid(col)
+        & (p.struct.field("x") >= xmin)
         & (p.struct.field("x") <= xmax)
         & (p.struct.field("y") >= ymin)
         & (p.struct.field("y") <= ymax)
@@ -354,9 +387,10 @@ def _parse_depth_axis(depth_axis: str) -> tuple[str, int]:
     values point towards the surface. Shared by the depth-aware spatial helpers
     so they parse the convention identically.
     """
-    if depth_axis.endswith("_r"):
-        return depth_axis[:-2], -1
-    return depth_axis, 1
+    axis = depth_axis[:-2] if depth_axis.endswith("_r") else depth_axis
+    if axis not in {"x", "y", "z"}:
+        raise ValueError("depth_axis must be x, y, z, x_r, y_r, or z_r.")
+    return axis, -1 if depth_axis.endswith("_r") else 1
 
 
 def depth_component(col: str, depth_axis: str = "y") -> pl.Expr:
@@ -364,7 +398,7 @@ def depth_component(col: str, depth_axis: str = "y") -> pl.Expr:
 
     Returns the ``depth_axis`` field of the position struct, sign-adjusted so
     that larger values are deeper (matching the ``depth_diff`` convention of
-    :func:`spatial_feature_exprs`). Evaluates to NaN where the column is null.
+    :func:`spatial_feature_exprs`). Evaluates to NaN for incomplete or non-finite positions.
 
     Parameters
     ----------
@@ -377,7 +411,7 @@ def depth_component(col: str, depth_axis: str = "y") -> pl.Expr:
     Returns
     -------
     pl.Expr
-        Expression for the signed depth coordinate. NaN where ``col`` is null.
+        Expression for the signed depth coordinate. NaN for incomplete or non-finite positions.
 
     Examples
     --------
@@ -386,7 +420,7 @@ def depth_component(col: str, depth_axis: str = "y") -> pl.Expr:
     axis, sign = _parse_depth_axis(depth_axis)
     c = pl.col(col)
     return (
-        pl.when(c.is_not_null())
+        pl.when(position_is_valid(col))
         .then(sign * c.struct.field(axis))
         .otherwise(pl.lit(float("nan")))
     )
@@ -397,7 +431,9 @@ def _sq_distance_expr(col_a: str, col_b: str, axes: tuple[str, ...]) -> pl.Expr:
     terms = [(a.struct.field(ax) - b.struct.field(ax)).pow(2) for ax in axes]
     sq_dist = terms[0] if len(terms) == 1 else pl.sum_horizontal(terms)
     return (
-        pl.when(a.is_not_null() & b.is_not_null())
+        pl.when(
+            position_is_valid(col_a) & position_is_valid(col_b) & sq_dist.is_finite()
+        )
         .then(sq_dist)
         .otherwise(pl.lit(float("nan")))
     )
@@ -407,7 +443,7 @@ def euclidean_distance(col_a: str, col_b: str) -> pl.Expr:
     """Euclidean (3-D) distance between two position struct columns.
 
     Both columns must be structs with x, y, z fields (see pack_position).
-    Returns NaN where either column is null.
+    Returns NaN where either position is incomplete or non-finite.
 
     Parameters
     ----------
@@ -420,7 +456,7 @@ def euclidean_distance(col_a: str, col_b: str) -> pl.Expr:
     -------
     pl.Expr
         Expression computing the 3-D Euclidean distance, element-wise. NaN where
-        either column is null.
+        either position is incomplete or non-finite.
 
     Examples
     --------
@@ -440,7 +476,7 @@ def radial_distance(col_a: str, col_b: str) -> pl.Expr:
 
     Computes distance in the xz plane, where y is the cortical depth axis and x/z
     are the horizontal axes. Both columns must be structs with x, y, z fields
-    (see pack_position). Returns NaN where either column is null.
+    (see pack_position). Returns NaN where either position is incomplete or non-finite.
 
     Parameters
     ----------
@@ -453,13 +489,136 @@ def radial_distance(col_a: str, col_b: str) -> pl.Expr:
     -------
     pl.Expr
         Expression computing the 2-D lateral distance in the xz plane,
-        element-wise. NaN where either column is null.
+        element-wise. NaN where either position is incomplete or non-finite.
 
     Examples
     --------
     >>> st.filter(radial_distance("soma_pre", "soma_post") <= 30_000)
     """
     return _sq_distance_expr(col_a, col_b, ("x", "z")).sqrt()
+
+
+def lateral_spread(
+    df: pl.DataFrame | pl.LazyFrame,
+    by: str,
+    position_col: str,
+    *,
+    min_points: int = 3,
+) -> pl.DataFrame | pl.LazyFrame:
+    """Per-cell centroid and lateral covariance of a set of positions.
+
+    Summarizes where each cell's points sit — typically a presynaptic cell's
+    output synapses — as the centroid ``{position_col}_centroid`` (an x/y/z
+    struct, so it drops into :func:`radial_distance` in place of a soma) and the
+    lateral covariance ``{position_col}_cov`` (an ``xx``/``xz``/``zz`` struct in
+    the xz plane, y being depth) for :func:`lateral_mahalanobis_distance`.
+    Centring on the output centroid rather than the soma keeps a lateralized
+    axon's reach on the side it actually projects to.
+
+    Points with an incomplete or non-finite position are ignored. Cells with
+    fewer than ``min_points`` valid points get a null covariance, since two
+    points span a line and the inverse would blow up; their centroid is kept.
+
+    Parameters
+    ----------
+    df : pl.DataFrame or pl.LazyFrame
+        One row per point, e.g. a synapse table.
+    by : str
+        Cell id column to group on, e.g. ``"pre_pt_root_id"``.
+    position_col : str
+        Position struct column with x, y, z fields (see pack_position).
+    min_points : int, optional
+        Fewest valid points needed for a covariance. Defaults to 3.
+
+    Returns
+    -------
+    pl.DataFrame or pl.LazyFrame
+        One row per cell: ``by``, ``n_points``, ``{position_col}_centroid``, and
+        ``{position_col}_cov``. Same frame type as ``df``.
+
+    Examples
+    --------
+    >>> spread = lateral_spread(synapses, "pre_pt_root_id", "ctr_pt_position")
+    """
+    if min_points < 3:
+        raise ValueError("min_points must be at least 3 for a 2-D covariance.")
+    c = pl.col(position_col)
+    x, y, z = (c.struct.field(a) for a in ("x", "y", "z"))
+    n = pl.len()
+    cov = pl.struct(
+        pl.cov(x, x, ddof=1).alias("xx"),
+        pl.cov(x, z, ddof=1).alias("xz"),
+        pl.cov(z, z, ddof=1).alias("zz"),
+    )
+    return (
+        df.filter(position_is_valid(position_col))
+        .group_by(by)
+        .agg(
+            n.alias("n_points"),
+            pl.struct(
+                x.mean().alias("x"), y.mean().alias("y"), z.mean().alias("z")
+            ).alias(f"{position_col}_centroid"),
+            pl.when(n >= min_points).then(cov).alias(f"{position_col}_cov"),
+        )
+    )
+
+
+def lateral_mahalanobis_distance(col_a: str, col_b: str, cov_col: str) -> pl.Expr:
+    """Lateral distance from ``col_a`` to ``col_b`` in units of ``col_a``'s spread.
+
+    The Mahalanobis distance ``sqrt(d^T S^-1 d)`` in the xz plane, where ``d`` is
+    the lateral offset and ``S`` the 2x2 covariance in ``cov_col`` (an
+    ``xx``/``xz``/``zz`` struct, as built by :func:`lateral_spread`). Where
+    :func:`radial_distance` reaches equally in every direction, this stretches
+    along an elongated axon's long axis, so a threshold on it is an ellipse
+    rather than a disk. The result is unitless: 1 is one standard deviation of
+    the spread along that direction.
+
+    Returns NaN where either position is incomplete or non-finite, and where the
+    covariance is null or not positive definite.
+
+    Parameters
+    ----------
+    col_a : str
+        Position struct column the spread is centred on, e.g. an axon centroid.
+    col_b : str
+        Position struct column of the other end, e.g. a postsynaptic soma.
+    cov_col : str
+        Covariance struct column with xx, xz, zz fields, describing ``col_a``.
+
+    Returns
+    -------
+    pl.Expr
+        Expression computing the unitless lateral Mahalanobis distance,
+        element-wise.
+
+    Examples
+    --------
+    >>> pu.filter(
+    ...     lateral_mahalanobis_distance(
+    ...         "ctr_pt_position_centroid_pre", "soma_post", "ctr_pt_position_cov_pre"
+    ...     )
+    ...     <= pl.col("mahal_radius_pre")
+    ... )
+    """
+    a, b, s = pl.col(col_a), pl.col(col_b), pl.col(cov_col)
+    dx = b.struct.field("x") - a.struct.field("x")
+    dz = b.struct.field("z") - a.struct.field("z")
+    xx, xz, zz = (s.struct.field(f) for f in ("xx", "xz", "zz"))
+    det = xx * zz - xz * xz
+    # the closed-form 2x2 inverse: [[zz, -xz], [-xz, xx]] / det
+    sq_dist = (zz * dx * dx - 2 * xz * dx * dz + xx * dz * dz) / det
+    return (
+        pl.when(
+            position_is_valid(col_a)
+            & position_is_valid(col_b)
+            & (xx > 0)
+            & (det > 0)
+            & sq_dist.is_finite()
+        )
+        .then(sq_dist.sqrt())
+        .otherwise(pl.lit(float("nan")))
+    )
 
 
 def spatial_feature_exprs(
@@ -474,7 +633,7 @@ def spatial_feature_exprs(
     """Compute a battery of spatial features for the vector from_col → to_col.
 
     Both columns must be structs with x, y, z fields (see pack_position).
-    All returned expressions evaluate to NaN (not null) where either column is null.
+    All returned expressions evaluate to NaN (not null) where either position is incomplete or non-finite.
 
     The vector **v = to_pos − from_pos** is decomposed into depth and lateral
     components relative to ``depth_axis``. With ``depth_axis="y"`` (the default
@@ -523,11 +682,11 @@ def spatial_feature_exprs(
     axis, depth_sign = _parse_depth_axis(depth_axis)
 
     fc, tc = pl.col(from_col), pl.col(to_col)
-    null_cond = fc.is_not_null() & tc.is_not_null()
+    null_cond = position_is_valid(from_col) & position_is_valid(to_col)
     nan = pl.lit(float("nan"))
 
     def _guard(expr: pl.Expr) -> pl.Expr:
-        return pl.when(null_cond).then(expr).otherwise(nan)
+        return pl.when(null_cond & expr.is_finite()).then(expr).otherwise(nan)
 
     # Lateral axes: the two axes not equal to axis, sorted for determinism
     lateral = tuple(sorted({"x", "y", "z"} - {axis}))

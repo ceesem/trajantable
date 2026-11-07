@@ -3,12 +3,12 @@
 __version__ = "0.0.1"
 
 from ._base import Scope
-from .connectivity_table import ConnectivityTable
 from .completeness import (
     edge_distance_expr,
     interior_share,
     universe_share_by_edge_distance,
 )
+from .connectivity_table import ConnectivityTable
 from .edge_correction import LateralBox, edge_weight, lateral_box, ring_inside_fraction
 from .edgelist import EdgeList
 from .export import to_dataframe, to_graph
@@ -17,6 +17,8 @@ from .scope import cells
 from .spatial import (
     depth_component,
     euclidean_distance,
+    lateral_mahalanobis_distance,
+    lateral_spread,
     pack_all_positions,
     pack_position,
     position_is_valid,
@@ -62,6 +64,8 @@ __all__ = [
     "counts",
     "depth_component",
     "euclidean_distance",
+    "lateral_mahalanobis_distance",
+    "lateral_spread",
     "pack_all_positions",
     "pack_position",
     "pivot_grid",

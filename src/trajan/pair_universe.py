@@ -18,6 +18,7 @@ See ``DESIGN-universe.md`` §4 for the full design.
 from __future__ import annotations
 
 import warnings
+from copy import deepcopy
 from typing import TYPE_CHECKING, Iterable, Union
 
 import polars as pl
@@ -32,6 +33,7 @@ from ._base import (
     filter_by_soma_distance_impl,
     resolve_position_annotation,
     resolve_universe_annotation,
+    validate_pair_filter,
 )
 from .spatial import bbox_predicate, euclidean_distance, radial_distance
 
@@ -83,6 +85,7 @@ class PairUniverse(_LazyBacked):
         weights: list[str] | None = None,
         cell_aliases: dict[str, tuple[str, str]] | None = None,
     ):
+        self.metadata: dict = {}
         self._pair_lf = lf
         self._pre_col = pre_col
         self._post_col = post_col
@@ -335,7 +338,7 @@ class PairUniverse(_LazyBacked):
     # a row-count warning instead of inheriting the caching _CachedTable surface.
 
     def to_edgelist(self) -> "EdgeList":
-        """Collect the observed sub-frame as an ``EdgeList``.
+        """Return a lazy observed sub-frame as an ``EdgeList``.
 
         Returns the subset of *observed* pairs (any weight ``> 0``), wrapped as
         an ``EdgeList``. This is the EdgeList contract: rows are observed
@@ -366,14 +369,37 @@ class PairUniverse(_LazyBacked):
             observed = pl.any_horizontal(*[pl.col(w) > 0 for w in self._weights])
         else:
             observed = pl.lit(True)
-        df = lf.filter(observed).collect()
-        return EdgeList(
+        # Reattach annotation/expressions rather than baking them into the
+        # base frame, preserving universe membership and alias relationships.
+        generated = {
+            c
+            for spec in self._cell_annotations.values()
+            for c in spec.produced_columns()
+        } | set(self._expressions)
+        columns = set(lf.collect_schema().names())
+        df = lf.filter(observed).drop(sorted(generated & columns))
+        el = EdgeList(
             df,
             pre_col=self._pre_col,
             post_col=self._post_col,
             weight_cols=list(self._weights),
             cell_aliases=dict(self._cell_aliases),
         )
+        el._cell_annotations = self._cell_annotations.copy()
+        el._expressions = self._expressions.copy()
+        el._expression_sides = {
+            name: el._classify_expression(expr)
+            for name, expr in el._expressions.items()
+        }
+        for expr in self._filters:
+            try:
+                validate_pair_filter(self, expr)
+            except ValueError:
+                continue
+            el._filters.append(expr)
+            el._filter_sides.append("pair")
+        el.metadata = deepcopy(self.metadata)
+        return el
 
     def to_pair_frame(self) -> pl.DataFrame:
         """Materialize the full cross-product (observed + unobserved) as a DataFrame.
@@ -517,6 +543,7 @@ class PairUniverse(_LazyBacked):
 
     def _copy(self) -> "PairUniverse":
         new = PairUniverse.__new__(PairUniverse)
+        new.metadata = deepcopy(self.metadata)
         new._pair_lf = self._pair_lf
         new._pre_col = self._pre_col
         new._post_col = self._post_col
@@ -550,10 +577,11 @@ def possible_pairs(
     Cell annotations registered on the source (including the universe) are
     re-registered on the returned ``PairUniverse``, so spatial filters and
     cell-type filters compose on the result. Cell-level filters that were
-    accumulated on the source are projected onto the cross-product
-    (single-sided filters constrain only their side; ``"both"`` filters that
-    cannot be cleanly decomposed are skipped with a warning, matching the
-    contract of ``cells()``).
+    accumulated on the source apply to the candidate plan, including joint
+    predicates involving both endpoints. Explicit filter_pairs predicates and
+    ID/distance helpers also restrict both observed and candidate connectivity.
+    The bootstrap population remains the registered universe, independent of
+    pair eligibility.
 
     Synapse-level filters on a ``SynapseTable`` source are baked into the
     observed-side counts via ``.edgelist()`` — they do NOT prune the
@@ -613,14 +641,14 @@ def possible_pairs(
         cell_filters = [
             (f, side)
             for f, side in zip(table._filters, table._filter_sides)
-            if side in ("pre", "post", "both")
+            if side in ("pre", "post", "both", "pair")
         ]
         el = table.edgelist()
     elif isinstance(table, EdgeList):
         cell_filters = [
             (f, side)
             for f, side in zip(table._filters, table._filter_sides)
-            if side in ("pre", "post", "both")
+            if side in ("pre", "post", "both", "pair")
         ]
         el = table
     else:
@@ -691,15 +719,7 @@ def possible_pairs(
     )
     # Re-register the source's cell annotations so spatial / type filters
     # compose on the PairUniverse with the same syntax as on the EdgeList.
-    for ann_name, spec in el._cell_annotations.items():
-        pu.add_annotation(
-            ann_name,
-            spec.lf,
-            cell_id_col=spec.cell_id_col,
-            position_col=spec.position_col,
-            is_universe=spec.is_universe,
-            join_on_alias=spec.join_on_alias,
-        )
+    pu._cell_annotations = el._cell_annotations.copy()
     # Propagate cell-side computed expressions from the EdgeList so any
     # accumulated cell-level filter that references one (e.g. a log1p'd
     # cell column, an uppercased cell_type, etc.) resolves against the
@@ -710,22 +730,12 @@ def possible_pairs(
     # their dependencies.
     for expr_name, expr in el._expressions.items():
         pu.add_expression(expr_name, expr)
-    # Project the source's accumulated cell-level filters onto the
-    # cross-product. Same projection contract as cells(): single-sided
-    # filters apply directly to that side (the annotation join exposes
-    # both _pre and _post columns); 'both' filters skip with a warning.
+    # Apply eligibility to candidates. This plan contains both endpoints and
+    # can evaluate joint predicates that cells() cannot factorize.
     # Synapse / vertex / pair-level filters (side=None) are not propagated —
     # they bake into observed counts via .edgelist() but don't shrink the
     # universe of *possible* connections.
     for f_expr, side_class in cell_filters:
-        if side_class == "both":
-            warnings.warn(
-                f"Cell-level filter classified as 'both' is not projected onto "
-                f"the PairUniverse cross-product (it still constrains observed "
-                f"counts). Split into separate .filter() calls for tight "
-                f"projection. Filter: {f_expr!s}",
-                stacklevel=2,
-            )
-            continue
         pu = pu.filter(f_expr)
+    pu.metadata = deepcopy(el.metadata)
     return pu

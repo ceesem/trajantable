@@ -1,6 +1,12 @@
 # trajantable — Feature Roadmap
 
 Ideas that need more design work before implementation. Rough notes, not commitments.
+$$
+For the current multi-tier architecture, gaps, and priorities, see
+[the connectivity analysis assessment](docs/guides/analysis-assessment.md).
+Connection probability/density, PairUniverse, and cell bootstrap are already
+implemented; the probability proposal below is historical. Delta Lake synapse
+loading/export is now supported through the optional `delta` extra.
 
 ---
 
@@ -77,6 +83,36 @@ with deduplication on join keys.
 
 **Open question:** What happens when the same cell ID appears in both tables with
 different annotation values (e.g., after proofread root ID remapping)?
+
+---
+
+## Synapse-Derived Cell Annotations
+
+`SynapseTable.derive_annotation(name, pre_agg=None, post_agg=None) -> SynapseTable`
+
+Some cell annotations are computed from synapses: an axon's output centroid and lateral
+covariance (`lateral_spread`), a per-cell partner-distance radius, mean synapse size.
+Today that is `cell_summary(st, pre_agg=…)` followed by `add_annotation`, and the
+annotation forgets where it came from.
+
+A derived annotation would be an ordinary annotation plus provenance: the source table
+and its filter state at derivation time. Two things that buys:
+
+- **Scope.** The values should come from a cell's full output, not a filtered view. An
+  axon radius derived *after* restricting to a target population or a potential set
+  defines its own domain and shrinks toward the synapses kept. Deriving from the
+  unfiltered table — and recording that it was — makes this explicit.
+- **Circularity.** The same synapses then reappear in the counts being analyzed. That's
+  harmless for a coarse per-cell geometry (a few parameters per cell), but a
+  `PairUniverse` or held-out validation could warn when an annotation was derived from
+  synapses it is now counting — e.g. a potential set defined using held-out partners.
+
+Motivating use: per-presynaptic potential sets for bulk connection models
+(`lateral_mahalanobis_distance(centroid_pre, soma_post, cov_pre) <= r_pre`).
+
+**Open question:** Is provenance a filter-state fingerprint (cheap, detects "derived
+from a different view") or the actual id sets (exact, enables per-synapse overlap
+checks with a held-out split)?
 
 ---
 

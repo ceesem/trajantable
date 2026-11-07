@@ -17,6 +17,7 @@ return a ConnectivityTable.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import replace
 from typing import Iterable
 
@@ -29,6 +30,8 @@ from ._base import (
     filter_by_id_sets,
     filter_by_soma_distance_impl,
     materialize_aliased_spec,
+    reject_reserved_names,
+    validate_pair_filter,
 )
 from .connectivity_table import ConnectivityTable
 from .spatial import bbox_predicate, euclidean_distance, radial_distance
@@ -162,6 +165,8 @@ class EdgeList(ConnectivityTable):
             for name, spec in self._cell_annotations.items()
         }
         new._cell_aliases = {}
+        new.metadata = deepcopy(self.metadata)
+        new._n_pair_base = self._n_pair_base
         new._cache = None
         return new
 
@@ -230,6 +235,25 @@ class EdgeList(ConnectivityTable):
         )
 
     # ── cell-specific filters ──────────────────────────────────────────────
+
+    def filter_pairs(self, expr: pl.Expr) -> EdgeList:
+        """Select eligible cell pairs for observed edges and possible_pairs.
+
+        Parameters
+        ----------
+        expr : pl.Expr
+            Boolean predicate based on cell IDs or cell annotations, never
+            observed edge weights such as n_syn.
+
+        Returns
+        -------
+        EdgeList
+            New table carrying eligibility through candidate-pair construction.
+        """
+        validate_pair_filter(self, expr)
+        new = self.filter(expr)
+        new._filter_sides[-1] = "pair"
+        return new
 
     def filter_by_ids(
         self,
@@ -307,6 +331,8 @@ class EdgeList(ConnectivityTable):
         pre: str | None = None,
         post: str | None = None,
         weight_cols: list[str] | str | None = None,
+        *,
+        agg: dict[str, pl.Expr] | None = None,
     ) -> ConnectivityTable:
         """Collapse one or both axes from cells to a label column.
 
@@ -315,8 +341,8 @@ class EdgeList(ConnectivityTable):
         entity columns, and the registered weights summed per type pair
         (per the weight contract: sum of a weight is a weight).
 
-        Non-weight *data* columns are NOT carried across — this is a semantic
-        reduction and arbitrary user columns don't have a canonical
+        Non-weight *data* columns are carried across only through explicit
+        ``agg`` expressions: arbitrary user columns don't have a canonical
         aggregation. Cell *annotations* on an axis that stays a cell axis
         (i.e. the side you did not collapse) ARE carried forward, re-registered
         one-sided on the result, because they remain 1:1 with the surviving
@@ -339,6 +365,14 @@ class EdgeList(ConnectivityTable):
         weight_cols : list[str] or str or None, optional
             Weights to carry forward (summed). Defaults to all currently
             registered weights.
+        agg : dict[str, pl.Expr] or None, optional
+            Additional output columns and reductions over the current pair
+            plan, for example ``{"mean_size": pl.mean("mean_size")}``.
+            Outputs are data columns, not automatically additive weights.
+            A mean of pair means weights connections equally. To recover a
+            synapse-level mean, aggregate per-pair size sums and non-null size
+            counts, then divide their sums here. Synapse-level expressions
+            cannot be replayed after their source columns have been reduced.
         """
         if pre is None and post is None:
             raise ValueError(
@@ -352,11 +386,17 @@ class EdgeList(ConnectivityTable):
             weight_cols = [weight_cols]
         if weight_cols is None:
             weight_cols = list(self._weights)
-        if not weight_cols:
+        if not weight_cols and not agg:
             raise ValueError(
-                "aggregate_to_type requires at least one weight column. "
-                "Pass weight_cols=... or register one via add_weight()."
+                "aggregate_to_type requires at least one weight column or agg expression. "
+                "Pass agg=..., weight_cols=..., or register one via add_weight()."
             )
+
+        reject_reserved_names(
+            (agg or {}).keys(),
+            {new_pre, new_post, *weight_cols},
+            context="aggregate_to_type agg",
+        )
 
         lf = self.build_lazy()
         missing = [c for c in weight_cols if c not in lf.collect_schema().names()]
@@ -366,13 +406,11 @@ class EdgeList(ConnectivityTable):
             if c not in lf.collect_schema().names():
                 raise ValueError(f"Axis column {c!r} not found in plan.")
 
-        agg = (
-            lf.group_by([new_pre, new_post])
-            .agg([pl.sum(w).alias(w) for w in weight_cols])
-            .collect()
-        )
+        agg_exprs = [pl.sum(w).alias(w) for w in weight_cols]
+        agg_exprs.extend(expr.alias(name) for name, expr in (agg or {}).items())
+        pair_df = lf.group_by([new_pre, new_post]).agg(agg_exprs)
         ct = ConnectivityTable(
-            agg, pre_col=new_pre, post_col=new_post, weight_cols=weight_cols
+            pair_df, pre_col=new_pre, post_col=new_post, weight_cols=weight_cols
         )
 
         # Carry forward annotations on whichever axis stayed a cell axis. An
@@ -399,6 +437,7 @@ class EdgeList(ConnectivityTable):
                 continue
             new_side = "both" if len(survives) == 2 else survives[0]
             ct._cell_annotations[ann_name] = replace(spec, side=new_side)
+        ct.metadata = deepcopy(self.metadata)
         ct._cache = None
         return ct
 
@@ -423,6 +462,8 @@ class EdgeList(ConnectivityTable):
         new._expressions = self._expressions.copy()
         new._expression_sides = self._expression_sides.copy()
         new._cell_aliases = self._cell_aliases.copy()
+        new.metadata = deepcopy(self.metadata)
+        new._n_pair_base = self._n_pair_base
         new._cache = None
         return new
 
@@ -546,4 +587,5 @@ class EdgeList(ConnectivityTable):
                 if saved_sides is not None and i < len(saved_sides):
                     instance._filter_sides[-1] = saved_sides[i]
 
+            instance.metadata = deepcopy(config.get("metadata", {}))
             return instance
