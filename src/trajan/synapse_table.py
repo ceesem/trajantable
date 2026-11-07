@@ -34,6 +34,7 @@ from ._base import (
     validate_pair_filter,
     validate_unique_key,
 )
+from ._guard import check_collect
 from .connectivity_table import ConnectivityTable
 from .edgelist import EdgeList
 from .spatial import (
@@ -623,6 +624,9 @@ class SynapseTable(_CachedTable):
         an individual registered annotation use ``synapse_annotations[name]``,
         ``cell_annotations[name]``, or ``vertex_annotations[name]``.
         """
+        if self._n_syn_base is None:
+            self._n_syn_base = self._syn_lf.select(pl.len()).collect().item()
+        check_collect(self._syn_lf, "SynapseTable.synapses", n_rows=self._n_syn_base)
         return self._syn_lf.collect()
 
     @property

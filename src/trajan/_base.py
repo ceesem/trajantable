@@ -154,8 +154,13 @@ class _CachedTable(_LazyBacked):
     def df(self) -> pl.DataFrame:
         """Full merged table with all registered annotations joined. Cached."""
         if self._cache is None:
-            self._cache = self.build_lazy().collect()
+            self._cache = self._guarded_full_collect(force=False)
         return self._cache
+
+    def _guarded_full_collect(self, force: bool) -> pl.DataFrame:
+        lf = self.build_lazy()
+        check_collect(lf, f"{type(self).__name__}.df", n_rows=len(self), force=force)
+        return lf.collect()
 
     def clear_cache(self: _T) -> _T:
         """Drop the materialized ``.df`` cache, releasing its memory.
@@ -168,7 +173,9 @@ class _CachedTable(_LazyBacked):
         self._cache = None
         return self
 
-    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+    def collect(
+        self, cols: list[str] | str | None = None, *, force: bool = False
+    ) -> pl.DataFrame:
         """Materialize the merged table, optionally projecting to ``cols``.
 
         With ``cols=None`` this is just the cached ``.df``. With an explicit
@@ -182,6 +189,8 @@ class _CachedTable(_LazyBacked):
         cols : list[str] or str or None, optional
             Columns to project. ``None`` (default) returns the full cached
             ``.df``. A single string is treated as a one-element list.
+        force : bool, optional
+            Skip the memory guard (see :mod:`trajan._guard`). Defaults to False.
 
         Returns
         -------
@@ -192,9 +201,13 @@ class _CachedTable(_LazyBacked):
         ------
         ValueError
             If any requested column is not present in the merged table.
+        CollectTooLargeError
+            If the result is estimated to exceed the collect limit.
         """
         if cols is None:
-            return self.df
+            if self._cache is None:
+                self._cache = self._guarded_full_collect(force=force)
+            return self._cache
         if isinstance(cols, str):
             cols = [cols]
         schema = self.build_lazy().collect_schema().names()
@@ -203,9 +216,17 @@ class _CachedTable(_LazyBacked):
             raise ValueError(
                 f"Column(s) {missing} not found in table. Available: {schema}"
             )
-        return self.build_lazy().select(cols).collect()
+        lf = self.build_lazy().select(cols)
+        check_collect(
+            lf,
+            f"{type(self).__name__}.collect(cols=...)",
+            n_rows=len(self),
+            force=force,
+        )
+        return lf.collect()
 
 
+from ._guard import check_collect
 from .spatial import pack_position
 
 # ── scope vocabulary ──────────────────────────────────────────────────────────

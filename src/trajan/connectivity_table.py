@@ -49,6 +49,7 @@ from ._base import (
     resolve_universe_annotation,
     unique_name,
 )
+from ._guard import check_collect
 
 
 class ConnectivityTable(_CachedTable):
@@ -450,6 +451,7 @@ class ConnectivityTable(_CachedTable):
         For the fully merged + filtered + computed table use ``.df``. To
         inspect an individual annotation, use ``annotations[name]``.
         """
+        check_collect(self._pair_lf, f"{type(self).__name__}.pairs")
         return self._pair_lf.collect()
 
     @property

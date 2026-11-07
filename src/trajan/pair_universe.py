@@ -35,6 +35,7 @@ from ._base import (
     resolve_universe_annotation,
     validate_pair_filter,
 )
+from ._guard import check_collect
 from .spatial import bbox_predicate, euclidean_distance, radial_distance
 
 if TYPE_CHECKING:
@@ -287,7 +288,9 @@ class PairUniverse(_LazyBacked):
 
     # ── materialization ──────────────────────────────────────────────────
 
-    def collect(self, cols: list[str] | str | None = None) -> pl.DataFrame:
+    def collect(
+        self, cols: list[str] | str | None = None, *, force: bool = False
+    ) -> pl.DataFrame:
         """Materialize the lazy plan into a DataFrame, optionally projecting.
 
         With ``cols=None`` the full pair frame is collected. With an explicit
@@ -304,11 +307,15 @@ class PairUniverse(_LazyBacked):
         cols : list[str] or str or None, optional
             Columns to project. ``None`` (default) collects the full frame.
             A single string is treated as a one-element list.
+        force : bool, optional
+            Skip the memory guard (see :mod:`trajan._guard`). Defaults to False.
 
         Raises
         ------
         ValueError
             If any requested column is not present in the pair frame.
+        CollectTooLargeError
+            If the result is estimated to exceed the collect limit.
         """
         lf = self.build_lazy()
         if cols is not None:
@@ -322,6 +329,7 @@ class PairUniverse(_LazyBacked):
                     f"Available: {schema}"
                 )
             lf = lf.select(cols)
+        check_collect(lf, "PairUniverse.collect()", force=force)
         df = lf.collect()
         if len(df) > 10_000_000:
             warnings.warn(
@@ -401,7 +409,7 @@ class PairUniverse(_LazyBacked):
         el.metadata = deepcopy(self.metadata)
         return el
 
-    def to_pair_frame(self) -> pl.DataFrame:
+    def to_pair_frame(self, *, force: bool = False) -> pl.DataFrame:
         """Materialize the full cross-product (observed + unobserved) as a DataFrame.
 
         Returns every pair in the universe, including those with ``n_syn = 0``
@@ -413,7 +421,9 @@ class PairUniverse(_LazyBacked):
         universes this is almost never what you want — compose more filters
         or use ``group_by().agg()`` upstream.
         """
-        df = self.build_lazy().collect()
+        lf = self.build_lazy()
+        check_collect(lf, "PairUniverse.to_pair_frame()", force=force)
+        df = lf.collect()
         if len(df) > 10_000_000:
             warnings.warn(
                 f"to_pair_frame materialized {len(df):,} rows (full "

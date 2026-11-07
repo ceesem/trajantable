@@ -3,6 +3,13 @@
 __version__ = "0.0.1"
 
 from ._base import Scope
+from ._guard import (
+    CollectTooLargeError,
+    allow_large_collect,
+    estimate_bytes,
+    get_max_collect_bytes,
+    set_max_collect_bytes,
+)
 from .completeness import (
     edge_distance_expr,
     interior_share,
@@ -42,6 +49,11 @@ from .stats import (
 from .synapse_table import SynapseTable
 
 __all__ = [
+    "CollectTooLargeError",
+    "allow_large_collect",
+    "estimate_bytes",
+    "get_max_collect_bytes",
+    "set_max_collect_bytes",
     "ConnectivityTable",
     "EdgeList",
     "LateralBox",
